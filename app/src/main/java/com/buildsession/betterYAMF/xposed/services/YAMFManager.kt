@@ -34,7 +34,7 @@ import com.buildsession.betterYAMF.xposed.IAppListCallback
 import com.buildsession.betterYAMF.xposed.IOpenCountListener
 import com.buildsession.betterYAMF.xposed.IYAMFManager
 import com.buildsession.betterYAMF.xposed.hook.HookLauncher
-import com.buildsession.betterYAMF.xposed.ui.window.AppWindow
+import com.buildsession.betterYAMF.window.host.AppWindow
 import com.buildsession.betterYAMF.xposed.utils.Instances
 import com.buildsession.betterYAMF.xposed.utils.Instances.systemContext
 import com.buildsession.betterYAMF.xposed.utils.Instances.systemUiContext

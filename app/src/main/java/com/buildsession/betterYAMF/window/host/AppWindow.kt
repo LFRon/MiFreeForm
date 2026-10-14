@@ -1,4 +1,4 @@
-package com.buildsession.betterYAMF.xposed.ui.window
+package com.buildsession.betterYAMF.window.host
 
 import android.animation.ValueAnimator
 import android.annotation.SuppressLint
@@ -14,19 +14,16 @@ import android.content.pm.IPackageManagerHidden
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
 import android.content.res.Configuration
+import android.content.res.Resources
 import android.graphics.Bitmap
-import android.graphics.Canvas
-import android.graphics.Color
-import android.graphics.DashPathEffect
-import android.graphics.Paint
 import android.graphics.PixelFormat
-import android.graphics.RectF
 import android.graphics.SurfaceTexture
 import android.graphics.drawable.BitmapDrawable
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.os.Build
 import android.os.SystemClock
+import android.util.DisplayMetrics
 import android.util.Log
 import android.util.TypedValue
 import android.view.Display
@@ -67,6 +64,15 @@ import com.buildsession.betterYAMF.databinding.LeftBackGestureOverlayBinding
 import com.buildsession.betterYAMF.databinding.RightBackGestureOverlayBinding
 import com.buildsession.betterYAMF.databinding.WindowAppBinding
 import kotlinx.coroutines.withContext
+import com.buildsession.betterYAMF.window.core.CloseOrigin
+import com.buildsession.betterYAMF.window.core.FullscreenOrigin
+import com.buildsession.betterYAMF.window.core.RegionId
+import com.buildsession.betterYAMF.window.core.ShellMode
+import com.buildsession.betterYAMF.window.core.WindowCommand
+import com.buildsession.betterYAMF.window.core.WindowInputEvent
+import com.buildsession.betterYAMF.window.core.WindowRegistration
+import com.buildsession.betterYAMF.window.core.WindowShellController
+import com.buildsession.betterYAMF.window.core.WindowShellRegistry
 import com.buildsession.betterYAMF.xposed.services.YAMFManager
 import com.buildsession.betterYAMF.xposed.services.YAMFManager.config
 import com.buildsession.betterYAMF.xposed.utils.Instances
@@ -84,7 +90,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlin.math.floor
-import kotlin.math.min
 import kotlin.math.pow
 import kotlin.math.sign
 import kotlin.math.sqrt
@@ -102,12 +107,14 @@ class AppWindow(
     companion object {
         const val TAG = "reYAMF_AppWindow"
         const val ACTION_RESET_ALL_WINDOW = "com.buildsession.betterYAMF.ui.window.action.ACTION_RESET_ALL_WINDOW"
+        private val shellRegistry = WindowShellRegistry()
     }
 
     lateinit var binding: WindowAppBinding
     lateinit var bindingLeftBackGesture: LeftBackGestureOverlayBinding
     lateinit var bindingRightBackGesture: RightBackGestureOverlayBinding
     private lateinit var virtualDisplay: VirtualDisplay
+    private lateinit var shell: WindowShellController
     
     var currentTaskId = -1
     private var isDestroyed = false
@@ -117,8 +124,6 @@ class AppWindow(
     private val surfaceOnGenericMotionListener = SurfaceOnGenericMotionListener()
     var displayId = -1
     var rotateLock = false
-    var isMini = false
-    var isCollapsed = false
     private var halfWidth = 0
     private var halfHeight = 0
     lateinit var surfaceView: View
@@ -134,11 +139,20 @@ class AppWindow(
     private var paramsBg = WindowManager.LayoutParams()
     private var backGestureJob: Job? = null
     private var keepInScreenAnimator: ValueAnimator? = null
-    private var lastClickTime = 0L
-    private val DOUBLE_CLICK_TIME_DELTA: Long = 300
-    private var isSuperShown = false
+    private var flingXAnimation: FlingAnimation? = null
+    private var flingYAnimation: FlingAnimation? = null
+    private var dragAnchorX = 0
+    private var dragAnchorY = 0
+    private var gestureRegion: RegionId? = null
+    private var lastGestureRawX = 0f
+    private var lastGestureRawY = 0f
+    private var last2GestureRawX = 0f
+    private var last2GestureRawY = 0f
+    private var flingRefX = 0f
+    private var flingRefY = 0f
+    private var resizeBeginWidth = 0
+    private var resizeBeginHeight = 0
     private var cornerDropZoneView: CornerDropZoneView? = null
-    private var currentHighlightedCorner = -1
 
     private val broadcastReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -270,295 +284,50 @@ class AppWindow(
         }
 
         binding.rootClickMask.setOnTouchListener { _, event ->
-            moveGestureDetector.onTouchEvent(event)
-            moveToTopIfNeed(event)
-            
-            if (event.action == MotionEvent.ACTION_UP || event.action == MotionEvent.ACTION_CANCEL) {
-                when (currentHighlightedCorner) {
-                    in 0..3 -> changeMini()
-                    4, 5 -> changeCollapsed()
-                    else -> keepInScreen()
-                }
-                currentHighlightedCorner = -1
-                hideCornerDropZone()
-            }
+            translateMoveGesture(RegionId.BODY_MASK, event)
             true
         }
 
         binding.cvBarClickMask.setOnClickListener {
-            val clickTime = System.currentTimeMillis()
-            if (clickTime - lastClickTime < DOUBLE_CLICK_TIME_DELTA) {
-                isResize = false
-                backGestureJob?.cancel()
-                backGestureJob = null
-
-                binding.cvappIcon.visibility = View.INVISIBLE
-                if (orientation == 0) {
-                    animateAlpha(binding.rlBarControllerBottom, 1f, 0f) {
-                        binding.rlBarControllerBottom.visibility = View.GONE
-                    }
-                } else {
-                    animateAlpha(binding.rlBarControllerSide, 1f, 0f) {
-                        binding.rlBarControllerSide.visibility = View.GONE
-                    }
-                }
-
-                CoroutineScope(Dispatchers.IO).launch {
-                    delay(200)
-
-                    withContext(Dispatchers.Main) {
-                        animateScaleThenResize(
-                            binding.cvParent,
-                            1F, 1F,
-                            0F, 0F,
-                            0.5F, 0.5F,
-                            0, 0,
-                            context
-                        ) {
-                            onDestroy()
-                        }
-                    }
-                }
-            }
-            lastClickTime = clickTime
+            dispatchInput(WindowInputEvent.Tap(displayId, System.currentTimeMillis(), RegionId.BAR_BOTTOM))
         }
 
         binding.cvBarSideClickMask.setOnClickListener {
-            val clickTime = System.currentTimeMillis()
-            if (clickTime - lastClickTime < DOUBLE_CLICK_TIME_DELTA) {
-                isResize = false
-                backGestureJob?.cancel()
-                backGestureJob = null
-
-                binding.cvappIcon.visibility = View.INVISIBLE
-                if (orientation == 0) {
-                    animateAlpha(binding.rlBarControllerBottom, 1f, 0f) {
-                        binding.rlBarControllerBottom.visibility = View.GONE
-                    }
-                } else {
-                    animateAlpha(binding.rlBarControllerSide, 1f, 0f) {
-                        binding.rlBarControllerSide.visibility = View.GONE
-                    }
-                }
-
-                CoroutineScope(Dispatchers.IO).launch {
-                    delay(200)
-
-                    withContext(Dispatchers.Main) {
-                        animateScaleThenResize(
-                            binding.cvParent,
-                            1F, 1F,
-                            0F, 0F,
-                            0.5F, 0.5F,
-                            0, 0,
-                            context
-                        ) {
-                            onDestroy()
-                        }
-                    }
-                }
-            }
-            lastClickTime = clickTime
+            dispatchInput(WindowInputEvent.Tap(displayId, System.currentTimeMillis(), RegionId.BAR_SIDE))
         }
 
         binding.ibSuper.setOnTouchListener { _, event ->
-            moveGestureDetector.onTouchEvent(event)
-            moveToTopIfNeed(event)
-            
-            if (event.action == MotionEvent.ACTION_UP || event.action == MotionEvent.ACTION_CANCEL) {
-                when (currentHighlightedCorner) {
-                    in 0..3 -> changeMini()
-                    4, 5 -> changeCollapsed()
-                    else -> keepInScreen()
-                }
-                currentHighlightedCorner = -1
-                hideCornerDropZone()
-            }
+            translateMoveGesture(RegionId.HANDLE, event)
             false
         }
 
         binding.ibSuper.setOnClickListener {
-            isSuperShown = true
-            animateAlpha(binding.clSuperLayout, 0f, 1f)
+            dispatchInput(WindowInputEvent.Tap(displayId, System.currentTimeMillis(), RegionId.HANDLE))
         }
 
         binding.cvBarClickMask.setOnTouchListener(object : View.OnTouchListener {
-             private var startRawY = 0f
-             private val threshold = 80.dpToPx()
-             private var isSwiping = false
-
             override fun onTouch(v: View, event: MotionEvent): Boolean {
-                moveToTopIfNeed(event)
-                when (event.action) {
-                    MotionEvent.ACTION_DOWN -> {
-                        startRawY = event.rawY
-                        isSwiping = true
-                        return true
-                    }
-                    MotionEvent.ACTION_MOVE -> {
-                        if (!isSwiping) return false
-                        val diffY = event.rawY - startRawY
-                        
-                        if (diffY < 0) { // Swipe up - Shrink and fade
-                            val progress = (-diffY / threshold).coerceIn(0f, 1f)
-                            val scale = 1f - (progress * 0.3f) // Scale down to 70%
-                            val alpha = 1f - progress
-                            binding.cvParent.scaleX = scale
-                            binding.cvParent.scaleY = scale
-                            binding.cvParent.alpha = alpha
-                            
-                            binding.viewFullScreenMask.visibility = View.GONE
-                            binding.tvFullScreenPrompt.visibility = View.GONE
-                        } else { // Swipe down - Enlarge and show full screen mask
-                            val progress = (diffY / threshold).coerceIn(0f, 1f)
-                            val scale = 1f + (progress * 0.2f) // Scale up to 120%
-                            binding.cvParent.scaleX = scale
-                            binding.cvParent.scaleY = scale
-                            binding.cvParent.alpha = 1f
-                            
-                            if (diffY > threshold) {
-                                binding.viewFullScreenMask.visibility = View.VISIBLE
-                                binding.tvFullScreenPrompt.visibility = View.VISIBLE
-                            } else {
-                                binding.viewFullScreenMask.visibility = View.GONE
-                                binding.tvFullScreenPrompt.visibility = View.GONE
-                            }
-                        }
-                        return true
-                    }
-                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                        if (!isSwiping) return false
-                        val diffY = event.rawY - startRawY
-                        
-                        if (diffY < -threshold) { // Swipe up past threshold - Close
-                            animateScaleThenResize(
-                                binding.cvParent,
-                                binding.cvParent.scaleX, binding.cvParent.scaleY,
-                                0f, 0f,
-                                0.5f, 0.5f,
-                                0, 0,
-                                context
-                            ) {
-                                onDestroy()
-                            }
-                        } else if (diffY > threshold) { // Swipe down past threshold - Full Screen
-                            getTopRootTask()?.runCatching {
-                                Instances.activityTaskManager.moveRootTaskToDisplay(taskId, 0)
-                                Instances.activityManager.moveTaskToFront(taskId, 0)
-                            }?.onSuccess {
-                                onDestroy()
-                            }?.onFailure {
-                                resetWindow()
-                            }
-                        } else {
-                            resetWindow()
-                        }
-                        isSwiping = false
-                        return true
-                    }
+                translateBarGesture(RegionId.BAR_BOTTOM, event)
+                return when (event.action) {
+                    MotionEvent.ACTION_DOWN,
+                    MotionEvent.ACTION_MOVE,
+                    MotionEvent.ACTION_UP,
+                    MotionEvent.ACTION_CANCEL -> true
+                    else -> false
                 }
-                return false
-            }
-
-            private fun resetWindow() {
-                binding.cvParent.animate()
-                    .scaleX(1f)
-                    .scaleY(1f)
-                    .alpha(1f)
-                    .setDuration(200)
-                    .start()
-                binding.viewFullScreenMask.visibility = View.GONE
-                binding.tvFullScreenPrompt.visibility = View.GONE
             }
         })
 
         binding.cvBarSideClickMask.setOnTouchListener(object : View.OnTouchListener {
-             private var startRawY = 0f
-             private val threshold = 80.dpToPx()
-             private var isSwiping = false
-
             override fun onTouch(v: View, event: MotionEvent): Boolean {
-                moveToTopIfNeed(event)
-                when (event.action) {
-                    MotionEvent.ACTION_DOWN -> {
-                        startRawY = event.rawY
-                        isSwiping = true
-                        return true
-                    }
-                    MotionEvent.ACTION_MOVE -> {
-                        if (!isSwiping) return false
-                        val diffY = event.rawY - startRawY
-                        
-                        if (diffY < 0) { // Swipe up - Shrink and fade
-                            val progress = (-diffY / threshold).coerceIn(0f, 1f)
-                            val scale = 1f - (progress * 0.3f)
-                            val alpha = 1f - progress
-                            binding.cvParent.scaleX = scale
-                            binding.cvParent.scaleY = scale
-                            binding.cvParent.alpha = alpha
-                            
-                            binding.viewFullScreenMask.visibility = View.GONE
-                            binding.tvFullScreenPrompt.visibility = View.GONE
-                        } else { // Swipe down - Enlarge and show full screen mask
-                            val progress = (diffY / threshold).coerceIn(0f, 1f)
-                            val scale = 1f + (progress * 0.2f)
-                            binding.cvParent.scaleX = scale
-                            binding.cvParent.scaleY = scale
-                            binding.cvParent.alpha = 1f
-                            
-                            if (diffY > threshold) {
-                                binding.viewFullScreenMask.visibility = View.VISIBLE
-                                binding.tvFullScreenPrompt.visibility = View.VISIBLE
-                            } else {
-                                binding.viewFullScreenMask.visibility = View.GONE
-                                binding.tvFullScreenPrompt.visibility = View.GONE
-                            }
-                        }
-                        return true
-                    }
-                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                        if (!isSwiping) return false
-                        val diffY = event.rawY - startRawY
-                        
-                        if (diffY < -threshold) { // Swipe up past threshold - Close
-                            animateScaleThenResize(
-                                binding.cvParent,
-                                binding.cvParent.scaleX, binding.cvParent.scaleY,
-                                0f, 0f,
-                                0.5f, 0.5f,
-                                0, 0,
-                                context
-                            ) {
-                                onDestroy()
-                            }
-                        } else if (diffY > threshold) { // Swipe down past threshold - Full Screen
-                            getTopRootTask()?.runCatching {
-                                Instances.activityTaskManager.moveRootTaskToDisplay(taskId, 0)
-                                Instances.activityManager.moveTaskToFront(taskId, 0)
-                            }?.onSuccess {
-                                onDestroy()
-                            }?.onFailure {
-                                resetWindow()
-                            }
-                        } else {
-                            resetWindow()
-                        }
-                        isSwiping = false
-                        return true
-                    }
+                translateBarGesture(RegionId.BAR_SIDE, event)
+                return when (event.action) {
+                    MotionEvent.ACTION_DOWN,
+                    MotionEvent.ACTION_MOVE,
+                    MotionEvent.ACTION_UP,
+                    MotionEvent.ACTION_CANCEL -> true
+                    else -> false
                 }
-                return false
-            }
-
-            private fun resetWindow() {
-                binding.cvParent.animate()
-                    .scaleX(1f)
-                    .scaleY(1f)
-                    .alpha(1f)
-                    .setDuration(200)
-                    .start()
-                binding.viewFullScreenMask.visibility = View.GONE
-                binding.tvFullScreenPrompt.visibility = View.GONE
             }
         })
 
@@ -568,73 +337,23 @@ class AppWindow(
         surfaceView.setOnGenericMotionListener(surfaceOnGenericMotionListener)
 
         binding.ibClose.setOnClickListener {
-            isResize = false
-            backGestureJob?.cancel()
-            backGestureJob = null
-
-            binding.cvappIcon.visibility = View.INVISIBLE
-            if (orientation == 0) {
-                animateAlpha(binding.rlBarControllerBottom, 1f, 0f) {
-                    binding.rlBarControllerBottom.visibility = View.GONE
-                }
-            } else {
-                animateAlpha(binding.rlBarControllerSide, 1f, 0f) {
-                    binding.rlBarControllerSide.visibility = View.GONE
-                }
-            }
-
-            CoroutineScope(Dispatchers.IO).launch {
-                delay(200)
-
-                withContext(Dispatchers.Main) {
-                    animateScaleThenResize(
-                        binding.cvParent,
-                        1F, 1F,
-                        0F, 0F,
-                        0.5F, 0.5F,
-                        0, 0,
-                        context
-                    ) {
-                        onDestroy()
-                    }
-                }
-            }
+            dispatchInput(WindowInputEvent.Tap(displayId, System.currentTimeMillis(), RegionId.BUTTON_CLOSE))
         }
 
         binding.ibFullscreen.setOnClickListener {
-            animateAlpha(binding.clSuperLayout, 1f, 0f)
-            getTopRootTask()?.runCatching {
-                Instances.activityTaskManager.moveRootTaskToDisplay(taskId, 0)
-            }?.onFailure { t ->
-                if (t is Error) throw t
-                TipUtil.showToast("${t.message}")
-            }?.onSuccess {
-                binding.ibClose.callOnClick()
-            }
+            dispatchInput(WindowInputEvent.Tap(displayId, System.currentTimeMillis(), RegionId.BUTTON_FULLSCREEN))
         }
 
         binding.ibMinimize.setOnClickListener {
-            isSuperShown = false
-            binding.apply {
-                animateAlpha(binding.clSuperLayout, 1f, 0f)
-                binding.clSuperLayout.visibility = View.GONE
-                changeMini()
-            }
+            dispatchInput(WindowInputEvent.Tap(displayId, System.currentTimeMillis(), RegionId.BUTTON_MINIMIZE))
         }
 
         binding.ibCollapse.setOnClickListener {
-            isSuperShown = false
-            binding.apply {
-                animateAlpha(binding.clSuperLayout, 1f, 0f)
-                binding.clSuperLayout.visibility = View.GONE
-                changeCollapsed()
-            }
-            true
+            dispatchInput(WindowInputEvent.Tap(displayId, System.currentTimeMillis(), RegionId.BUTTON_COLLAPSE))
         }
 
         binding.ibSuperClose.setOnClickListener {
-            isSuperShown = false
-            animateAlpha(binding.clSuperLayout, 1f, 0f)
+            dispatchInput(WindowInputEvent.Tap(displayId, System.currentTimeMillis(), RegionId.SUPER_CLOSE))
         }
 
         if (config.windowMode == 0) { // Virtual Display
@@ -662,6 +381,11 @@ class AppWindow(
             surfaceView.visibility = View.GONE // Hide the surface view, task renders directly
             binding.cvParent.post(::updateSmoothBounds)
         }
+
+        shell = shellRegistry.register(
+            WindowRegistration(displayId, Resources.getSystem().displayMetrics.density)
+        )
+        updateShellScreenMetrics()
         
         context.registerReceiver(broadcastReceiver, IntentFilter(ACTION_RESET_ALL_WINDOW), Context.RECEIVER_EXPORTED)
         val width = config.defaultWindowWidth.dpToPx().toInt()
@@ -718,7 +442,8 @@ class AppWindow(
                     delay(1000)
                     continue
                 }
-                if (isMini || isCollapsed) {
+                val mode = shell.snapshot().mode
+                if (mode != ShellMode.NORMAL) {
                     withContext(Dispatchers.Main) {
                         bindingLeftBackGesture.root.visibility = View.GONE
                         bindingRightBackGesture.root.visibility = View.GONE
@@ -735,7 +460,7 @@ class AppWindow(
                     }
                 }
 
-                if (!isMini && !isCollapsed) {
+                if (mode == ShellMode.NORMAL) {
                     withContext(Dispatchers.Main) {
                         if (orientation == 0) {
                             binding.rlBarControllerBottom.visibility = View.VISIBLE
@@ -757,6 +482,9 @@ class AppWindow(
         runCatching { Instances.iWindowManager.removeRotationWatcher(rotationWatcher) }
         
         YAMFManager.removeWindow(displayId)
+        if (::shell.isInitialized) {
+            shellRegistry.unregister(shell)
+        }
         if (config.windowMode == 0) {
             runCatching { virtualDisplay.release() }
         } else {
@@ -811,12 +539,275 @@ class AppWindow(
         YAMFManager.moveToTop(displayId)
     }
 
-    private fun moveToTopIfNeed(event: MotionEvent) {
-        if (event.action == MotionEvent.ACTION_UP && YAMFManager.isTop(displayId).not()) {
-            moveToTop()
+    private fun dispatchInput(event: WindowInputEvent) {
+        shell.onInput(event).forEach(::execute)
+    }
+
+    private fun execute(command: WindowCommand) {
+        when (command) {
+            is WindowCommand.MoveBy -> execMoveBy(command)
+            is WindowCommand.FlingBy -> execFlingBy(command)
+            is WindowCommand.ClampToScreen -> execClampToScreen(command)
+            is WindowCommand.DropZoneShow -> showCornerDropZone()
+            is WindowCommand.DropHover -> execDropHover(command)
+            is WindowCommand.DropZoneHide -> hideCornerDropZone()
+            is WindowCommand.VerticalDragPreview -> execVerticalDragPreview(command)
+            is WindowCommand.ClearVerticalDragPreview -> execResetWindowScale()
+            is WindowCommand.ResizePreviewStart -> execResizePreviewStart()
+            is WindowCommand.ResizePreviewUpdate -> execResizePreviewUpdate(command)
+            is WindowCommand.ResizePreviewCommit -> execResizePreviewCommit()
+            is WindowCommand.EnterMini -> execEnterMini()
+            is WindowCommand.ExitMini -> execExitMini()
+            is WindowCommand.EnterCollapsed -> execEnterCollapsed()
+            is WindowCommand.ExitCollapsed -> execExitCollapsed()
+            is WindowCommand.ShowSuperMenu -> execShowSuperMenu()
+            is WindowCommand.HideSuperMenu -> execHideSuperMenu()
+            is WindowCommand.RequestClose -> execRequestClose(command.origin)
+            is WindowCommand.RequestFullscreen -> execRequestFullscreen(command.origin)
+            is WindowCommand.RaiseWindow -> moveToTop()
+        }
+    }
+
+    private fun updateShellScreenMetrics() {
+        val dm = DisplayMetrics()
+        context.display?.getRealMetrics(dm)
+        shell.onScreenMetricsChanged(dm.widthPixels, dm.heightPixels)
+    }
+
+    private fun translateMoveGesture(region: RegionId, event: MotionEvent) {
+        if (event.action == MotionEvent.ACTION_DOWN) {
+            flingXAnimation?.cancel()
+            flingYAnimation?.cancel()
+            gestureRegion = region
+            val params = binding.root.layoutParams as WindowManager.LayoutParams
+            dragAnchorX = params.x
+            dragAnchorY = params.y
+        }
+        moveGestureDetector.onTouchEvent(event)
+        when (event.action) {
+            MotionEvent.ACTION_DOWN ->
+                dispatchInput(WindowInputEvent.Press(displayId, event.eventTime, region, event.rawX, event.rawY))
+            MotionEvent.ACTION_UP ->
+                dispatchInput(WindowInputEvent.Up(displayId, event.eventTime, region, event.rawX, event.rawY))
+            MotionEvent.ACTION_CANCEL ->
+                dispatchInput(WindowInputEvent.Cancel(displayId, event.eventTime, region, event.rawX, event.rawY))
         }
         if (config.windowMode == 1) {
             updateSmoothBounds()
+        }
+    }
+
+    private fun translateBarGesture(region: RegionId, event: MotionEvent) {
+        if (config.windowMode == 1) {
+            updateSmoothBounds()
+        }
+        when (event.action) {
+            MotionEvent.ACTION_DOWN ->
+                dispatchInput(WindowInputEvent.Press(displayId, event.eventTime, region, event.rawX, event.rawY))
+            MotionEvent.ACTION_MOVE ->
+                dispatchInput(WindowInputEvent.Move(displayId, event.eventTime, region, event.rawX, event.rawY))
+            MotionEvent.ACTION_UP ->
+                dispatchInput(WindowInputEvent.Up(displayId, event.eventTime, region, event.rawX, event.rawY))
+            MotionEvent.ACTION_CANCEL ->
+                dispatchInput(WindowInputEvent.Cancel(displayId, event.eventTime, region, event.rawX, event.rawY))
+        }
+    }
+
+    private fun execMoveBy(command: WindowCommand.MoveBy) {
+        val params = binding.root.layoutParams as WindowManager.LayoutParams
+        params.x = (dragAnchorX + command.dx).toInt()
+        params.y = (dragAnchorY + command.dy).toInt()
+        Instances.windowManager.updateViewLayout(binding.root, params)
+        if (config.windowMode == 1) updateSmoothBounds()
+    }
+
+    private fun execFlingBy(command: WindowCommand.FlingBy) {
+        val params = binding.root.layoutParams as WindowManager.LayoutParams
+        val displayMetrics = context.resources.displayMetrics
+        val screenWidth = displayMetrics.widthPixels
+        val screenHeight = displayMetrics.heightPixels
+        val windowWidth = binding.root.width
+        val windowHeight = binding.root.height
+
+        val minX = 0f
+        val maxX = (screenWidth - windowWidth).toFloat()
+        val minY = 0f
+        val maxY = (screenHeight - windowHeight).toFloat()
+
+        runCatching {
+            if (sign(command.velocityX) != sign(flingRefX - last2GestureRawX)) return@runCatching
+            flingXAnimation = flingAnimationOf({
+                params.x = it.toInt()
+                runCatching {
+                    Instances.windowManager.updateViewLayout(binding.root, params)
+                    if (config.windowMode == 1) updateSmoothBounds()
+                }
+            }, {
+                params.x.toFloat()
+            })
+                .setStartVelocity(command.velocityX)
+                .apply {
+                    if (params.x >= minX && params.x <= maxX) {
+                        setMinValue(minX)
+                        setMaxValue(maxX)
+                    }
+                }
+            flingXAnimation?.addEndListener { _, _, _, _ ->
+                keepInScreen()
+            }
+            flingXAnimation?.start()
+        }
+        runCatching {
+            if (sign(command.velocityY) != sign(flingRefY - last2GestureRawY)) return@runCatching
+            flingYAnimation = flingAnimationOf({
+                params.y = it.toInt()
+                runCatching {
+                    Instances.windowManager.updateViewLayout(binding.root, params)
+                    if (config.windowMode == 1) updateSmoothBounds()
+                }
+            }, {
+                params.y.toFloat()
+            })
+                .setStartVelocity(command.velocityY)
+                .apply {
+                    if (params.y >= minY && params.y <= maxY) {
+                        setMinValue(minY)
+                        setMaxValue(maxY)
+                    }
+                }
+            flingYAnimation?.addEndListener { _, _, _, _ ->
+                keepInScreen()
+            }
+            flingYAnimation?.start()
+        }
+    }
+
+    private fun execClampToScreen(command: WindowCommand.ClampToScreen) {
+        keepInScreen(command.animated)
+    }
+
+    private fun execDropHover(command: WindowCommand.DropHover) {
+        cornerDropZoneView?.render(command.hover, command.active)
+    }
+
+    private fun execVerticalDragPreview(command: WindowCommand.VerticalDragPreview) {
+        val progress = command.progress
+        if (!command.downward) {
+            val scale = 1f - (progress * 0.3f)
+            val alpha = 1f - progress
+            binding.cvParent.scaleX = scale
+            binding.cvParent.scaleY = scale
+            binding.cvParent.alpha = alpha
+
+            binding.viewFullScreenMask.visibility = View.GONE
+            binding.tvFullScreenPrompt.visibility = View.GONE
+        } else {
+            val scale = 1f + (progress * 0.2f)
+            binding.cvParent.scaleX = scale
+            binding.cvParent.scaleY = scale
+            binding.cvParent.alpha = 1f
+
+            if (command.showFullscreenHint) {
+                binding.viewFullScreenMask.visibility = View.VISIBLE
+                binding.tvFullScreenPrompt.visibility = View.VISIBLE
+            } else {
+                binding.viewFullScreenMask.visibility = View.GONE
+                binding.tvFullScreenPrompt.visibility = View.GONE
+            }
+        }
+    }
+
+    private fun execResetWindowScale() {
+        binding.cvParent.animate()
+            .scaleX(1f)
+            .scaleY(1f)
+            .alpha(1f)
+            .setDuration(200)
+            .start()
+        binding.viewFullScreenMask.visibility = View.GONE
+        binding.tvFullScreenPrompt.visibility = View.GONE
+    }
+
+    private fun execShowSuperMenu() {
+        animateAlpha(binding.clSuperLayout, 0f, 1f)
+    }
+
+    private fun execHideSuperMenu() {
+        animateAlpha(binding.clSuperLayout, 1f, 0f)
+    }
+
+    private fun execRequestClose(origin: CloseOrigin) {
+        when (origin) {
+            CloseOrigin.DRAG_UP_BAR -> {
+                animateScaleThenResize(
+                    binding.cvParent,
+                    binding.cvParent.scaleX, binding.cvParent.scaleY,
+                    0f, 0f,
+                    0.5f, 0.5f,
+                    0, 0,
+                    context
+                ) {
+                    onDestroy()
+                }
+            }
+            CloseOrigin.BUTTON_X, CloseOrigin.DOUBLE_TAP_BAR -> {
+                isResize = false
+                backGestureJob?.cancel()
+                backGestureJob = null
+
+                binding.cvappIcon.visibility = View.INVISIBLE
+                if (orientation == 0) {
+                    animateAlpha(binding.rlBarControllerBottom, 1f, 0f) {
+                        binding.rlBarControllerBottom.visibility = View.GONE
+                    }
+                } else {
+                    animateAlpha(binding.rlBarControllerSide, 1f, 0f) {
+                        binding.rlBarControllerSide.visibility = View.GONE
+                    }
+                }
+
+                CoroutineScope(Dispatchers.IO).launch {
+                    delay(200)
+
+                    withContext(Dispatchers.Main) {
+                        animateScaleThenResize(
+                            binding.cvParent,
+                            1F, 1F,
+                            0F, 0F,
+                            0.5F, 0.5F,
+                            0, 0,
+                            context
+                        ) {
+                            onDestroy()
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun execRequestFullscreen(origin: FullscreenOrigin) {
+        when (origin) {
+            FullscreenOrigin.BUTTON -> {
+                getTopRootTask()?.runCatching {
+                    Instances.activityTaskManager.moveRootTaskToDisplay(taskId, 0)
+                }?.onFailure { t ->
+                    if (t is Error) throw t
+                    TipUtil.showToast("${t.message}")
+                }?.onSuccess {
+                    execRequestClose(CloseOrigin.BUTTON_X)
+                }
+            }
+            FullscreenOrigin.DRAG_DOWN_BAR -> {
+                getTopRootTask()?.runCatching {
+                    Instances.activityTaskManager.moveRootTaskToDisplay(taskId, 0)
+                    Instances.activityManager.moveTaskToFront(taskId, 0)
+                }?.onSuccess {
+                    onDestroy()
+                }?.onFailure {
+                    execResetWindowScale()
+                }
+            }
         }
     }
 
@@ -1023,7 +1014,7 @@ class AppWindow(
     }
 
     override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
-        if (isMini.not() && isCollapsed.not()) {
+        if (shell.snapshot().mode == ShellMode.NORMAL) {
             newDpi = calculateDpi(width, height, calculateScreenInches(width, height)) - config.reduceDPI
             virtualDisplay.resize(width, height, newDpi)
             surface.setDefaultBufferSize(width, height)
@@ -1039,7 +1030,7 @@ class AppWindow(
 
     override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) {
         if (isResize) {
-            if (isMini.not()) {
+            if (shell.snapshot().mode != ShellMode.MINI) {
                 newDpi = calculateDpi(width, height, calculateScreenInches(width, height)) - config.reduceDPI
                 virtualDisplay.resize(width, height, newDpi)
                 surface.setDefaultBufferSize(width, height)
@@ -1152,95 +1143,86 @@ class AppWindow(
         )
     }
 
-    // minimizes the floating window a bar-less only-content floating window
-    private fun changeMini() {
-        isCollapsed = false
+    private fun execEnterMini() {
         isResize = false
 
-        if (isMini) {
-            isMini = false
-            isResize = true
-            binding.rootClickMask.visibility = View.GONE
+        binding.rootClickMask.visibility = View.VISIBLE
+        binding.rlBarControllerBottom.visibility = View.GONE
+        binding.rlBarControllerSide.visibility = View.GONE
 
-            if (surfaceView is SurfaceView) {
-                binding.cvBackground.updateLayoutParams {
-                    width = originalWidth
-                    height = originalHeight
-                }
-                setBackgroundWrapContent()
-                setParrentWrapContent()
-                keepInScreen()
-                if (orientation == 0) {
-                    binding.rlBarControllerBottom.visibility = View.VISIBLE
-                    binding.rlBarControllerSide.visibility = View.GONE
-                } else {
-                    binding.rlBarControllerSide.visibility = View.VISIBLE
-                    binding.rlBarControllerBottom.visibility = View.GONE
-                }
-            } else {
-                binding.cvBackground.updateLayoutParams {
-                    width = originalWidth
-                    height = originalHeight
-                }
-                animateScaleThenResize(
-                    binding.cvBackground,
-                    0.5F, 0.5F,
-                    1F, 1F,
-                    0.5F, 0.5F,
-                    originalWidth, originalHeight,
-                    context
-                ){
-                    setBackgroundWrapContent()
-                    setParrentWrapContent()
-                    bindingLeftBackGesture.root.visibility = View.VISIBLE
-                    bindingRightBackGesture.root.visibility = View.VISIBLE
-                    keepInScreen()
-                }
+        if (config.surfaceView == 1) {
+            binding.cvBackground.updateLayoutParams {
+                width = originalWidth/2
+                height = originalHeight/2
             }
+            keepInScreen()
+        } else {
+            animateResizeCentered(
+                binding.cvBackground,
+                originalWidth, originalWidth/2,
+                originalHeight, originalHeight/2
+            ){
+                isResize = true
+                bindingLeftBackGesture.root.visibility = View.GONE
+                bindingRightBackGesture.root.visibility = View.GONE
+                keepInScreen()
+            }
+        }
 
-            binding.ibRightResize.visibility = View.VISIBLE
+        binding.ibRightResize.visibility = View.GONE
+        surfaceView.setOnTouchListener(null)
+        surfaceView.setOnGenericMotionListener(null)
+    }
+
+    private fun execExitMini() {
+        isResize = true
+        binding.rootClickMask.visibility = View.GONE
+
+        if (surfaceView is SurfaceView) {
+            binding.cvBackground.updateLayoutParams {
+                width = originalWidth
+                height = originalHeight
+            }
+            setBackgroundWrapContent()
+            setParrentWrapContent()
+            keepInScreen()
             if (orientation == 0) {
                 binding.rlBarControllerBottom.visibility = View.VISIBLE
+                binding.rlBarControllerSide.visibility = View.GONE
             } else {
                 binding.rlBarControllerSide.visibility = View.VISIBLE
+                binding.rlBarControllerBottom.visibility = View.GONE
             }
-            surfaceView.visibility = View.VISIBLE
-            surfaceView.setOnTouchListener(surfaceOnTouchListener)
-            surfaceView.setOnGenericMotionListener(surfaceOnGenericMotionListener)
-
-            return
-        }
-        else if (!isMini) {
-            binding.rootClickMask.visibility = View.VISIBLE
-            binding.rlBarControllerBottom.visibility = View.GONE
-            binding.rlBarControllerSide.visibility = View.GONE
-            isMini = true
-
-            if (config.surfaceView == 1) {
-                binding.cvBackground.updateLayoutParams {
-                    width = originalWidth/2
-                    height = originalHeight/2
-                }
+        } else {
+            binding.cvBackground.updateLayoutParams {
+                width = originalWidth
+                height = originalHeight
+            }
+            animateScaleThenResize(
+                binding.cvBackground,
+                0.5F, 0.5F,
+                1F, 1F,
+                0.5F, 0.5F,
+                originalWidth, originalHeight,
+                context
+            ){
+                setBackgroundWrapContent()
+                setParrentWrapContent()
+                bindingLeftBackGesture.root.visibility = View.VISIBLE
+                bindingRightBackGesture.root.visibility = View.VISIBLE
                 keepInScreen()
-            } else {
-                animateResizeCentered(
-                    binding.cvBackground,
-                    originalWidth, originalWidth/2,
-                    originalHeight, originalHeight/2
-                ){
-                    isResize = true
-                    bindingLeftBackGesture.root.visibility = View.GONE
-                    bindingRightBackGesture.root.visibility = View.GONE
-                    keepInScreen()
-                }
             }
-
-            binding.ibRightResize.visibility = View.GONE
-            surfaceView.setOnTouchListener(null)
-            surfaceView.setOnGenericMotionListener(null)
-
-            return
         }
+
+        binding.ibRightResize.visibility = View.VISIBLE
+        if (orientation == 0) {
+            binding.rlBarControllerBottom.visibility = View.VISIBLE
+        } else {
+            binding.rlBarControllerSide.visibility = View.VISIBLE
+        }
+        surfaceView.visibility = View.VISIBLE
+        surfaceView.setOnTouchListener(surfaceOnTouchListener)
+        surfaceView.setOnGenericMotionListener(surfaceOnGenericMotionListener)
     }
 
     private fun setBackgroundWrapContent() {
@@ -1257,25 +1239,25 @@ class AppWindow(
         binding.cvParent.layoutParams = layoutParams
     }
 
-    private fun changeCollapsed() {
+    private fun execEnterCollapsed() {
         isResize = false
-        if (isCollapsed) {
-            binding.rootClickMask.visibility = View.GONE
-            expandWindow()
-            bindingLeftBackGesture.root.visibility = View.VISIBLE
-            bindingRightBackGesture.root.visibility = View.VISIBLE
-        } else {
-            binding.rootClickMask.visibility = View.VISIBLE
-            binding.rlBarControllerBottom.visibility = View.GONE
-            binding.rlBarControllerSide.visibility = View.GONE
-            collapseWindow()
-            bindingLeftBackGesture.root.visibility = View.GONE
-            bindingRightBackGesture.root.visibility = View.GONE
-        }
+        binding.rootClickMask.visibility = View.VISIBLE
+        binding.rlBarControllerBottom.visibility = View.GONE
+        binding.rlBarControllerSide.visibility = View.GONE
+        collapseWindow()
+        bindingLeftBackGesture.root.visibility = View.GONE
+        bindingRightBackGesture.root.visibility = View.GONE
+    }
+
+    private fun execExitCollapsed() {
+        isResize = false
+        binding.rootClickMask.visibility = View.GONE
+        expandWindow()
+        bindingLeftBackGesture.root.visibility = View.VISIBLE
+        bindingRightBackGesture.root.visibility = View.VISIBLE
     }
 
     private fun expandWindow() {
-        isCollapsed = false
         binding.background.visibility = View.VISIBLE
 
         animateResizeCentered(
@@ -1304,8 +1286,6 @@ class AppWindow(
     }
 
     private fun collapseWindow() {
-        isCollapsed = true
-
         CoroutineScope(Dispatchers.Main).launch {
             delay(200)
 
@@ -1339,50 +1319,17 @@ class AppWindow(
 
     private fun rightResize(ibResize: ImageButton) {
         ibResize.setOnTouchListener(object : View.OnTouchListener {
-            var beginX = 0F
-            var beginY = 0F
-            var beginWidth = 0
-            var beginHeight = 0
-
-            var offsetX = 0F
-            var offsetY = 0F
-
             override fun onTouch(v: View, event: MotionEvent): Boolean {
                 when(event.action) {
-                    MotionEvent.ACTION_DOWN -> {
-                        beginX = event.rawX
-                        beginY = event.rawY
-                        binding.vSizePreviewer.layoutParams.let {
-                            beginWidth = it.width
-                            beginHeight = it.height
-                        }
-                        binding.vSizePreviewer.visibility = View.VISIBLE
-                        binding.cvParent.strokeWidth = 0
-                    }
-                    MotionEvent.ACTION_MOVE -> {
-                        offsetX = event.rawX - beginX
-                        offsetY = event.rawY - beginY
-                        binding.vSizePreviewer.updateLayoutParams {
-                            val targetWidth = beginWidth + offsetX.toInt()
-                            if (targetWidth > 0)
-                                width = targetWidth
-                            val targetHeight = beginHeight + offsetY.toInt()
-                            if (targetHeight > 0)
-                                height = targetHeight
-                        }
-                    }
+                    MotionEvent.ACTION_DOWN ->
+                        dispatchInput(WindowInputEvent.Press(displayId, event.eventTime, RegionId.RESIZE_HANDLE, event.rawX, event.rawY))
+                    MotionEvent.ACTION_MOVE ->
+                        dispatchInput(WindowInputEvent.Move(displayId, event.eventTime, RegionId.RESIZE_HANDLE, event.rawX, event.rawY))
                     MotionEvent.ACTION_UP -> {
-                        binding.vSizePreviewer.post {
-                            surfaceView.updateLayoutParams {
-                                width = binding.vSizePreviewer.width
-                                height = binding.vSizePreviewer.height
-                            }
+                        dispatchInput(WindowInputEvent.Up(displayId, event.eventTime, RegionId.RESIZE_HANDLE, event.rawX, event.rawY))
+                        if (config.windowMode == 1) {
+                            updateSmoothBounds()
                         }
-
-                        binding.vSizePreviewer.visibility = View.GONE
-                        moveToTopIfNeed(event)
-                        binding.cvParent.strokeWidth = 2.dpToPx().toInt()
-                        keepInScreen()
                     }
                 }
                 return true
@@ -1390,8 +1337,41 @@ class AppWindow(
         })
     }
 
+    private fun execResizePreviewStart() {
+        binding.vSizePreviewer.layoutParams.let {
+            resizeBeginWidth = it.width
+            resizeBeginHeight = it.height
+        }
+        binding.vSizePreviewer.visibility = View.VISIBLE
+        binding.cvParent.strokeWidth = 0
+    }
+
+    private fun execResizePreviewUpdate(command: WindowCommand.ResizePreviewUpdate) {
+        binding.vSizePreviewer.updateLayoutParams {
+            val targetWidth = resizeBeginWidth + command.dx.toInt()
+            if (targetWidth > 0)
+                width = targetWidth
+            val targetHeight = resizeBeginHeight + command.dy.toInt()
+            if (targetHeight > 0)
+                height = targetHeight
+        }
+    }
+
+    private fun execResizePreviewCommit() {
+        binding.vSizePreviewer.post {
+            surfaceView.updateLayoutParams {
+                width = binding.vSizePreviewer.width
+                height = binding.vSizePreviewer.height
+            }
+        }
+
+        binding.vSizePreviewer.visibility = View.GONE
+        binding.cvParent.strokeWidth = 2.dpToPx().toInt()
+        keepInScreen()
+    }
+
     fun forwardMotionEvent(event: MotionEvent) {
-        if (!isSuperShown) {
+        if (!shell.snapshot().superMenuVisible) {
             val newEvent = MotionEvent.obtain(event)
             newEvent.invokeMethod("setDisplayId", args(displayId), argTypes(Integer.TYPE))
             Instances.inputManager.injectInputEvent(newEvent, 0)
@@ -1404,7 +1384,17 @@ class AppWindow(
             bindingLeftBackGesture.root.visibility = View.VISIBLE
             bindingRightBackGesture.root.visibility = View.VISIBLE
             forwardMotionEvent(event)
-            moveToTopIfNeed(event)
+            when (event.action) {
+                MotionEvent.ACTION_DOWN ->
+                    dispatchInput(WindowInputEvent.Press(displayId, event.eventTime, RegionId.CONTENT, event.rawX, event.rawY))
+                MotionEvent.ACTION_UP ->
+                    dispatchInput(WindowInputEvent.Up(displayId, event.eventTime, RegionId.CONTENT, event.rawX, event.rawY))
+                MotionEvent.ACTION_CANCEL ->
+                    dispatchInput(WindowInputEvent.Cancel(displayId, event.eventTime, RegionId.CONTENT, event.rawX, event.rawY))
+            }
+            if (config.windowMode == 1) {
+                updateSmoothBounds()
+            }
             return true
         }
     }
@@ -1432,27 +1422,9 @@ class AppWindow(
     }
 
     private val moveGestureDetector = GestureDetector(context, object : GestureDetector.SimpleOnGestureListener() {
-        var startX = 0
-        var startY = 0
-        var xAnimation: FlingAnimation? = null
-        var yAnimation: FlingAnimation? = null
-        private var keepInScreenAnimator: ValueAnimator? = null
-        var lastX = 0F
-        var lastY = 0F
-        var last2X = 0F
-        var last2Y = 0F
-
         override fun onDown(e: MotionEvent): Boolean {
-            xAnimation?.cancel()
-            yAnimation?.cancel()
-            keepInScreenAnimator?.cancel()
-            val params = binding.root.layoutParams as WindowManager.LayoutParams
-            startX = params.x
-            startY = params.y
-            currentHighlightedCorner = -1
             return true
         }
-
 
         override fun onScroll(
             e1: MotionEvent?,
@@ -1461,18 +1433,20 @@ class AppWindow(
             distanceY: Float
         ): Boolean {
             e1 ?: return false
-            val params = binding.root.layoutParams as WindowManager.LayoutParams
-            params.x = (startX + (e2.rawX - e1.rawX)).toInt()
-            params.y = (startY + (e2.rawY - e1.rawY)).toInt()
-            Instances.windowManager.updateViewLayout(binding.root, params)
-            if (config.windowMode == 1) updateSmoothBounds()
-            last2X = lastX
-            last2Y = lastY
-            lastX = e2.rawX
-            lastY = e2.rawY
-
-            showCornerDropZone()
-            currentHighlightedCorner = cornerDropZoneView?.updateHighlight(e2.rawX, e2.rawY) ?: -1
+            last2GestureRawX = lastGestureRawX
+            last2GestureRawY = lastGestureRawY
+            lastGestureRawX = e2.rawX
+            lastGestureRawY = e2.rawY
+            updateShellScreenMetrics()
+            dispatchInput(
+                WindowInputEvent.Move(
+                    displayId,
+                    e2.eventTime,
+                    gestureRegion ?: RegionId.BODY_MASK,
+                    e2.rawX,
+                    e2.rawY
+                )
+            )
             return true
         }
 
@@ -1484,76 +1458,22 @@ class AppWindow(
         ): Boolean {
             e1 ?: return false
             if (e1.source == InputDevice.SOURCE_MOUSE) return false
-            val params = binding.root.layoutParams as WindowManager.LayoutParams
-            val displayMetrics = context.resources.displayMetrics
-            val screenWidth = displayMetrics.widthPixels
-            val screenHeight = displayMetrics.heightPixels
-            val windowWidth = binding.root.width
-            val windowHeight = binding.root.height
-
-            val minX = 0f
-            val maxX = (screenWidth - windowWidth).toFloat()
-            val minY = 0f
-            val maxY = (screenHeight - windowHeight).toFloat()
-
-            runCatching {
-                if (sign(velocityX) != sign(e2.rawX - last2X)) return@runCatching
-                xAnimation = flingAnimationOf({
-                    params.x = it.toInt()
-                    runCatching { 
-                        Instances.windowManager.updateViewLayout(binding.root, params)
-                        if (config.windowMode == 1) updateSmoothBounds()
-                    }
-                }, {
-                    params.x.toFloat()
-                })
-                    .setStartVelocity(velocityX)
-                    // If already outside, don't set boundaries here to avoid instant snap.
-                    // keepInScreen() will handle it after the fling or on release.
-                    .apply {
-                        if (params.x >= minX && params.x <= maxX) {
-                            setMinValue(minX)
-                            setMaxValue(maxX)
-                        }
-                    }
-                xAnimation?.addEndListener { _, _, _, _ ->
-                    keepInScreen()
-                }
-                xAnimation?.start()
-            }
-            runCatching {
-                if (sign(velocityY) != sign(e2.rawY - last2Y)) return@runCatching
-                yAnimation = flingAnimationOf({
-                    params.y = it.toInt()
-                    runCatching { 
-                        Instances.windowManager.updateViewLayout(binding.root, params)
-                        if (config.windowMode == 1) updateSmoothBounds()
-                    }
-                }, {
-                    params.y.toFloat()
-                })
-                    .setStartVelocity(velocityY)
-                    .apply {
-                        if (params.y >= minY && params.y <= maxY) {
-                            setMinValue(minY)
-                            setMaxValue(maxY)
-                        }
-                    }
-                yAnimation?.addEndListener { _, _, _, _ ->
-                    keepInScreen()
-                }
-                yAnimation?.start()
-            }
+            flingRefX = e2.rawX
+            flingRefY = e2.rawY
+            dispatchInput(WindowInputEvent.Fling(displayId, e2.eventTime, velocityX, velocityY))
             return true
         }
 
         override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
-            if (isCollapsed) {
-                isMini = false // Always restore to Normal window from Collapsed state
-                changeCollapsed()
-            } else if (isMini) {
-                changeMini()
-            }
+            dispatchInput(
+                WindowInputEvent.TapConfirmed(
+                    displayId,
+                    e.eventTime,
+                    gestureRegion ?: RegionId.BODY_MASK,
+                    e.rawX,
+                    e.rawY
+                )
+            )
             return true
         }
     })
@@ -1578,131 +1498,6 @@ class AppWindow(
 
     private fun hideCornerDropZone() {
         cornerDropZoneView?.visibility = View.GONE
-    }
-
-    private inner class CornerDropZoneView(context: Context) : View(context) {
-        private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
-        private val dashPaint = Paint(Paint.ANTI_ALIAS_FLAG)
-        private fun getRealScreenMetrics(): android.util.DisplayMetrics {
-            val dm = android.util.DisplayMetrics()
-            context.display?.getRealMetrics(dm)
-            return dm
-        }
-
-        private val radius: Float
-            get() {
-                val dm = getRealScreenMetrics()
-                return if (dm.widthPixels > dm.heightPixels) {
-                    dm.heightPixels * 0.20f
-                } else {
-                    dm.widthPixels * 0.20f
-                }
-            }
-        private val proximityRadius: Float
-            get() = radius * 1.75f
-        
-        private var currentCorner = -1 // -1: none, 0: TL, 1: TR, 2: BL, 3: BR
-        private var isInsideActiveZone = false
-
-        init {
-            paint.style = Paint.Style.FILL
-            dashPaint.style = Paint.Style.STROKE
-            dashPaint.strokeWidth = 2f.dpToPx()
-            dashPaint.pathEffect = DashPathEffect(floatArrayOf(10f.dpToPx(), 10f.dpToPx()), 0f)
-        }
-
-        fun updateHighlight(rawX: Float, rawY: Float): Int {
-            if (isCollapsed) return -1 // Collapsed mode: no edge interaction
-
-            val dm = getRealScreenMetrics()
-            val sw = dm.widthPixels.toFloat()
-            val sh = dm.heightPixels.toFloat()
-            
-            val x = rawX
-            val y = rawY
-            
-            if (sw == 0f || sh == 0f) return -1
-
-            // Calculate distance to each corner using orientation-corrected coordinates
-            val distTL = sqrt(x.pow(2) + y.pow(2))
-            val distTR = sqrt((sw - x).pow(2) + y.pow(2))
-            val distBL = sqrt(x.pow(2) + (sh - y).pow(2))
-            val distBR = sqrt((sw - x).pow(2) + (sh - y).pow(2))
-
-            val minDist = min(distTL, min(distTR, min(distBL, distBR)))
-            
-            val corner = if (!isMini) { // Only Normal mode allows corner interaction
-                when {
-                    distTL == minDist && distTL < proximityRadius -> 0
-                    distTR == minDist && distTR < proximityRadius -> 1
-                    distBL == minDist && distBL < proximityRadius -> 2
-                    distBR == minDist && distBR < proximityRadius -> 3
-                    else -> -1
-                }
-            } else -1
-
-            if (corner != -1) {
-                currentCorner = corner
-                isInsideActiveZone = minDist < radius
-            } else {
-                // Check sides: 4 for Left, 5 for Right. Both Normal and Mini modes allow side interaction
-                currentCorner = when {
-                    x < proximityRadius -> 4
-                    x > sw - proximityRadius -> 5
-                    else -> -1
-                }
-                // Active zone: 5% width, 80% height centered
-                isInsideActiveZone = when (currentCorner) {
-                    4 -> x < sw * 0.05f && y > sh * 0.1f && y < sh * 0.9f
-                    5 -> x > sw * 0.95f && y > sh * 0.1f && y < sh * 0.9f
-                    else -> false
-                }
-            }
-
-            invalidate()
-            return if (isInsideActiveZone) currentCorner else -1
-        }
-
-        override fun onDraw(canvas: Canvas) {
-            val dm = getRealScreenMetrics()
-            val w = dm.widthPixels.toFloat()
-            val h = dm.heightPixels.toFloat()
-            if (w == 0f || h == 0f || currentCorner == -1) return
-
-            when (currentCorner) {
-                0 -> drawCorner(canvas, 0f, 0f, 0f, 90f) // TL
-                1 -> drawCorner(canvas, w, 0f, 90f, 90f) // TR
-                2 -> drawCorner(canvas, 0f, h, 270f, 90f) // BL
-                3 -> drawCorner(canvas, w, h, 180f, 90f) // BR
-                4 -> drawSide(canvas, 0f, h * 0.1f, w * 0.05f, h * 0.9f) // Left
-                5 -> drawSide(canvas, w * 0.95f, h * 0.1f, w, h * 0.9f) // Right
-            }
-        }
-
-        private fun drawCorner(canvas: Canvas, cx: Float, cy: Float, startAngle: Float, sweepAngle: Float) {
-            val color = if (isInsideActiveZone) Color.parseColor("#CC61D4FF") else Color.parseColor("#40FFFFFF")
-            val strokeColor = if (isInsideActiveZone) Color.parseColor("#FF61D4FF") else Color.WHITE
-
-            paint.color = color
-            dashPaint.color = strokeColor
-
-            val rectF = RectF(cx - radius, cy - radius, cx + radius, cy + radius)
-            canvas.drawArc(rectF, startAngle, sweepAngle, true, paint)
-            canvas.drawArc(rectF, startAngle, sweepAngle, true, dashPaint)
-        }
-
-        private fun drawSide(canvas: Canvas, left: Float, top: Float, right: Float, bottom: Float) {
-            val color = if (isInsideActiveZone) Color.parseColor("#CC61D4FF") else Color.parseColor("#40FFFFFF")
-            val strokeColor = if (isInsideActiveZone) Color.parseColor("#FF61D4FF") else Color.WHITE
-
-            paint.color = color
-            dashPaint.color = strokeColor
-
-            val rectF = RectF(left, top, right, bottom)
-            val rx = 10f.dpToPx()
-            canvas.drawRoundRect(rectF, rx, rx, paint)
-            canvas.drawRoundRect(rectF, rx, rx, dashPaint)
-        }
     }
 }
 
