@@ -17,8 +17,6 @@ import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.IXposedHookZygoteInit
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
-import de.robv.android.xposed.XposedHelpers
-import de.robv.android.xposed.XposedHelpers.findAndHookMethod
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 import kotlin.concurrent.thread
 
@@ -95,29 +93,6 @@ class HookSystem : IXposedHookZygoteInit, IXposedHookLoadPackage {
             }
         }.onFailure {
             log(TAG, "BroadcastController checkBroadcastFromSystem fail")
-        }
-
-        try {
-            val clazz = XposedHelpers.findClass(
-                "com.android.server.wm.InputMonitor",
-                lpparam.classLoader
-            )
-
-            findAndHookMethod(
-                clazz,
-                "requestFocus",
-                android.os.IBinder::class.java,
-                String::class.java,
-                object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        val thisObject = param.thisObject
-                        val displayId = XposedHelpers.getIntField(thisObject, "mDisplayId")
-                        YAMFManager.currentDisplayId = displayId
-                    }
-                }
-            )
-        } catch (e: Throwable) {
-            XposedBridge.log("[XposedHook] Error hooking requestFocus: ${e.message}")
         }
     }
 }

@@ -45,7 +45,6 @@ import com.buildsession.betterYAMF.xposed.utils.getActivityInfoCompat
 import com.buildsession.betterYAMF.xposed.utils.getTopRootTask
 import com.buildsession.betterYAMF.xposed.utils.log
 import com.buildsession.betterYAMF.xposed.utils.registerReceiver
-import com.buildsession.betterYAMF.xposed.utils.startAuto
 import com.qauxv.ui.CommonContextWrapper
 import de.robv.android.xposed.XposedHelpers
 import rikka.hidden.compat.ActivityManagerApis
@@ -76,14 +75,12 @@ object YAMFManager : IYAMFManager.Stub() {
     private val activeWindows = mutableMapOf<Int, AppWindow>()
     val smoothFreeformTasks = mutableSetOf<Int>()
     val smoothFreeformBounds = mutableMapOf<Int, android.graphics.Rect>()
-    val pendingSmoothFreeformApps = mutableSetOf<ComponentName>()
+    val pendingSmoothFreeformApps = mutableMapOf<ComponentName, AppWindow>()
     lateinit var config: Config
     val configFile = File("/data/system/BetterYAMF.json")
     private var openWindowCount = 0
     private val iOpenCountListenerSet = mutableSetOf<IOpenCountListener>()
     lateinit var activityManagerService: Any
-    private val listeners = mutableListOf<TopDisplayId>()
-    var currentDisplayId = 0
 
     private const val WINDOWING_MODE_FULLSCREEN = 1
     private const val WINDOWING_MODE_FREEFORM = 5
@@ -95,24 +92,26 @@ object YAMFManager : IYAMFManager.Stub() {
                     "onTaskMovedToFront" -> {
                         val taskInfo = args[0] as android.app.ActivityManager.RunningTaskInfo
                         activeWindows.values.forEach { it.onTaskMovedToFront(taskInfo) }
-                        
-                        // If a task is moved to front and it's in FREEFORM, and we are in smooth mode,
-                        // consider adding it to smoothFreeformTasks if it's not already there.
-                        // Or if it's moved to FULLSCREEN, remove it.
-                        if (config.windowMode == 1) {
-                            val windowingMode = XposedHelpers.getIntField(taskInfo, "windowingMode")
-                            if (windowingMode == WINDOWING_MODE_FREEFORM) {
-                                val topActivity = taskInfo.topActivity
-                                if (topActivity != null && pendingSmoothFreeformApps.contains(topActivity)) {
+
+                        // 若首帧时任务已是 FREEFORM 的任务尚未登记（例如从菜单直启），补登记并立即套用缩放链路；
+                        // 切回 FULLSCREEN 的任务则移出登记。
+                        val windowingMode = XposedHelpers.getIntField(taskInfo, "windowingMode")
+                        if (windowingMode == WINDOWING_MODE_FREEFORM) {
+                            val topActivity = taskInfo.topActivity
+                            if (topActivity != null) {
+                                val pendingWindow = pendingSmoothFreeformApps[topActivity]
+                                if (pendingWindow != null) {
                                     smoothFreeformTasks.add(taskInfo.taskId)
                                     pendingSmoothFreeformApps.remove(topActivity)
                                     // Trigger a config change to apply spoofing/scaling immediately
                                     switchToSmoothFreeform(taskInfo.taskId)
+                                    pendingWindow.currentTaskId = taskInfo.taskId
+                                    pendingWindow.onTaskMovedToFront(taskInfo)
                                 }
-                            } else if (windowingMode == WINDOWING_MODE_FULLSCREEN) {
-                                smoothFreeformTasks.remove(taskInfo.taskId)
-                                smoothFreeformBounds.remove(taskInfo.taskId)
                             }
+                        } else if (windowingMode == WINDOWING_MODE_FULLSCREEN) {
+                            smoothFreeformTasks.remove(taskInfo.taskId)
+                            smoothFreeformBounds.remove(taskInfo.taskId)
                         }
                     }
                     "onTaskDescriptionChanged" -> {
@@ -218,53 +217,46 @@ object YAMFManager : IYAMFManager.Stub() {
 
     fun createWindow(startCmd: StartCmd?) {
         Instances.iStatusBarService.collapsePanels()
-        
-        val isSmooth = config.windowMode == 1
-        val taskId = startCmd?.taskId ?: -1
 
-        if (isSmooth && taskId != -1) {
+        val taskId = startCmd?.taskId ?: -1
+        if (taskId != -1) {
             smoothFreeformTasks.add(taskId)
         }
 
         AppWindow(
-            CommonContextWrapper.createAppCompatContext(systemUiContext.createContext()),
-            config.flags
-        ) { window, displayId ->
-            addWindow(displayId, window)
-            
-            if (isSmooth) {
-                if (taskId != -1) {
-                    switchToSmoothFreeform(taskId)
-                    window.currentTaskId = taskId
-                } else if (startCmd?.componentName != null) {
-                    pendingSmoothFreeformApps.add(startCmd.componentName)
-                    // Start new activity in freeform
-                    val options = android.app.ActivityOptions.makeBasic()
-                    XposedHelpers.callMethod(options, "setLaunchWindowingMode", WINDOWING_MODE_FREEFORM)
-                    
-                    val intent = Intent().apply {
-                        component = startCmd.componentName
-                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                        addFlags(Intent.FLAG_ACTIVITY_NEW_DOCUMENT)
-                        addFlags(Intent.FLAG_ACTIVITY_MULTIPLE_TASK)
-                    }
-                    
-                    val userHandle = XposedHelpers.callStaticMethod(
-                        android.os.UserHandle::class.java,
-                        "of",
-                        startCmd.userId ?: 0
-                    )
-                    
-                    XposedHelpers.callMethod(
-                        Instances.systemContext,
-                        "startActivityAsUser",
-                        intent,
-                        options.toBundle(),
-                        userHandle
-                    )
+            CommonContextWrapper.createAppCompatContext(systemUiContext.createContext())
+        ) { window, windowId ->
+            addWindow(windowId, window)
+
+            if (taskId != -1) {
+                switchToSmoothFreeform(taskId)
+                window.currentTaskId = taskId
+            } else if (startCmd?.componentName != null) {
+                pendingSmoothFreeformApps[startCmd.componentName] = window
+                // Start new activity in freeform
+                val options = android.app.ActivityOptions.makeBasic()
+                XposedHelpers.callMethod(options, "setLaunchWindowingMode", WINDOWING_MODE_FREEFORM)
+                
+                val intent = Intent().apply {
+                    component = startCmd.componentName
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_DOCUMENT)
+                    addFlags(Intent.FLAG_ACTIVITY_MULTIPLE_TASK)
                 }
-            } else {
-                startCmd?.startAuto(displayId)
+                
+                val userHandle = XposedHelpers.callStaticMethod(
+                    android.os.UserHandle::class.java,
+                    "of",
+                    startCmd.userId ?: 0
+                )
+                
+                XposedHelpers.callMethod(
+                    Instances.systemContext,
+                    "startActivityAsUser",
+                    intent,
+                    options.toBundle(),
+                    userHandle
+                )
             }
         }
     }
@@ -315,6 +307,27 @@ object YAMFManager : IYAMFManager.Stub() {
         val windowOrganizerController = XposedHelpers.callMethod(Instances.activityTaskManager, "getWindowOrganizerController")
         XposedHelpers.callMethod(windowOrganizerController, "applyTransaction", wct)
         // log(TAG, "Switched task $taskId to smooth freeform")
+    }
+
+    fun switchTaskToFullscreen(taskId: Int): Boolean {
+        smoothFreeformTasks.remove(taskId)
+        smoothFreeformBounds.remove(taskId)
+        
+        val classLoader = Instances.systemContext.classLoader
+        val wctClass = classLoader.loadClass("android.window.WindowContainerTransaction")
+        val wct = XposedHelpers.newInstance(wctClass)
+        
+        val runningTasks = XposedHelpers.callMethod(Instances.activityTaskManager, "getTasks", Int.MAX_VALUE, false, false, -1) as List<*>
+        val taskInfo = runningTasks.find { 
+            XposedHelpers.getIntField(it, "taskId") == taskId 
+        } ?: return false
+        
+        val token = XposedHelpers.getObjectField(taskInfo, "token")
+        XposedHelpers.callMethod(wct, "setWindowingMode", token, WINDOWING_MODE_FULLSCREEN)
+        
+        val windowOrganizerController = XposedHelpers.callMethod(Instances.activityTaskManager, "getWindowOrganizerController")
+        XposedHelpers.callMethod(windowOrganizerController, "applyTransaction", wct)
+        return true
     }
 
     init {
