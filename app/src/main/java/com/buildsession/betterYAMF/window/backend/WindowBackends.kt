@@ -29,5 +29,6 @@ private object NoopWindowBackend : WindowBackend {
     override fun ensureTaskVisible(taskId: Int) {}
     override fun setTaskFocusable(taskId: Int, focusable: Boolean) {}
     override fun bringTaskToFront(taskId: Int): Boolean = false
+    override fun isAlwaysOnTopActive(): Boolean = false
     override fun isTaskManaged(taskId: Int): Boolean = false
 }

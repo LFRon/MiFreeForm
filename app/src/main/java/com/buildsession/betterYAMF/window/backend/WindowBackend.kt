@@ -51,6 +51,13 @@ interface WindowBackend {
     /** 置前（回置顶等）。返回系统调用是否成功。 */
     fun bringTaskToFront(taskId: Int): Boolean
 
+    /**
+     * 是否已获得系统级置顶身份（承载根 always-on-top）：
+     * 生效时宿主不得再做任何"抢层/回置顶"动作（层级由系统排序规则保证），
+     * 仅保留焦点/几何等语义维护。
+     */
+    fun isAlwaysOnTopActive(): Boolean
+
     /** 任务是否由本后端接管（窗口语义成立，可施加几何/焦点操作）。 */
     fun isTaskManaged(taskId: Int): Boolean
 }

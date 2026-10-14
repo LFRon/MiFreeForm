@@ -938,6 +938,18 @@ class AppWindow(
 
     private fun keepAboveHome() {
         if (isDestroyed) return
+        // 置顶身份（承载根 always-on-top）生效后，层序由系统排序规则保证：
+        // 此时任何"回置顶"（bringTaskToFront/reorder）都是多余的抢层动作，正是与
+        // recents 手势/过渡互相打断的来源 → 直接让路。
+        // 仅保留"浮窗不持有焦点"的既定语义（否则可能抢走 home/下方应用的焦点）。
+        if (YAMFManager.windowBackend.isAlwaysOnTopActive()) {
+            log(TAG, "keepAboveHome skip (always-on-top) task=$currentTaskId")
+            val managedTaskId = currentTaskId
+            if (managedTaskId > 0) {
+                runCatching { YAMFManager.windowBackend.setTaskFocusable(managedTaskId, false) }
+            }
+            return
+        }
         val taskId = currentTaskId
         if (taskId <= 0) return
         if (reFrontScheduled) return
