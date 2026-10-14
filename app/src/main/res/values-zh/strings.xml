@@ -27,6 +27,7 @@
     <string name="reset_all_window">重置所有窗口</string>
     <string name="window_size_separator">x</string>
     <string name="default_window_size_text">默认窗口大小</string>
+    <string name="window_size_auto">自动</string>
     <string name="keep_alive_service_text">保持 BetterYAMF 在后台运行</string>
     <string name="collapsed_app_icon">折叠视图的应用图标</string>
     <string name="wow_nsuch_empty">哇！\n空荡荡~</string>
