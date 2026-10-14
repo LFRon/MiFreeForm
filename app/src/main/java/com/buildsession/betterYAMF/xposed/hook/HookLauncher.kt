@@ -52,6 +52,7 @@ import com.github.kyuubiran.ezxhelper.utils.newInstance
 import com.github.kyuubiran.ezxhelper.utils.paramCount
 import com.buildsession.betterYAMF.R
 import com.buildsession.betterYAMF.xposed.hook.launcher.LauncherInputAnchors
+import com.buildsession.betterYAMF.xposed.hook.launcher.ManagedTaskFilter
 import com.buildsession.betterYAMF.xposed.services.YAMFManager
 import com.buildsession.betterYAMF.xposed.utils.dpToPx
 import com.buildsession.betterYAMF.xposed.utils.log
@@ -151,6 +152,9 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
             findMethod(tisClass) { name == "onCreate" }.hookAfter { param ->
                 // log(TAG, "TouchInteractionService#onCreate hooked in ${lpparam.packageName}")
                 val context = param.thisObject as android.app.Service
+
+                // M6 批次2：委托独立组件（接收器注册 + 主动查询当前受管任务集合）
+                ManagedTaskFilter.ensureReceiverRegistered(context)
                 
                 // 确保在主线程执行 UI 操作
                 mMainHandler.post {
@@ -192,6 +196,10 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                     }
                 }
             }
+
+            // M6 批次2：手势目标任务过滤——委托独立组件（把受管浮窗任务从 TopTaskTracker
+            // 的判定中剔除，使上滑/快速切换等手势永远以"下方应用"为目标）。
+            ManagedTaskFilter.installTopTaskFilters(lpparam.classLoader)
 
             val inputAnchor = LauncherInputAnchors.resolve(lpparam.classLoader)
             if (inputAnchor != null) {
