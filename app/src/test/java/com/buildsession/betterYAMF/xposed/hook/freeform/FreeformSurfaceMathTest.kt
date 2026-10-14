@@ -23,10 +23,21 @@ class FreeformSurfaceMathTest {
     }
 
     @Test
-    fun computesAnisotropicScale() {
+    fun fitsUniformScaleAndCentersContentVertically() {
         val t = FreeformSurfaceMath.compute(0, 0, 250, 500, 1000, 1000)!!
         assertEquals(0.25f, t.scaleX, 0.0001f)
+        assertEquals(0.25f, t.scaleY, 0.0001f)
+        assertEquals(0f, t.positionX, 0.0001f)
+        assertEquals(125f, t.positionY, 0.0001f)
+    }
+
+    @Test
+    fun fitsUniformScaleAndCentersContentHorizontally() {
+        val t = FreeformSurfaceMath.compute(10, 20, 1000, 500, 1000, 1000)!!
+        assertEquals(0.5f, t.scaleX, 0.0001f)
         assertEquals(0.5f, t.scaleY, 0.0001f)
+        assertEquals(260f, t.positionX, 0.0001f)
+        assertEquals(20f, t.positionY, 0.0001f)
     }
 
     @Test

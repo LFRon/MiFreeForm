@@ -17,13 +17,21 @@ object FreeformSurfaceMath {
         spoofedHeight: Int
     ): TaskSurfaceTransform? {
         if (spoofedWidth <= 0 || spoofedHeight <= 0) return null
+        if (physicalWidth <= 0 || physicalHeight <= 0) return null
+        val scale = minOf(
+            physicalWidth.toFloat() / spoofedWidth,
+            physicalHeight.toFloat() / spoofedHeight
+        )
+        val scaledWidth = spoofedWidth * scale
+        val scaledHeight = spoofedHeight * scale
         return TaskSurfaceTransform(
-            scaleX = physicalWidth.toFloat() / spoofedWidth,
-            scaleY = physicalHeight.toFloat() / spoofedHeight,
-            positionX = physicalLeft.toFloat(),
-            positionY = physicalTop.toFloat()
+            scaleX = scale,
+            scaleY = scale,
+            positionX = physicalLeft + (physicalWidth - scaledWidth) / 2f,
+            positionY = physicalTop + (physicalHeight - scaledHeight) / 2f
         )
     }
 
-    fun inputScale(surfaceScaleX: Float): Float = 1.0f / surfaceScaleX
+    fun inputScale(surfaceScaleX: Float): Float =
+        if (surfaceScaleX > 0f) 1.0f / surfaceScaleX else 1.0f
 }
