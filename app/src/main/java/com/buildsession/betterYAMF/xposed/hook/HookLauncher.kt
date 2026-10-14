@@ -92,6 +92,7 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
     private var mCurrentRotation = 0
     private var mIsAlreadyVisual = true
     private var mIsPotentialSwipeUp = false
+    private var mSuppressArmed = false
 
     private fun updateDimensions(context: android.content.Context) {
         val wm = context.getSystemService(android.content.Context.WINDOW_SERVICE) as WindowManager
@@ -254,6 +255,10 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                             mCurrentTaskId = -1
                             // 只有从底部 5% 区域开始的滑动才被认为是潜在的上划手势
                             mIsPotentialSwipeUp = correctedY > mScreenHeight * 0.95
+                            mSuppressArmed = mIsPotentialSwipeUp
+                            if (mSuppressArmed) {
+                                suppressRecentsGesture(900L)
+                            }
                             // log(TAG, "ACTION_DOWN at ($correctedX, $correctedY), potential=$mIsPotentialSwipeUp")
                         }
 
@@ -307,7 +312,7 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                                         mMainHandler.post {
                                             mDropZoneView?.visibility = View.VISIBLE
                                         }
-                                        // log(TAG, "Swipe up threshold reached with taskId $mCurrentTaskId")
+                                        log(TAG, "Swipe up threshold reached with taskId $mCurrentTaskId")
                                     } else {
                                         // 如果不是有效的任务（例如在桌面），则不再处理后续 MOVE
                                         mIsPotentialSwipeUp = false
@@ -328,15 +333,20 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                         }
 
                         MotionEvent.ACTION_UP -> {
-                                // log(TAG, "ACTION_UP at ($correctedX, $correctedY), isInZone=$isInZone, isShowing=$mIsShowingZone, taskId=$mCurrentTaskId")
+                                if (mSuppressArmed) {
+                                    mSuppressArmed = false
+                                    suppressRecentsGesture(450L)
+                                }
+                                log(TAG, "ACTION_UP at ($correctedX, $correctedY), isInZone=$isInZone, isShowing=$mIsShowingZone, taskId=$mCurrentTaskId")
                                 if (mIsShowingZone && isInZone && mCurrentTaskId != -1) {
                                     val intent = Intent(YAMFManager.ACTION_OPEN_IN_YAMF).apply {
                                         setPackage("android")
                                         putExtra(YAMFManager.EXTRA_TASK_ID, mCurrentTaskId)
                                         putExtra(YAMFManager.EXTRA_SOURCE, YAMFManager.SOURCE_RECENT)
+                                        putExtra(YAMFManager.EXTRA_FROM_DROP_ZONE, true)
                                     }
                                     AndroidAppHelper.currentApplication().sendBroadcast(intent)
-                                    // log(TAG, "Sent broadcast to open task $mCurrentTaskId in YAMF")
+                                    log(TAG, "Sent broadcast to open task $mCurrentTaskId in YAMF")
                                     
                                     mMainHandler.post {
                                         Toast.makeText(
@@ -354,6 +364,10 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                             }
 
                             MotionEvent.ACTION_CANCEL -> {
+                                if (mSuppressArmed) {
+                                    mSuppressArmed = false
+                                    suppressRecentsGesture(450L)
+                                }
                                 // log(TAG, "ACTION_CANCEL")
                                 mMainHandler.post {
                                     mDropZoneView?.visibility = View.GONE
@@ -562,6 +576,18 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
 
     private fun hookTransientTaskbar(lpparam: XC_LoadPackage.LoadPackageParam) {
         // log(TAG, "hooking transient taskbar ${lpparam.packageName}")
+    }
+
+    private fun suppressRecentsGesture(durationMs: Long) {
+        runCatching {
+            val intent = Intent(YAMFManager.ACTION_RECENTS_GESTURE).apply {
+                setPackage("android")
+                putExtra(YAMFManager.EXTRA_SUPPRESS_MS, durationMs)
+            }
+            AndroidAppHelper.currentApplication().sendBroadcast(intent)
+        }.onFailure {
+            log(TAG, "suppressRecentsGesture failed", it)
+        }
     }
 
     private fun updateDropZoneColor(isInZone: Boolean) {
