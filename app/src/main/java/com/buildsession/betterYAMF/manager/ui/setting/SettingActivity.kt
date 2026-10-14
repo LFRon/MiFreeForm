@@ -86,7 +86,8 @@ class SettingActivity : AppCompatActivity() {
         binding?.apply {
             sColoerd.isChecked = config.coloredController
             sBackHome.isChecked = config.recentBackHome
-            etSizeH.setText(config.defaultWindowHeight.toString())
+            etSizeH.hint = getString(R.string.window_size_auto)
+            etSizeH.setText(if (config.defaultWindowHeight > 0) config.defaultWindowHeight.toString() else "")
             etSizeW.setText(config.defaultWindowWidth.toString())
             sHookLauncherHookRecents.isChecked = config.hookLauncher.hookRecents
             sHookLauncherHookTaskbar.isChecked = config.hookLauncher.hookTaskbar
@@ -111,7 +112,7 @@ class SettingActivity : AppCompatActivity() {
         binding?.apply {
             config.coloredController = sColoerd.isChecked
             config.recentBackHome = sBackHome.isChecked
-            config.defaultWindowHeight = etSizeH.text.toString().toIntOrNull() ?: config.defaultWindowHeight
+            config.defaultWindowHeight = etSizeH.text.toString().toIntOrNull() ?: 0
             config.defaultWindowWidth = etSizeW.text.toString().toIntOrNull() ?: config.defaultWindowWidth
             config.hookLauncher.hookRecents = sHookLauncherHookRecents.isChecked
             config.hookLauncher.hookTaskbar = sHookLauncherHookTaskbar.isChecked
