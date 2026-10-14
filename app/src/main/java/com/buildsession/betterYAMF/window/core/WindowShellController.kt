@@ -137,14 +137,16 @@ class WindowShellController(
     }
 
     private fun decideDrop(out: MutableList<WindowCommand>) {
-        when (dropActive) {
+        val kind = dropActive
+        when (kind) {
             DropKind.CORNER_TL, DropKind.CORNER_TR, DropKind.CORNER_BL, DropKind.CORNER_BR -> {
-                out += WindowCommand.EnterMini(windowId)
+                out += WindowCommand.EnterMini(windowId, kind)
                 mode = ShellMode.MINI
             }
+            // 侧边吸附与角落一致：缩小并贴边显示应用画面（不再收起为图标球）
             DropKind.SIDE_LEFT, DropKind.SIDE_RIGHT -> {
-                out += WindowCommand.EnterCollapsed(windowId)
-                mode = ShellMode.COLLAPSED
+                out += WindowCommand.EnterMini(windowId, kind)
+                mode = ShellMode.MINI
             }
             null -> out += WindowCommand.ClampToScreen(windowId, animated = true)
         }

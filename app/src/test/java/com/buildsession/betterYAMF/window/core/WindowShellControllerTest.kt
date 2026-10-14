@@ -88,23 +88,23 @@ class WindowShellControllerTest {
             c.feed(move(RegionId.BODY_MASK, 10f, 10f))
         )
         assertEquals(
-            listOf(WindowCommand.EnterMini(1), WindowCommand.DropZoneHide(1)),
+            listOf(WindowCommand.EnterMini(1, DropKind.CORNER_TL), WindowCommand.DropZoneHide(1)),
             c.feed(up(RegionId.BODY_MASK, 10f, 10f))
         )
         assertEquals(ShellMode.MINI, c.snapshot().mode)
     }
 
     @Test
-    fun sideDropEntersCollapsedAndTapConfirmedExpands() {
+    fun sideDropEntersSideMiniAndTapConfirmedExpands() {
         val c = controller()
         c.feed(press(RegionId.BODY_MASK, 10f, 1000f))
         c.feed(move(RegionId.BODY_MASK, 10f, 1000f))
         assertEquals(
-            listOf(WindowCommand.EnterCollapsed(1), WindowCommand.DropZoneHide(1)),
+            listOf(WindowCommand.EnterMini(1, DropKind.SIDE_LEFT), WindowCommand.DropZoneHide(1)),
             c.feed(up(RegionId.BODY_MASK, 10f, 1000f))
         )
-        assertEquals(ShellMode.COLLAPSED, c.snapshot().mode)
-        assertEquals(listOf<WindowCommand>(WindowCommand.ExitCollapsed(1)), c.feed(tapConfirmed()))
+        assertEquals(ShellMode.MINI, c.snapshot().mode)
+        assertEquals(listOf<WindowCommand>(WindowCommand.ExitMini(1)), c.feed(tapConfirmed()))
         assertEquals(ShellMode.NORMAL, c.snapshot().mode)
     }
 
@@ -143,18 +143,17 @@ class WindowShellControllerTest {
         c.feed(press(RegionId.BODY_MASK, 10f, 1000f))
         c.feed(move(RegionId.BODY_MASK, 10f, 1000f))
         assertEquals(
-            listOf(WindowCommand.EnterCollapsed(1), WindowCommand.DropZoneHide(1)),
+            listOf(WindowCommand.EnterMini(1, DropKind.SIDE_LEFT), WindowCommand.DropZoneHide(1)),
             c.feed(up(RegionId.BODY_MASK, 10f, 1000f))
         )
-        assertEquals(ShellMode.COLLAPSED, c.snapshot().mode)
+        assertEquals(ShellMode.MINI, c.snapshot().mode)
     }
 
     @Test
     fun collapsedDragShowsZoneWithoutHoverAndClamps() {
         val c = controller()
-        c.feed(press(RegionId.BODY_MASK, 10f, 1000f))
-        c.feed(move(RegionId.BODY_MASK, 10f, 1000f))
-        c.feed(up(RegionId.BODY_MASK, 10f, 1000f))
+        c.feed(tap(RegionId.BUTTON_COLLAPSE))
+        assertEquals(ShellMode.COLLAPSED, c.snapshot().mode)
 
         c.feed(press(RegionId.BODY_MASK, 10f, 1000f))
         assertEquals(
@@ -269,7 +268,7 @@ class WindowShellControllerTest {
         c.feed(press(RegionId.BODY_MASK, 10f, 10f))
         c.feed(move(RegionId.BODY_MASK, 10f, 10f))
         assertEquals(
-            listOf(WindowCommand.EnterMini(1), WindowCommand.DropZoneHide(1)),
+            listOf(WindowCommand.EnterMini(1, DropKind.CORNER_TL), WindowCommand.DropZoneHide(1)),
             c.feed(cancel(RegionId.BODY_MASK, 10f, 10f))
         )
         assertEquals(ShellMode.MINI, c.snapshot().mode)
