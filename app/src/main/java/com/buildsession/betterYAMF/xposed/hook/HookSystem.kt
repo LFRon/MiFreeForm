@@ -8,6 +8,7 @@ import com.github.kyuubiran.ezxhelper.utils.findMethod
 import com.github.kyuubiran.ezxhelper.utils.hookAfter
 import com.github.kyuubiran.ezxhelper.utils.hookBefore
 import com.buildsession.betterYAMF.BuildConfig
+import com.buildsession.betterYAMF.xposed.hook.freeform.FreeformBackend
 import com.buildsession.betterYAMF.xposed.services.UserService
 import com.buildsession.betterYAMF.xposed.services.YAMFManager
 import com.buildsession.betterYAMF.xposed.utils.log
@@ -38,9 +39,9 @@ class HookSystem : IXposedHookZygoteInit, IXposedHookLoadPackage {
         EzXHelperInit.initHandleLoadPackage(lpparam)
         Initiator.init(lpparam.classLoader)
         runCatching {
-            FreeformHook.init(lpparam.classLoader)
+            FreeformBackend.init(lpparam.classLoader)
         }.onFailure {
-            log(TAG, "FreeformHook init failed, but continuing for legacy support", it)
+            log(TAG, "FreeformBackend init failed, but continuing for legacy support", it)
         }
 
          var serviceManagerHook: XC_MethodHook.Unhook? = null

@@ -1,7 +1,8 @@
-package com.buildsession.betterYAMF.xposed.hook
+package com.buildsession.betterYAMF.xposed.hook.freeform
 
 import android.content.res.Configuration
 import android.graphics.Rect
+import android.os.Build
 import android.view.SurfaceControl
 import com.buildsession.betterYAMF.xposed.services.YAMFManager
 import com.buildsession.betterYAMF.xposed.utils.log
@@ -10,16 +11,21 @@ import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 
-object FreeformHook {
-    private const val TAG = "reYAMF_FreeformHook"
+object FreeformBackend {
+    private const val TAG = "reYAMF_FreeformBackend"
     private const val WINDOWING_MODE_FULLSCREEN = 1
     private const val WINDOWING_MODE_FREEFORM = 5
 
     fun init(classLoader: ClassLoader) {
+        val policy = FreeformPolicies.forSdk(Build.VERSION.SDK_INT)
+        log(TAG, "init with policy: ${policy.displayName}")
         runCatching { hookRelaunch(classLoader) }.onFailure { log(TAG, "hookRelaunch failed", it) }
         runCatching { hookAdditionalRelaunchPoints(classLoader) }.onFailure { log(TAG, "hookAdditionalRelaunchPoints failed", it) }
-        runCatching { hookConfigSpoofing(classLoader) }.onFailure { log(TAG, "hookConfigSpoofing failed", it) }
-        runCatching { hookSurfaceScaling(classLoader) }.onFailure { log(TAG, "hookSurfaceScaling failed", it) }
+        runCatching { hookConfigSpoofing(classLoader, policy) }.onFailure { log(TAG, "hookConfigSpoofing failed", it) }
+        runCatching { hookSurfaceScaling(classLoader, policy) }.onFailure { log(TAG, "hookSurfaceScaling failed", it) }
+        if (policy.reassertTaskTransforms) {
+            runCatching { hookSurfaceReassertions(classLoader, policy) }.onFailure { log(TAG, "hookSurfaceReassertions failed", it) }
+        }
         runCatching { hookInputScaling(classLoader) }.onFailure { log(TAG, "hookInputScaling failed", it) }
     }
 
@@ -104,13 +110,19 @@ object FreeformHook {
         }
     }
 
-    private fun hookConfigSpoofing(classLoader: ClassLoader) {
+    private fun hookConfigSpoofing(classLoader: ClassLoader, policy: FreeformPolicy) {
         val taskFragmentClass = classLoader.loadClass("com.android.server.wm.TaskFragment")
+        val hintClassName = FreeformResolver.firstLoadable(classLoader, policy.configOverrideHintCandidates)
+        if (hintClassName == null) {
+            log(TAG, "ConfigOverrideHint not found (${policy.configOverrideHintCandidates}), config spoofing disabled")
+            return
+        }
+        log(TAG, "ConfigOverrideHint resolved to $hintClassName")
         
         XposedHelpers.findAndHookMethod(taskFragmentClass, "computeConfigResourceOverrides",
             Configuration::class.java,
             Configuration::class.java,
-            "com.android.server.wm.TaskFragment\$ConfigOverrideHint",
+            hintClassName,
             object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
                     val taskFragment = param.thisObject
@@ -149,32 +161,81 @@ object FreeformHook {
         )
     }
 
-    private fun hookSurfaceScaling(classLoader: ClassLoader) {
+    private fun hookSurfaceScaling(classLoader: ClassLoader, policy: FreeformPolicy) {
         val taskClass = classLoader.loadClass("com.android.server.wm.Task")
         
         findMethod(taskClass) {
             name == "onConfigurationChanged" && paramCount == 1
         }.hookAfter { param ->
-            val task = param.thisObject
-            val taskId = XposedHelpers.getIntField(task, "mTaskId")
-            
-            if (YAMFManager.smoothFreeformTasks.contains(taskId)) {
-                val physicalBounds = YAMFManager.smoothFreeformBounds[taskId] ?: return@hookAfter
-                val config = XposedHelpers.callMethod(task, "getConfiguration") as Configuration
-                val windowConfig = XposedHelpers.getObjectField(config, "windowConfiguration")
-                val spoofedBounds = XposedHelpers.callMethod(windowConfig, "getBounds") as Rect
-                
-                if (spoofedBounds.isEmpty) return@hookAfter
-                
-                val scaleX = physicalBounds.width().toFloat() / spoofedBounds.width()
-                val scaleY = physicalBounds.height().toFloat() / spoofedBounds.height()
-                
-                val surfaceControl = XposedHelpers.getObjectField(task, "mSurfaceControl") as? SurfaceControl ?: return@hookAfter
-                val transaction = XposedHelpers.callMethod(task, "getSyncTransaction") as SurfaceControl.Transaction
-                
-                XposedHelpers.callMethod(transaction, "setMatrix", surfaceControl, scaleX, 0f, 0f, scaleY)
-                XposedHelpers.callMethod(transaction, "setPosition", surfaceControl, physicalBounds.left.toFloat(), physicalBounds.top.toFloat())
-            }
+            applyTaskTransform(param.thisObject, policy.clearTaskCrop)
+        }
+    }
+
+    private fun hookSurfaceReassertions(classLoader: ClassLoader, policy: FreeformPolicy) {
+        val taskClass = classLoader.loadClass("com.android.server.wm.Task")
+
+        findMethod(taskClass) {
+            name == "updateSurfaceSize" && paramCount == 1
+        }.hookAfter { param ->
+            val transaction = param.args[0] as? SurfaceControl.Transaction ?: return@hookAfter
+            applyTaskTransformOnTransaction(param.thisObject, transaction, policy.clearTaskCrop)
+        }
+
+        findMethod(taskClass) {
+            name == "resetSurfaceControlTransforms" && paramCount == 0
+        }.hookAfter { param ->
+            applyTaskTransform(param.thisObject, policy.clearTaskCrop)
+        }
+
+        findMethod(taskClass) {
+            name == "prepareSurfaces" && paramCount == 0
+        }.hookAfter { param ->
+            applyTaskTransform(param.thisObject, policy.clearTaskCrop)
+        }
+    }
+
+    private fun applyTaskTransform(task: Any, clearCrop: Boolean) {
+        val transaction = runCatching {
+            XposedHelpers.callMethod(task, "getSyncTransaction") as SurfaceControl.Transaction
+        }.getOrNull() ?: return
+        applyTaskTransformOnTransaction(task, transaction, clearCrop)
+    }
+
+    private fun applyTaskTransformOnTransaction(
+        task: Any,
+        transaction: SurfaceControl.Transaction,
+        clearCrop: Boolean
+    ) {
+        val taskId = runCatching { XposedHelpers.getIntField(task, "mTaskId") }.getOrDefault(-1)
+        if (!YAMFManager.smoothFreeformTasks.contains(taskId)) return
+        val physicalBounds = YAMFManager.smoothFreeformBounds[taskId] ?: return
+
+        val config = XposedHelpers.callMethod(task, "getConfiguration") as Configuration
+        val windowConfig = XposedHelpers.getObjectField(config, "windowConfiguration")
+        val spoofedBounds = XposedHelpers.callMethod(windowConfig, "getBounds") as Rect
+
+        val transform = FreeformSurfaceMath.compute(
+            physicalLeft = physicalBounds.left,
+            physicalTop = physicalBounds.top,
+            physicalWidth = physicalBounds.width(),
+            physicalHeight = physicalBounds.height(),
+            spoofedWidth = spoofedBounds.width(),
+            spoofedHeight = spoofedBounds.height()
+        ) ?: return
+
+        val surfaceControl = XposedHelpers.getObjectField(task, "mSurfaceControl") as? SurfaceControl ?: return
+
+        XposedHelpers.callMethod(transaction, "setMatrix", surfaceControl, transform.scaleX, 0f, 0f, transform.scaleY)
+        XposedHelpers.callMethod(transaction, "setPosition", surfaceControl, transform.positionX, transform.positionY)
+
+        if (clearCrop) {
+            XposedHelpers.callMethod(
+                transaction,
+                "setWindowCrop",
+                arrayOf<Class<*>>(SurfaceControl::class.java, Rect::class.java),
+                surfaceControl,
+                null
+            )
         }
     }
 
@@ -197,14 +258,21 @@ object FreeformHook {
                         val windowConfig = XposedHelpers.getObjectField(config, "windowConfiguration")
                         val spoofedBounds = XposedHelpers.callMethod(windowConfig, "getBounds") as Rect
                         
-                        if (spoofedBounds.isEmpty) return
-                        
-                        val scaleX = physicalBounds.width().toFloat() / spoofedBounds.width()
-                        // Inverse scale for input
-                        val inputScale = 1.0f / scaleX
+                        val transform = FreeformSurfaceMath.compute(
+                            physicalLeft = physicalBounds.left,
+                            physicalTop = physicalBounds.top,
+                            physicalWidth = physicalBounds.width(),
+                            physicalHeight = physicalBounds.height(),
+                            spoofedWidth = spoofedBounds.width(),
+                            spoofedHeight = spoofedBounds.height()
+                        ) ?: return
                         
                         val inputWindowHandleWrapper = param.args[0]
-                        XposedHelpers.callMethod(inputWindowHandleWrapper, "setScaleFactor", inputScale)
+                        XposedHelpers.callMethod(
+                            inputWindowHandleWrapper,
+                            "setScaleFactor",
+                            FreeformSurfaceMath.inputScale(transform.scaleX)
+                        )
                     }
                 }
             }
