@@ -4,21 +4,54 @@ import android.content.res.Configuration
 import android.graphics.Rect
 import android.os.Build
 import android.view.SurfaceControl
+import com.buildsession.betterYAMF.BuildConfig
 import com.buildsession.betterYAMF.xposed.services.YAMFManager
 import com.buildsession.betterYAMF.xposed.utils.log
 import com.github.kyuubiran.ezxhelper.utils.*
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
+import java.util.concurrent.ConcurrentHashMap
 
 object FreeformBackend {
     private const val TAG = "reYAMF_FreeformBackend"
     private const val WINDOWING_MODE_FULLSCREEN = 1
     private const val WINDOWING_MODE_FREEFORM = 5
 
+    private val diagnostics = BuildConfig.DEBUG
+    private val lastLogByTask = ConcurrentHashMap<Int, String>()
+    private val snapshotLogged =
+        java.util.Collections.newSetFromMap(ConcurrentHashMap<Int, Boolean>())
+
+    private fun logOnce(taskId: Int, message: String) {
+        if (!diagnostics) return
+        if (lastLogByTask.put(taskId, message) != message) {
+            log(TAG, message)
+        }
+    }
+
+    private fun logOnceTask(task: Any, message: String) {
+        if (!diagnostics) return
+        val taskId = runCatching { XposedHelpers.getIntField(task, "mTaskId") }.getOrDefault(-1)
+        logOnce(taskId, message)
+    }
+
+    private fun isTaskAnimating(task: Any): Boolean =
+        runCatching { XposedHelpers.callMethod(task, "isAnimating") as Boolean }.getOrDefault(false)
+
+    private fun reassertTaskTransform(task: Any, clearCrop: Boolean, source: String) {
+        if (isTaskAnimating(task)) {
+            logOnceTask(task, "transform skip source=$source reason=animating")
+            return
+        }
+        applyTaskTransform(task, clearCrop)
+    }
+
     fun init(classLoader: ClassLoader) {
         val policy = FreeformPolicies.forSdk(Build.VERSION.SDK_INT)
-        log(TAG, "init with policy: ${policy.displayName}")
+        if (diagnostics) {
+            log(TAG, "init with policy: ${policy.displayName}")
+        }
         runCatching { hookRelaunch(classLoader) }.onFailure { log(TAG, "hookRelaunch failed", it) }
         runCatching { hookAdditionalRelaunchPoints(classLoader) }.onFailure { log(TAG, "hookAdditionalRelaunchPoints failed", it) }
         runCatching { hookConfigSpoofing(classLoader, policy) }.onFailure { log(TAG, "hookConfigSpoofing failed", it) }
@@ -117,7 +150,9 @@ object FreeformBackend {
             log(TAG, "ConfigOverrideHint not found (${policy.configOverrideHintCandidates}), config spoofing disabled")
             return
         }
-        log(TAG, "ConfigOverrideHint resolved to $hintClassName")
+        if (diagnostics) {
+            log(TAG, "ConfigOverrideHint resolved to $hintClassName")
+        }
         
         XposedHelpers.findAndHookMethod(taskFragmentClass, "computeConfigResourceOverrides",
             Configuration::class.java,
@@ -155,6 +190,7 @@ object FreeformBackend {
                         inOutConfig.densityDpi = parentConfig.densityDpi
                         inOutConfig.orientation = parentConfig.orientation
                         XposedHelpers.callMethod(inOutWindowConfig, "setWindowingMode", WINDOWING_MODE_FULLSCREEN)
+                        logOnce(taskId, "spoof task=$taskId hint=${param.args.getOrNull(2)?.javaClass?.name} physical=$physicalBounds parent=$parentBounds")
                     }
                 }
             }
@@ -177,6 +213,10 @@ object FreeformBackend {
         findMethod(taskClass) {
             name == "updateSurfaceSize" && paramCount == 1
         }.hookAfter { param ->
+            if (isTaskAnimating(param.thisObject)) {
+                logOnceTask(param.thisObject, "transform skip source=updateSurfaceSize reason=animating")
+                return@hookAfter
+            }
             val transaction = param.args[0] as? SurfaceControl.Transaction ?: return@hookAfter
             applyTaskTransformOnTransaction(param.thisObject, transaction, policy.clearTaskCrop)
         }
@@ -184,13 +224,17 @@ object FreeformBackend {
         findMethod(taskClass) {
             name == "resetSurfaceControlTransforms" && paramCount == 0
         }.hookAfter { param ->
-            applyTaskTransform(param.thisObject, policy.clearTaskCrop)
+            reassertTaskTransform(param.thisObject, policy.clearTaskCrop, "resetSurfaceControlTransforms")
         }
 
         findMethod(taskClass) {
             name == "prepareSurfaces" && paramCount == 0
         }.hookAfter { param ->
-            applyTaskTransform(param.thisObject, policy.clearTaskCrop)
+            reassertTaskTransform(param.thisObject, policy.clearTaskCrop, "prepareSurfaces")
+        }
+
+        if (diagnostics) {
+            log(TAG, "reassert anchors installed (clearCrop=${policy.clearTaskCrop}, file=Task)")
         }
     }
 
@@ -207,8 +251,15 @@ object FreeformBackend {
         clearCrop: Boolean
     ) {
         val taskId = runCatching { XposedHelpers.getIntField(task, "mTaskId") }.getOrDefault(-1)
-        if (!YAMFManager.smoothFreeformTasks.contains(taskId)) return
-        val physicalBounds = YAMFManager.smoothFreeformBounds[taskId] ?: return
+        if (!YAMFManager.smoothFreeformTasks.contains(taskId)) {
+            logOnce(taskId, "transform skip task=$taskId reason=untracked")
+            return
+        }
+        val physicalBounds = YAMFManager.smoothFreeformBounds[taskId]
+        if (physicalBounds == null) {
+            logOnce(taskId, "transform skip task=$taskId reason=no-physical-bounds")
+            return
+        }
 
         val config = XposedHelpers.callMethod(task, "getConfiguration") as Configuration
         val windowConfig = XposedHelpers.getObjectField(config, "windowConfiguration")
@@ -221,9 +272,25 @@ object FreeformBackend {
             physicalHeight = physicalBounds.height(),
             spoofedWidth = spoofedBounds.width(),
             spoofedHeight = spoofedBounds.height()
-        ) ?: return
+        )
+        if (transform == null) {
+            logOnce(taskId, "transform skip task=$taskId reason=empty-spoofed-bounds")
+            return
+        }
 
-        val surfaceControl = XposedHelpers.getObjectField(task, "mSurfaceControl") as? SurfaceControl ?: return
+        val surfaceControl = XposedHelpers.getObjectField(task, "mSurfaceControl") as? SurfaceControl
+        if (surfaceControl == null) {
+            logOnce(taskId, "transform skip task=$taskId reason=no-surface")
+            return
+        }
+
+        if (diagnostics && snapshotLogged.add(taskId)) {
+            val requested = runCatching {
+                XposedHelpers.callMethod(task, "getRequestedOverrideBounds") as Rect
+            }.getOrNull()
+            log(TAG, "transform context task=$taskId configBounds=$spoofedBounds requested=$requested physical=$physicalBounds")
+        }
+        logOnce(taskId, "transform task=$taskId scale=(${transform.scaleX},${transform.scaleY}) clearCrop=$clearCrop")
 
         XposedHelpers.callMethod(transaction, "setMatrix", surfaceControl, transform.scaleX, 0f, 0f, transform.scaleY)
         XposedHelpers.callMethod(transaction, "setPosition", surfaceControl, transform.positionX, transform.positionY)
