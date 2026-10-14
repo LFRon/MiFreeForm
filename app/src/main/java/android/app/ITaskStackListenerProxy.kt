@@ -18,7 +18,7 @@ object ITaskStackListenerProxy {
     ): ITaskStackListener {
         return ByteBuddy()
             .subclass(ITaskStackListener.Stub::class.java)
-            .method(ElementMatchers.any())
+            .method(ElementMatchers.isDeclaredBy(ITaskStackListener::class.java))
             .intercept(MethodDelegation.to(object {
                 @RuntimeType
                 fun intercept(
@@ -29,7 +29,7 @@ object ITaskStackListenerProxy {
                 }
             }))
             .make()
-            .load(classLoader, byteBuddyStrategy)
+            .load(ITaskStackListenerProxy::class.java.classLoader, byteBuddyStrategy)
             .loaded
             .getDeclaredConstructor()
             .newInstance()
