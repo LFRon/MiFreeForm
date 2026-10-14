@@ -162,6 +162,8 @@ object SmoothWindowBackend : WindowBackend {
         }
     }
 
+    override fun isAlwaysOnTopActive(): Boolean = SmoothTaskOrganizer.isRootAlwaysOnTop()
+
     override fun isTaskManaged(taskId: Int): Boolean = SmoothTaskOrganizer.isLeashManaged(taskId)
 
     // === 后端 → 宿主回灌（由 SmoothTaskOrganizer 在系统回调内调用） ===

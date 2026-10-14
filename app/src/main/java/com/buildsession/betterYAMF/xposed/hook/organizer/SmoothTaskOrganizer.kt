@@ -67,6 +67,10 @@ object SmoothTaskOrganizer {
     @Volatile
     private var floatingRootLeash: SurfaceControl? = null
 
+    /** 悬浮根是否已取得系统级置顶身份（always-on-top）：生效后宿主不得再做抢层动作。 */
+    @Volatile
+    private var rootAlwaysOnTop = false
+
     private val leashes = ConcurrentHashMap<Int, SurfaceControl>()
     private val logicalBounds = ConcurrentHashMap<Int, Rect>()
     private val originalParentTokens = ConcurrentHashMap<Int, Any>()
@@ -82,6 +86,9 @@ object SmoothTaskOrganizer {
     private val lastLeashWriteLogAt = ConcurrentHashMap<Int, Long>()
 
     fun isLeashManaged(taskId: Int): Boolean = adoptedTasks.contains(taskId)
+
+    /** 承载根是否已具备 always-on-top 置顶身份（生效后宿主应让路，不再抢层）。 */
+    fun isRootAlwaysOnTop(): Boolean = rootAlwaysOnTop
 
     /**
      * 自持 leash 句柄。
@@ -261,6 +268,29 @@ object SmoothTaskOrganizer {
                 }
             }.onFailure {
                 log(TAG, "ensure floating root organizer state failed", it)
+            }
+
+            // 置顶身份：把承载根声明为 always-on-top（TaskDisplayArea 优先级 1——低于 PiP/Dream、
+            // 高于一切普通任务）。系统层序规则（getPriority + findPositionForRootTask 夹取）
+            // 保证 home/recents/新应用前置时都只能插到我们之下：浮窗"全局置顶"从此是
+            // 一次声明的身份，而不是每次抢层（reorder/moveTaskToFront）——后者正是此前与
+            // recents 手势/过渡互相打断的根源。宿主侧 keepAboveHome 会据此让路。
+            runCatching {
+                val token = floatingRootToken
+                if (token != null) {
+                    val wct = newWct()
+                    val tokenClass = Instances.systemContext.classLoader
+                        .loadClass("android.window.WindowContainerToken")
+                    XposedHelpers.callMethod(
+                        wct, "setAlwaysOnTop",
+                        arrayOf(tokenClass, java.lang.Boolean.TYPE), token, true
+                    )
+                    applyWct(wct)
+                    rootAlwaysOnTop = true
+                    log(TAG, "floating root always-on-top applied task=$floatingRootTaskId")
+                }
+            }.onFailure {
+                log(TAG, "floating root always-on-top failed", it)
             }
 
             // 空根先隐藏（空 container 若在最上层会整屏渲染成黑色遮住一切），
