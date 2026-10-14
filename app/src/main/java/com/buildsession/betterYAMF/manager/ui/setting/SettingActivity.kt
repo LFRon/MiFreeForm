@@ -1,13 +1,9 @@
 package com.buildsession.betterYAMF.manager.ui.setting
 
-import android.content.Intent
 import android.content.SharedPreferences
 import android.os.Bundle
-import android.util.Log
 import androidx.activity.enableEdgeToEdge
 import androidx.appcompat.app.AppCompatActivity
-import androidx.appcompat.widget.PopupMenu
-import androidx.core.net.toUri
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.preference.PreferenceManager
@@ -23,25 +19,6 @@ class SettingActivity : AppCompatActivity() {
 
     private var _binding: ActivitySettingBinding? = null
     private val binding get() = _binding
-
-    companion object {
-        val flags = listOf(
-            "VIRTUAL_DISPLAY_FLAG_PUBLIC",                          // 1 << 0
-            "VIRTUAL_DISPLAY_FLAG_PRESENTATION",                    // 1 << 1
-            "VIRTUAL_DISPLAY_FLAG_SECURE",                          // 1 << 2
-            "VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY",                // 1 << 3
-            "VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR",                     // 1 << 4
-            "VIRTUAL_DISPLAY_FLAG_CAN_SHOW_WITH_INSECURE_KEYGUARD", // 1 << 5
-            "VIRTUAL_DISPLAY_FLAG_SUPPORTS_TOUCH",                  // 1 << 6
-            "VIRTUAL_DISPLAY_FLAG_ROTATES_WITH_CONTENT",            // 1 << 7
-            "VIRTUAL_DISPLAY_FLAG_DESTROY_CONTENT_ON_REMOVAL",      // 1 << 8
-            "VIRTUAL_DISPLAY_FLAG_SHOULD_SHOW_SYSTEM_DECORATIONS",  // 1 << 9
-            "VIRTUAL_DISPLAY_FLAG_TRUSTED",                         // 1 << 10
-            "VIRTUAL_DISPLAY_FLAG_OWN_DISPLAY_GROUP",               // 1 << 11
-            "VIRTUAL_DISPLAY_FLAG_ALWAYS_UNLOCKED",                 // 1 << 12
-            "VIRTUAL_DISPLAY_FLAG_TOUCH_FEEDBACK_DISABLED",         // 1 << 13
-        )
-    }
 
     lateinit var config: YAMFConfig
     private val preference: SharedPreferences by lazy { PreferenceManager.getDefaultSharedPreferences(this) }
@@ -79,59 +56,6 @@ class SettingActivity : AppCompatActivity() {
                     .show()
             }
 
-            btnFlags.setOnClickListener {
-                val checks = BooleanArray(flags.size) { i ->
-                    config.flags and (1 shl i) != 0
-                }
-                MaterialAlertDialogBuilder(this@SettingActivity)
-                    .setMultiChoiceItems(flags.toTypedArray(), checks) { _, i, c ->
-                        checks[i] = c
-                        btnFlags.text = checks.foldIndexed(0) { i, f, b ->
-                            if (b)
-                                f + (1 shl i)
-                            else
-                                f
-                        }.toString()
-                    }
-                    .setPositiveButton("about") { _, _ ->
-                        startActivity(Intent(Intent.ACTION_VIEW).apply {
-                            data = "https://cs.android.com/android/platform/superproject/+/master:frameworks/base/core/java/android/hardware/display/DisplayManager.java".toUri()
-                        })
-                    }
-                    .show()
-            }
-            btnWindowsfy.setOnClickListener {
-                PopupMenu(this@SettingActivity, btnWindowsfy).apply {
-                    listOf("Move Task", "Start Activity", "Hybrid").forEach { i ->
-                        menu.add(i).setOnMenuItemClickListener {
-                            btnWindowsfy.text = i
-                            true
-                        }
-                    }
-                }.show()
-            }
-            btnSurface.setOnClickListener {
-                PopupMenu(this@SettingActivity, btnSurface).apply {
-                    listOf("Texture View", "Surface View").forEach { i ->
-                        menu.add(i).setOnMenuItemClickListener {
-                            btnSurface.text = i
-                            true
-                        }
-                    }
-                }.show()
-            }
-            btnWindowMode.setOnClickListener {
-                PopupMenu(this@SettingActivity, btnWindowMode).apply {
-                    val modes = listOf(getString(R.string.window_mode_vd), getString(R.string.window_mode_freeform))
-                    modes.forEachIndexed { index, i ->
-                        menu.add(i).setOnMenuItemClickListener {
-                            btnWindowMode.text = i
-                            config.windowMode = index
-                            true
-                        }
-                    }
-                }.show()
-            }
             sliderRounded.addOnSliderTouchListener(object : Slider.OnSliderTouchListener {
                 override fun onStartTrackingTouch(slider: Slider) {}
 
@@ -160,11 +84,8 @@ class SettingActivity : AppCompatActivity() {
 
     private fun applyConfigToViews() {
         binding?.apply {
-            etReduceDPI.setText(config.reduceDPI.toString())
-            btnFlags.text = config.flags.toString()
             sColoerd.isChecked = config.coloredController
             sBackHome.isChecked = config.recentBackHome
-            sShowIMEinWindow.isChecked = config.showImeInWindow
             etSizeH.setText(config.defaultWindowHeight.toString())
             etSizeW.setText(config.defaultWindowWidth.toString())
             sHookLauncherHookRecents.isChecked = config.hookLauncher.hookRecents
@@ -182,67 +103,14 @@ class SettingActivity : AppCompatActivity() {
             } else {
                 "${config.animationSpeed.toFloat()}"
             }
-            btnSurface.text = when (config.surfaceView) {
-                0 -> "Texture View"
-                1 -> "Surface View"
-                else -> {
-                    Log.d("reYAMF", "surfaceView: ${config.surfaceView}")
-                    "Unavailable"
-                }
-            }
-            btnWindowMode.text = when (config.windowMode) {
-                0 -> getString(R.string.window_mode_vd)
-                1 -> getString(R.string.window_mode_freeform)
-                else -> "Unavailable"
-            }
-            btnWindowsfy.text = when (config.windowfy) {
-                0 -> "Move Task"
-                1 -> "Start Activity"
-                2 -> "Hybrid"
-                else -> {
-                    Log.d("reYAMF", "windowfy: ${config.windowfy}")
-                    "Unavailable"
-                }
-            }
         }
     }
 
     override fun onDestroy() {
         super.onDestroy()
         binding?.apply {
-            config.reduceDPI = etReduceDPI.text.toString().toIntOrNull() ?: config.reduceDPI
-            config.flags = btnFlags.text.toString().toIntOrNull() ?: config.flags
-            config.surfaceView = when (val surface = btnSurface.text.toString()) {
-                "Texture View" -> {
-                    0
-                }
-                "Surface View" -> {
-                    1
-                }
-                else -> {
-                    Log.d("YAMF", "surface value: $surface")
-                    0
-                }
-            }
-
-            config.windowfy = when (val window = btnWindowsfy.text.toString()) {
-                "Move Task" -> {
-                    0
-                }
-                "Start Activity" -> {
-                    1
-                }
-                "Hybrid" -> {
-                    2
-                }
-                else -> {
-                    Log.d("reYAMF", "window value: $window")
-                    0
-                }
-            }
             config.coloredController = sColoerd.isChecked
             config.recentBackHome = sBackHome.isChecked
-            config.showImeInWindow = sShowIMEinWindow.isChecked
             config.defaultWindowHeight = etSizeH.text.toString().toIntOrNull() ?: config.defaultWindowHeight
             config.defaultWindowWidth = etSizeW.text.toString().toIntOrNull() ?: config.defaultWindowWidth
             config.hookLauncher.hookRecents = sHookLauncherHookRecents.isChecked

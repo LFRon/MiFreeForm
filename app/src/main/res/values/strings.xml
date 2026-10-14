@@ -27,7 +27,6 @@
     <string name="reset_all_window">reset all window</string>
     <string name="window_size_separator">x</string>
     <string name="default_window_size_text">Default Window Size</string>
-    <string name="ime_switch_text">Show IME in window\nVIRTUAL_DISPLAY_FLAG_PUBLIC must be true</string>
     <string name="keep_alive_service_text">Keeps BetterYAMF alive in the background</string>
     <string name="collapsed_app_icon">app icon for collapsed view</string>
     <string name="wow_nsuch_empty">Wow! \nSuch empty</string>
@@ -39,14 +38,7 @@
     <string name="restart_butt_desc">Or use this button to close sidebar for 5 seconds. Sidebar will reappaer automatically</string>
     <string name="reyamf">BetterYAMF</string>
     <string name="a_yamf_fork">a reYAMF fork</string>
-    <string name="view_type">View Type</string>
-    <string name="window_mode">Window Implementation Method</string>
-    <string name="window_mode_vd">Virtual Display (Legacy)</string>
-    <string name="window_mode_freeform">Smooth Freeform (Native)</string>
-    <string name="dpi_density">DPI Density</string>
-    <string name="flags">Flags</string>
     <string name="colored_controller">Colored Controller</string>
-    <string name="launch_method">Launch Method</string>
     <string name="recents_back_home">Recents Back Home</string>
     <string name="recents_app_icon_hook">Recents App Icon Hook</string>
     <string name="taskbar_hook">Taskbar Hook</string>
@@ -58,7 +50,6 @@
     <string name="launcher_might_need_to_be_restarted_twice_for_hooks_to_take_effect">* Launcher might need to be restarted twice for hooks to take effect</string>
     <string name="current_to_window">Current to window</string>
     <string name="launch_sidebar">Launch sidebar</string>
-    <string name="reduce_dpi">Reduce DPI</string>
     <string name="sidebar_transparency">Sidebar Transparency</string>
     <string name="_80">80</string>
     <string name="window_rounded_corner">Window Rounded Corner</string>
