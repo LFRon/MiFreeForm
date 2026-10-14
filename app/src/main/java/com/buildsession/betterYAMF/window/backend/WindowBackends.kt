@@ -31,4 +31,5 @@ private object NoopWindowBackend : WindowBackend {
     override fun bringTaskToFront(taskId: Int): Boolean = false
     override fun isAlwaysOnTopActive(): Boolean = false
     override fun isTaskManaged(taskId: Int): Boolean = false
+    override fun managedTaskIds(): IntArray = IntArray(0)
 }

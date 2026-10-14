@@ -94,6 +94,14 @@ object SmoothTaskOrganizer {
     /** 承载根是否已具备 always-on-top 置顶身份（生效后宿主应让路，不再抢层）。 */
     fun isRootAlwaysOnTop(): Boolean = rootAlwaysOnTop
 
+    /** 受管任务 id（承载根 + 已认领子任务）：供 Launcher 手势目标过滤同步（M6 批次2）。 */
+    fun managedTaskIds(): IntArray {
+        val ids = ArrayList<Int>(adoptedTasks.size + 1)
+        if (floatingRootTaskId > 0) ids.add(floatingRootTaskId)
+        ids.addAll(adoptedTasks)
+        return ids.toIntArray()
+    }
+
     /**
      * 自持 leash 句柄。
      *

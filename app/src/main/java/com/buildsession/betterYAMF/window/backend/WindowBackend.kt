@@ -60,6 +60,12 @@ interface WindowBackend {
 
     /** 任务是否由本后端接管（窗口语义成立，可施加几何/焦点操作）。 */
     fun isTaskManaged(taskId: Int): Boolean
+
+    /**
+     * 受管任务集合（承载根 + 已认领子任务）：
+     * 供流程层做跨进程同步（如 Launcher 手势目标豁免）；未接管的实现返回空数组。
+     */
+    fun managedTaskIds(): IntArray
 }
 
 /** 后端 → 宿主的回灌事件。 */

@@ -166,6 +166,8 @@ object SmoothWindowBackend : WindowBackend {
 
     override fun isTaskManaged(taskId: Int): Boolean = SmoothTaskOrganizer.isLeashManaged(taskId)
 
+    override fun managedTaskIds(): IntArray = SmoothTaskOrganizer.managedTaskIds()
+
     // === 后端 → 宿主回灌（由 SmoothTaskOrganizer 在系统回调内调用） ===
 
     fun notifyTaskAdopted(taskId: Int) {

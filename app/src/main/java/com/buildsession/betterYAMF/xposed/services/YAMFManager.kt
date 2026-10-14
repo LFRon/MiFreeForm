@@ -66,6 +66,8 @@ object YAMFManager : IYAMFManager.Stub() {
     private const val ACTION_OPEN_APP_LIST = "com.buildsession.betterYAMF.action.OPEN_APP_LIST"
     const val ACTION_OPEN_IN_YAMF = "com.buildsession.betterYAMF.ACTION_OPEN_IN_YAMF"
     const val ACTION_RECENTS_GESTURE = "com.buildsession.betterYAMF.action.RECENTS_GESTURE"
+    const val ACTION_MANAGED_TASKS = "com.buildsession.betterYAMF.action.MANAGED_TASKS"
+    const val ACTION_QUERY_MANAGED_TASKS = "com.buildsession.betterYAMF.action.QUERY_MANAGED_TASKS"
 
     const val EXTRA_COMPONENT_NAME = "componentName"
     const val EXTRA_USER_ID = "userId"
@@ -73,6 +75,7 @@ object YAMFManager : IYAMFManager.Stub() {
     const val EXTRA_SOURCE = "source"
     const val EXTRA_SUPPRESS_MS = "suppressMs"
     const val EXTRA_FROM_DROP_ZONE = "fromDropZone"
+    const val EXTRA_MANAGED_TASK_IDS = "managedTaskIds"
 
     private const val SOURCE_UNSPECIFIED = 0
     const val SOURCE_RECENT = 1
@@ -276,6 +279,9 @@ object YAMFManager : IYAMFManager.Stub() {
                 log("reYAMF_debug", "recents gesture suppress ${suppressMs}ms")
             }
         }
+        systemContext.registerReceiver(ACTION_QUERY_MANAGED_TASKS) { _, _ ->
+            broadcastManagedTaskIds()
+        }
         systemContext.registerReceiver(ACTION_CURRENT_TO_WINDOW) { _, _ ->
             currentToWindow()
         }
@@ -421,6 +427,7 @@ object YAMFManager : IYAMFManager.Stub() {
                 runCatching { w.onOrganizerLeash() }
             }
         }
+        broadcastManagedTaskIds()
     }
 
     /** organizer 路径：任务已消失（含最近任务划掉），销毁对应外壳 */
@@ -429,6 +436,31 @@ object YAMFManager : IYAMFManager.Stub() {
             if (w.currentTaskId == taskId) {
                 runCatching { w.onDestroy() }
             }
+        }
+        broadcastManagedTaskIds()
+    }
+
+    /**
+     * 把"受管任务（承载根 + 已认领子任务）"集合同步给 Launcher（M6 批次2）。
+     *
+     * 集合来源 = `WindowBackend.managedTaskIds()`（端口查询，不依赖具体后端实现）；
+     * 触发点 = 流程层事件（认领回灌/消失回灌/释放完成）。
+     * Launcher 侧据此把这些任务从"手势目标任务"判定（TopTaskTracker）中剔除——
+     * 对齐系统对 pinned 任务的处理：上滑/快速切换等手势永远不会选中浮窗，
+     * 浮窗只受自身触摸与模块命令驱动。
+     */
+    fun broadcastManagedTaskIds() {
+        runCatching {
+            val ids = windowBackend.managedTaskIds()
+            val intent = Intent(ACTION_MANAGED_TASKS)
+                .setPackage("com.android.launcher3")
+                .putExtra(EXTRA_MANAGED_TASK_IDS, ids)
+            systemContext.sendBroadcast(intent)
+            if (BuildConfig.DEBUG) {
+                log("reYAMF_debug", "managed tasks -> launcher: [${ids.joinToString()}]")
+            }
+        }.onFailure {
+            log("reYAMF_debug", "broadcast managed tasks failed", it)
         }
     }
 
@@ -461,7 +493,10 @@ object YAMFManager : IYAMFManager.Stub() {
         smoothTaskActivities.remove(taskId)
 
         // 系统窗口后端：释放（organizer 优先，未接管任务走旧 WCT 回全屏兜底）
-        return windowBackend.releaseTask(taskId)
+        val released = windowBackend.releaseTask(taskId)
+        // 流程层负责把最新受管集合同步给 Launcher（手势目标豁免；M6 批次2）
+        broadcastManagedTaskIds()
+        return released
     }
 
     init {
