@@ -51,6 +51,7 @@ import com.github.kyuubiran.ezxhelper.utils.loadClassOrNull
 import com.github.kyuubiran.ezxhelper.utils.newInstance
 import com.github.kyuubiran.ezxhelper.utils.paramCount
 import com.buildsession.betterYAMF.R
+import com.buildsession.betterYAMF.xposed.hook.launcher.LauncherInputAnchors
 import com.buildsession.betterYAMF.xposed.services.YAMFManager
 import com.buildsession.betterYAMF.xposed.utils.dpToPx
 import com.buildsession.betterYAMF.xposed.utils.log
@@ -191,8 +192,11 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                 }
             }
 
-            // 使用更通用的方式 Hook onInputEvent
-            XposedBridge.hookAllMethods(tisClass, "onInputEvent", object : XC_MethodHook() {
+            val inputAnchor = LauncherInputAnchors.resolve(lpparam.classLoader)
+            if (inputAnchor != null) {
+            log(TAG, "Launcher input anchor: ${inputAnchor.displayName}")
+            val inputClass = lpparam.classLoader.loadClass(inputAnchor.className)
+            XposedBridge.hookAllMethods(inputClass, "onInputEvent", object : XC_MethodHook() {
                 override fun beforeHookedMethod(param: MethodHookParam) {
                     val event = param.args[0] as? MotionEvent ?: return
                     val action = event.actionMasked
@@ -201,7 +205,7 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                         action != MotionEvent.ACTION_UP &&
                         action != MotionEvent.ACTION_CANCEL) return
 
-                    val context = param.thisObject as android.app.Service
+                    val context = param.thisObject as android.content.Context
                     
                     // 仅在 DOWN 时更新屏幕信息，减少开销
                     if (action == MotionEvent.ACTION_DOWN) {
@@ -262,10 +266,10 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                             if (diffY > threshold) {
                                 if (!mIsShowingZone) {
                                     // 仅在达到阈值时才进行反射调用，大幅减少性能损耗
-                                    var capturedTaskId = -1
-                                    runCatching {
-                                        val gestureState = XposedHelpers.getObjectField(param.thisObject, "mGestureState")
-                                        if (gestureState != null) {
+                                     var capturedTaskId = -1
+                                     runCatching {
+                                         val gestureState = inputAnchor.gestureStateOf(param.thisObject, event)
+                                         if (gestureState != null) {
                                             val taskId = XposedHelpers.callMethod(gestureState, "getTopRunningTaskId") as Int
                                             val runningTask = XposedHelpers.callMethod(gestureState, "getRunningTask")
                                             val isHomeTask = if (runningTask != null) {
@@ -359,6 +363,9 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                         }
                 }
             })
+            } else {
+                log(TAG, "No launcher input anchor available")
+            }
 
             findMethod(tisClass) { name == "onDestroy" }.hookBefore {
                 // log(TAG, "TouchInteractionService#onDestroy hooked")
