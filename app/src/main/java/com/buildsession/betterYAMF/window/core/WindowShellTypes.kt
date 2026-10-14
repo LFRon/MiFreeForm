@@ -117,7 +117,7 @@ sealed interface WindowCommand {
     data class ResizePreviewStart(override val windowId: Int) : WindowCommand
     data class ResizePreviewUpdate(override val windowId: Int, val dx: Float, val dy: Float) : WindowCommand
     data class ResizePreviewCommit(override val windowId: Int) : WindowCommand
-    data class EnterMini(override val windowId: Int) : WindowCommand
+    data class EnterMini(override val windowId: Int, val corner: DropKind = DropKind.CORNER_TR) : WindowCommand
     data class ExitMini(override val windowId: Int) : WindowCommand
     data class EnterCollapsed(override val windowId: Int) : WindowCommand
     data class ExitCollapsed(override val windowId: Int) : WindowCommand
