@@ -67,6 +67,10 @@ object SmoothTaskOrganizer {
     @Volatile
     private var floatingRootLeash: SurfaceControl? = null
 
+    /** TaskOrganizerController 引用（init 时保存；解析"另一个 organizer"需要查询其注册表） */
+    @Volatile
+    private var organizerControllerRef: Any? = null
+
     /** 悬浮根是否已取得系统级置顶身份（always-on-top）：生效后宿主不得再做抢层动作。 */
     @Volatile
     private var rootAlwaysOnTop = false
@@ -157,6 +161,7 @@ object SmoothTaskOrganizer {
             val taskOrganizerController = XposedHelpers.getObjectField(
                 organizerController, "mTaskOrganizerController"
             )
+            organizerControllerRef = taskOrganizerController
 
             // 1) 捕获上一任 organizer（透明插入的关键参照）
             runCatching {
@@ -345,6 +350,36 @@ object SmoothTaskOrganizer {
         }
     }
 
+    /**
+     * 解析注册表里"另一个" organizer（通常是系统壳 ShellTaskOrganizer）。
+     *
+     * `TaskOrganizerController` 对 starting window / 锁屏遮挡 / 包更新 / 过渡播放等**全局回调**
+     * 按 `getTaskOrganizer() = mTaskOrganizers.peekLast()` 派发——谁最后注册谁收。本机实测
+     * 我们的 organizer 最后注册（dumpsys 中带 `(active)`），这些回调全部落到我们头上；
+     * 我们没有（也不该有）Splash 渲染管线，必须原样转交系统壳，否则冷启动 Splash 消失。
+     */
+    private fun resolveShellOrganizer(): Any? = runCatching {
+        val controller = organizerControllerRef ?: return null
+        val deque = XposedHelpers.getObjectField(controller, "mTaskOrganizers")
+            as? java.util.ArrayDeque<*> ?: return null
+        deque.toList().asReversed().firstOrNull { it != null && it !== organizer }
+    }.getOrNull()
+
+    /** 把"最后注册者语义"的全局回调原样转交系统壳（见 [resolveShellOrganizer]）。 */
+    private fun forwardToShell(name: String, args: Array<Any?>) {
+        val shell = resolveShellOrganizer() ?: previousOrganizer
+        if (shell == null) {
+            log(TAG, "forward $name skipped: no shell organizer")
+            return
+        }
+        runCatching {
+            XposedHelpers.callMethod(shell, name, *args)
+            log(TAG, "forward $name -> shell")
+        }.onFailure {
+            log(TAG, "forward $name failed", it)
+        }
+    }
+
     private fun handle(name: String, args: Array<Any?>) {
         when (name) {
             "onTaskAppeared" -> {
@@ -405,8 +440,17 @@ object SmoothTaskOrganizer {
                     log(TAG, "onTaskInfoChanged task=${info.taskId} visible=${info.isVisible}")
                 }
             }
+            // 全局回调（系统按"最后注册的 organizer"= peekLast 派发）：原样转交系统壳。
+            // 不转交的后果（本 bug 实测根因）：全系统冷启动 Splash 消失——Splash 由系统壳的
+            // StartingWindowController 渲染，这些回调被派发到我们（当前最后注册）后被静默丢弃。
+            // 若我们不是最后注册者，这些回调本来就直接发给系统壳，这里不会触发。
+            "addStartingWindow", "removeStartingWindow", "copySplashScreenView",
+            "onAppSplashScreenViewRemoved", "onImeDrawnOnTask", "onBackOnTaskRoot",
+            "onKeyguardOccludingTaskChanged",
+            "onPackageUpdateRequested", "onPackageUpdateFinished",
+            "onTransitionReady", "requestStartTransition" -> forwardToShell(name, args)
             else -> {
-                // 过渡播放器等其它回调：多播列表设计，附加式，无需处理
+                // 其余未知回调：忽略。新增 AIDL 方法时需评估是否属于"全局回调"而需要转交。
             }
         }
     }
