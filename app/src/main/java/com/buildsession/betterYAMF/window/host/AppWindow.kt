@@ -59,11 +59,13 @@ import com.buildsession.betterYAMF.window.core.WindowInputEvent
 import com.buildsession.betterYAMF.window.core.WindowRegistration
 import com.buildsession.betterYAMF.window.core.WindowShellController
 import com.buildsession.betterYAMF.window.core.WindowShellRegistry
+import com.buildsession.betterYAMF.common.model.resolveWindowSizePx
 import com.buildsession.betterYAMF.xposed.services.YAMFManager
 import com.buildsession.betterYAMF.xposed.services.YAMFManager.config
 import com.buildsession.betterYAMF.xposed.utils.Instances
 import com.buildsession.betterYAMF.xposed.utils.RunMainThreadQueue
 import com.buildsession.betterYAMF.xposed.utils.TipUtil
+import com.buildsession.betterYAMF.xposed.utils.log
 import com.buildsession.betterYAMF.xposed.utils.animateAlpha
 import com.buildsession.betterYAMF.xposed.utils.animateResize
 import com.buildsession.betterYAMF.xposed.utils.animateScaleThenResize
@@ -85,6 +87,8 @@ class AppWindow(
     companion object {
         const val TAG = "reYAMF_AppWindow"
         const val ACTION_RESET_ALL_WINDOW = "com.buildsession.betterYAMF.ui.window.action.ACTION_RESET_ALL_WINDOW"
+        private const val HOME_REFRONT_DELAY_MS = 0L
+        private const val MINI_START_DELAY_MS = 500L
         private val shellRegistry = WindowShellRegistry()
         private val windowIdGen = java.util.concurrent.atomic.AtomicInteger(1)
     }
@@ -95,6 +99,8 @@ class AppWindow(
 
     var currentTaskId = -1
     private var isDestroyed = false
+    private var openAsMiniPending = false
+    private var miniRequested = false
 
     private var originalWidth: Int = 0
     private var originalHeight: Int = 0
@@ -116,6 +122,12 @@ class AppWindow(
     private var resizeBeginWidth = 0
     private var resizeBeginHeight = 0
     private var cornerDropZoneView: CornerDropZoneView? = null
+    private var frameOffsetX = 0
+    private var frameOffsetY = 0
+    private var frameOffsetKnown = false
+    private var contentTouchThrough = true
+    private val frameOffsetLayoutListener =
+        android.view.ViewTreeObserver.OnGlobalLayoutListener { refreshFrameOffset() }
 
     private val broadcastReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -162,6 +174,7 @@ class AppWindow(
                     WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM,
             PixelFormat.TRANSLUCENT
         )
+        params.setTitle(YAMFManager.CHROME_WINDOW_TITLE)
 
         val displayManager = context.getSystemService(DISPLAY_SERVICE) as DisplayManager
         val display = displayManager.getDisplay(Display.DEFAULT_DISPLAY)
@@ -170,8 +183,7 @@ class AppWindow(
         val dm = context.resources.displayMetrics
         val screenWidth = dm.widthPixels
         val screenHeight = dm.heightPixels
-        val windowWidth = config.defaultWindowWidth.dpToPx().toInt()
-        val windowHeight = config.defaultWindowHeight.dpToPx().toInt()
+        val (windowWidth, windowHeight) = config.resolveWindowSizePx(screenWidth, screenHeight)
 
         params.apply {
             gravity = Gravity.TOP or Gravity.START
@@ -201,6 +213,10 @@ class AppWindow(
         binding.root.let { layout ->
             Instances.windowManager.addView(layout, params)
         }
+
+        // 布局完成后缓存"窗口帧 - params"偏移（如状态栏 130px），
+        // 之后 updateSmoothBounds 用 params + 缓存偏移确定性推导，不依赖会滞后/失效的视图坐标 API。
+        binding.root.viewTreeObserver.addOnGlobalLayoutListener(frameOffsetLayoutListener)
 
         binding.rootClickMask.setOnTouchListener { _, event ->
             translateMoveGesture(RegionId.BODY_MASK, event)
@@ -272,19 +288,15 @@ class AppWindow(
             dispatchInput(WindowInputEvent.Tap(windowId, System.currentTimeMillis(), RegionId.SUPER_CLOSE))
         }
 
-        binding.cvParent.post(::updateSmoothBounds)
-
         shell = shellRegistry.register(
             WindowRegistration(windowId, Resources.getSystem().displayMetrics.density)
         )
         updateShellScreenMetrics()
         
         context.registerReceiver(broadcastReceiver, IntentFilter(ACTION_RESET_ALL_WINDOW), Context.RECEIVER_EXPORTED)
-        val width = config.defaultWindowWidth.dpToPx().toInt()
-        val height = config.defaultWindowHeight.dpToPx().toInt()
         binding.vSizePreviewer.updateLayoutParams {
-            this.width = width
-            this.height = height
+            this.width = windowWidth
+            this.height = windowHeight
         }
         onWindowInit(this, windowId)
 
@@ -325,19 +337,32 @@ class AppWindow(
 
     }
 
-    fun onDestroy() {
+    fun onDestroy(releaseTask: Boolean = true) {
         if (isDestroyed) return
         isDestroyed = true
+
+        // 关闭小窗时任务回到全屏（否则任务会残留为没有外壳的 freeform 小窗）；
+        // 任务移交新壳（同任务重复开窗）时静默销毁，不做释放。
+        if (releaseTask) {
+            runCatching {
+                if (currentTaskId > 0) YAMFManager.switchTaskToFullscreen(currentTaskId)
+            }.onFailure {
+                log(TAG, "release task to fullscreen failed", it)
+            }
+        }
         
         runCatching { context.unregisterReceiver(broadcastReceiver) }
         
         YAMFManager.removeWindow(windowId)
+        YAMFManager.chromeTouchHoles.remove(windowId)
         YAMFManager.pendingSmoothFreeformApps.entries.removeAll { it.value === this }
         if (::shell.isInitialized) {
             shellRegistry.unregister(shell)
         }
         YAMFManager.smoothFreeformTasks.remove(currentTaskId)
         YAMFManager.smoothFreeformBounds.remove(currentTaskId)
+        YAMFManager.smoothCornerRadiusPx.remove(currentTaskId)
+        YAMFManager.smoothTaskActivities.remove(currentTaskId)
         
         runMain {
             if (binding.root.isAttachedToWindow) {
@@ -357,6 +382,8 @@ class AppWindow(
             Instances.windowManager.removeView(binding.root)
         }
         Instances.windowManager.addView(binding.root, binding.root.layoutParams)
+        // 重挂会更换 ViewRoot，布局监听需要重新注册
+        binding.root.viewTreeObserver.addOnGlobalLayoutListener(frameOffsetLayoutListener)
         YAMFManager.moveToTop(windowId)
     }
 
@@ -365,6 +392,10 @@ class AppWindow(
     }
 
     private fun execute(command: WindowCommand) {
+        if (command !is WindowCommand.MoveBy && command !is WindowCommand.FlingBy &&
+            command !is WindowCommand.DropHover && command !is WindowCommand.DropZoneShow) {
+            log(TAG, "exec ${command::class.simpleName} window=$windowId")
+        }
         when (command) {
             is WindowCommand.MoveBy -> execMoveBy(command)
             is WindowCommand.FlingBy -> execFlingBy(command)
@@ -377,7 +408,7 @@ class AppWindow(
             is WindowCommand.ResizePreviewStart -> execResizePreviewStart()
             is WindowCommand.ResizePreviewUpdate -> execResizePreviewUpdate(command)
             is WindowCommand.ResizePreviewCommit -> execResizePreviewCommit()
-            is WindowCommand.EnterMini -> execEnterMini()
+            is WindowCommand.EnterMini -> execEnterMini(command.corner)
             is WindowCommand.ExitMini -> execExitMini()
             is WindowCommand.EnterCollapsed -> execEnterCollapsed()
             is WindowCommand.ExitCollapsed -> execExitCollapsed()
@@ -447,9 +478,9 @@ class AppWindow(
         val windowHeight = binding.root.height
 
         val minX = 0f
-        val maxX = (screenWidth - windowWidth).toFloat()
+        val maxX = (screenWidth - windowWidth - frameOffsetX).toFloat()
         val minY = 0f
-        val maxY = (screenHeight - windowHeight).toFloat()
+        val maxY = (screenHeight - windowHeight - frameOffsetY).toFloat()
 
         runCatching {
             if (sign(command.velocityX) != sign(flingRefX - last2GestureRawX)) return@runCatching
@@ -607,7 +638,7 @@ class AppWindow(
             FullscreenOrigin.BUTTON -> {
                 runCatching {
                     YAMFManager.switchTaskToFullscreen(currentTaskId)
-                    Instances.activityManager.moveTaskToFront(currentTaskId, 0)
+                    YAMFManager.windowBackend.bringTaskToFront(currentTaskId)
                 }.onFailure { t ->
                     if (t is Error) throw t
                     TipUtil.showToast("${t.message}")
@@ -618,7 +649,7 @@ class AppWindow(
             FullscreenOrigin.DRAG_DOWN_BAR -> {
                 runCatching {
                     YAMFManager.switchTaskToFullscreen(currentTaskId)
-                    Instances.activityManager.moveTaskToFront(currentTaskId, 0)
+                    YAMFManager.windowBackend.bringTaskToFront(currentTaskId)
                 }.onSuccess {
                     onDestroy()
                 }.onFailure {
@@ -628,20 +659,104 @@ class AppWindow(
         }
     }
 
+    private fun refreshFrameOffset() {
+        runCatching {
+            val loc = IntArray(2)
+            binding.root.getLocationOnScreen(loc)
+            val p = binding.root.layoutParams as? WindowManager.LayoutParams ?: return@runCatching
+            val offX = loc[0] - p.x
+            val offY = loc[1] - p.y
+            if (!frameOffsetKnown || offX != frameOffsetX || offY != frameOffsetY) {
+                frameOffsetX = offX
+                frameOffsetY = offY
+                frameOffsetKnown = true
+                log(TAG, "frameOffset=($offX,$offY) loc=(${loc[0]},${loc[1]}) params=(${p.x},${p.y})")
+                updateSmoothBounds()
+            }
+        }
+    }
+
     private fun updateSmoothBounds() {
         if (currentTaskId == -1) return
-        
-        val location = IntArray(2)
-        binding.cvParent.getLocationOnScreen(location)
+
+        // 矩形从窗口 params 确定性推导（+ 首次布局后缓存的帧偏移；偏移未知时按 0 计，
+        // 布局完成后会再纠正一次）。视图的 getLocationOnScreen 在 relayout 完成前会返回旧值，
+        // 不再作为主路径。
+        val params = binding.root.layoutParams as? WindowManager.LayoutParams
+        val left: Int
+        val top: Int
+        if (params != null) {
+            left = params.x + (if (frameOffsetKnown) frameOffsetX else 0) + binding.cvParent.left
+            top = params.y + (if (frameOffsetKnown) frameOffsetY else 0) + binding.cvParent.top
+        } else {
+            val location = IntArray(2)
+            binding.root.getLocationOnScreen(location)
+            left = location[0] + binding.cvParent.left
+            top = location[1] + binding.cvParent.top
+        }
+        if (binding.cvParent.width <= 0 || binding.cvParent.height <= 0) {
+            // 首帧布局未完成：矩形无效，等 OnGlobalLayout 后的下一次同步
+            return
+        }
         val rect = android.graphics.Rect(
-            location[0], 
-            location[1], 
-            location[0] + binding.cvParent.width, 
-            location[1] + binding.cvParent.height
+            left,
+            top,
+            left + binding.cvParent.width,
+            top + binding.cvParent.height
         )
+        // 一致性守卫：卡片矩形不可能大于外壳窗口内容（root 视图）本身。
+        // 实测曾出现可疑的全屏+帧偏移矩形进入几何链路；这里拒绝并留证。
+        if (binding.root.width > 0 && binding.root.height > 0 &&
+            (rect.width() > binding.root.width || rect.height() > binding.root.height)
+        ) {
+            log(
+                TAG,
+                "SUSPICIOUS geometry window=$windowId task=$currentTaskId rect=$rect " +
+                    "root=${binding.root.width}x${binding.root.height} " +
+                    "params=(${params?.x},${params?.y}) offset=($frameOffsetX,$frameOffsetY) " +
+                    "cv=(${binding.cvParent.left},${binding.cvParent.top},${binding.cvParent.width}x${binding.cvParent.height})"
+            )
+            return
+        }
+
+        if (contentTouchThrough) {
+            val handleHeight = binding.ibSuper.height.takeIf { it > 0 } ?: 25.dpToPx().toInt()
+            YAMFManager.chromeTouchHoles[windowId] = android.graphics.Rect(
+                rect.left,
+                rect.top + handleHeight,
+                rect.right,
+                rect.bottom
+            )
+        } else {
+            YAMFManager.chromeTouchHoles.remove(windowId)
+        }
+        YAMFManager.smoothCornerRadiusPx[currentTaskId] = (config.windowRoundedCorner + 2).dpToPx().toInt()
         
         if (YAMFManager.smoothFreeformBounds[currentTaskId] != rect) {
-            YAMFManager.updateSmoothBounds(currentTaskId, rect)
+            // 系统窗口后端：几何落地（leash 变换或兼容路径由实现决定，宿主不感知）
+            YAMFManager.windowBackend.applyGeometry(currentTaskId, rect)
+        }
+    }
+
+    /** 系统窗口后端把任务 leash 交给我们（onTaskAdopted 回灌）后，按当前几何立即摆放 */
+    fun onOrganizerLeash() {
+        runMain {
+            runCatching {
+                // leash 刚到手：按当前几何立即摆一次位（首帧布局未完成时 updateSmoothBounds 会
+                // 自行跳过，布局完成后由 OnGlobalLayout 再同步；不再等待 frameOffset 已知）。
+                updateSmoothBounds()
+                val taskId = currentTaskId
+                val backend = YAMFManager.windowBackend
+                if (taskId > 0 && backend.isTaskManaged(taskId)) {
+                    if (YAMFManager.smoothFreeformBounds[taskId] != null) {
+                        backend.reapplyGeometry(taskId)
+                    } else {
+                        // 几何未知（首帧布局尚未完成）：先保证任务表面可见，避免后端迁移后
+                        // 任务表面处于隐藏等待状态
+                        backend.ensureTaskVisible(taskId)
+                    }
+                }
+            }.onFailure { log(TAG, "onOrganizerLeash failed", it) }
         }
     }
 
@@ -717,13 +832,23 @@ class AppWindow(
     }
 
     fun onTaskMovedToFront(taskInfo: ActivityManager.RunningTaskInfo) {
-        if (isHomeTask(taskInfo)) {
-            onDestroy()
+        val isHome = isHomeTask(taskInfo)
+        log(TAG, "onTaskMovedToFront task=${taskInfo.taskId} isHome=$isHome current=$currentTaskId")
+        if (isHome) {
+            keepAboveHome()
             return
         }
 
         if (taskInfo.taskId == currentTaskId) {
             updateTask(taskInfo)
+            maybeRequestMini()
+            return
+        }
+
+        // 其他应用到前台：本窗作为浮窗保持在最前（全局覆盖语义）。
+        // 另一个小窗（smooth 任务）到前台则允许压在上一层，不抢。
+        if (!YAMFManager.smoothFreeformTasks.contains(taskInfo.taskId) && !isDestroyed) {
+            keepAboveHome()
         }
     }
 
@@ -733,12 +858,123 @@ class AppWindow(
         }
 
         if (isHomeTask(taskInfo)) {
-            onDestroy()
+            keepAboveHome()
             return
         }
 
         if (taskInfo.taskId == currentTaskId) {
             updateTask(taskInfo)
+        }
+    }
+
+    fun markOpenAsMini() {
+        openAsMiniPending = true
+    }
+
+    private fun maybeRequestMini() {
+        if (!openAsMiniPending || miniRequested || isDestroyed || currentTaskId <= 0) return
+        openAsMiniPending = false
+        miniRequested = true
+        log(TAG, "requestMiniAtCorner task=$currentTaskId")
+        runMain {
+            binding.root.postDelayed({
+                requestMiniAtCorner()
+            }, MINI_START_DELAY_MS)
+        }
+    }
+
+    private fun requestMiniAtCorner() {
+        if (isDestroyed || currentTaskId <= 0) return
+        runCatching {
+            val dm = context.resources.displayMetrics
+            val cx = (dm.widthPixels - 12).toFloat()
+            val cy = 150f
+            val t = System.currentTimeMillis()
+            dispatchInput(WindowInputEvent.Press(windowId, t, RegionId.BODY_MASK, cx, cy))
+            dispatchInput(WindowInputEvent.Move(windowId, t, RegionId.BODY_MASK, cx, cy))
+            dispatchInput(WindowInputEvent.Up(windowId, t, RegionId.BODY_MASK, cx, cy))
+        }.onFailure {
+            log(TAG, "requestMiniAtCorner failed", it)
+        }
+    }
+
+    private var pendingHide: Runnable? = null
+    private var reFrontScheduled = false
+
+    fun onTaskVisibilityChanged(visible: Boolean) {
+        if (isDestroyed) return
+        runMain {
+            runCatching {
+                pendingHide?.let { binding.root.removeCallbacks(it) }
+                pendingHide = null
+                if (visible) {
+                    if (binding.root.visibility != View.VISIBLE) {
+                        log(TAG, "onTaskVisibilityChanged visible=true set=VISIBLE")
+                        binding.root.visibility = View.VISIBLE
+                    }
+                } else {
+                    // 250ms 宽限：浮窗回置顶/过渡期间不要闪隐
+                    val hide = Runnable {
+                        pendingHide = null
+                        runCatching {
+                            if (binding.root.visibility != View.INVISIBLE) {
+                                log(TAG, "onTaskVisibilityChanged visible=false set=INVISIBLE(delayed)")
+                                binding.root.visibility = View.INVISIBLE
+                            }
+                        }
+                    }
+                    pendingHide = hide
+                    binding.root.postDelayed(hide, 250)
+                }
+            }.onFailure {
+                log(TAG, "onTaskVisibilityChanged failed visible=$visible", it)
+            }
+        }
+    }
+
+    fun onHomeTop() {
+        keepAboveHome()
+    }
+
+    private fun keepAboveHome() {
+        if (isDestroyed) return
+        val taskId = currentTaskId
+        if (taskId <= 0) return
+        if (reFrontScheduled) return
+        reFrontScheduled = true
+        val now = android.os.SystemClock.uptimeMillis()
+        val suppressUntil = YAMFManager.recentsGestureSuppressUntilMs
+        val delay = if (suppressUntil > now) suppressUntil - now + 60L else HOME_REFRONT_DELAY_MS
+        log(TAG, "keepAboveHome schedule task=$taskId delay=$delay")
+        runMain {
+            binding.root.postDelayed({ reFrontWhenTouchIdle(taskId, 0) }, delay)
+        }
+    }
+
+    /**
+     * 只在"没有触摸进行中"时回置顶：任何正在进行的滑动（QQ 滚动、上滑手势等）
+     * 都先让路，手指抬起后才把浮窗拉回最上层，避免中途改窗口栈把手势抢到小窗。
+     */
+    private fun reFrontWhenTouchIdle(taskId: Int, attempts: Int) {
+        if (isDestroyed) {
+            reFrontScheduled = false
+            return
+        }
+        if (YAMFManager.isTouchActive() && attempts < 40) {
+            binding.root.postDelayed({ reFrontWhenTouchIdle(taskId, attempts + 1) }, 150)
+            return
+        }
+        reFrontScheduled = false
+        val result = YAMFManager.windowBackend.bringTaskToFront(taskId)
+        log(TAG, "keepAboveHome re-front task=$taskId result=$result attempts=$attempts")
+        // 浮窗保持在最上，但不持有焦点：返回/键盘等导航事件交给下方正在使用的应用
+        runCatching { YAMFManager.windowBackend.setTaskFocusable(taskId, false) }
+        onTaskVisibilityChanged(true)
+        // HOME/应用切换的入场过渡可能在本次重排之后才落定（实测：根被压到 home 之下、
+        // 子任务 moveTaskToFront 抬不起根）→ 稍后重试，保证浮窗最终在系统壳之上（有界，最多 3 次）。
+        if (attempts < 2) {
+            reFrontScheduled = true
+            binding.root.postDelayed({ reFrontWhenTouchIdle(taskId, attempts + 1) }, 400)
         }
     }
 
@@ -776,8 +1012,8 @@ class AppWindow(
 
             val minX = 0
             val minY = 0
-            val maxX = screenWidth - windowWidth
-            val maxY = screenHeight - windowHeight
+            val maxX = screenWidth - windowWidth - frameOffsetX
+            val maxY = screenHeight - windowHeight - frameOffsetY
 
             val targetX = params.x.coerceIn(minX, maxX)
             val targetY = params.y.coerceIn(minY, maxY)
@@ -798,6 +1034,7 @@ class AppWindow(
                         params.y = (startY + (targetY - startY) * fraction).toInt()
                         runCatching {
                             Instances.windowManager.updateViewLayout(binding.root, params)
+                            updateSmoothBounds()
                         }
                     }
                     start()
@@ -807,6 +1044,7 @@ class AppWindow(
                 params.y = targetY
                 runCatching {
                     Instances.windowManager.updateViewLayout(binding.root, params)
+                    updateSmoothBounds()
                 }
             }
         }
@@ -855,24 +1093,81 @@ class AppWindow(
         )
     }
 
-    private fun execEnterMini() {
+    private fun execEnterMini(corner: com.buildsession.betterYAMF.window.core.DropKind) {
         isResize = false
 
         binding.rootClickMask.visibility = View.VISIBLE
         binding.rlBarControllerBottom.visibility = View.GONE
         binding.rlBarControllerSide.visibility = View.GONE
 
+        // 侧边最小化比角落 mini 再小一档（1/3），角落为 1/2
+        val isSide = corner == com.buildsession.betterYAMF.window.core.DropKind.SIDE_LEFT ||
+                corner == com.buildsession.betterYAMF.window.core.DropKind.SIDE_RIGHT
+        val miniDivisor = if (isSide) 3 else 2
         binding.cvBackground.updateLayoutParams {
-            width = originalWidth/2
-            height = originalHeight/2
+            width = originalWidth / miniDivisor
+            height = originalHeight / miniDivisor
         }
-        keepInScreen()
 
         binding.ibRightResize.visibility = View.GONE
+
+        // mini 状态下整卡可点（点任意位置放大回正常窗口），关闭内容透传洞
+        contentTouchThrough = false
+        YAMFManager.chromeTouchHoles.remove(windowId)
+
+        // 收起后吸附到触发的角落（与演示一致）。
+        // 半尺寸布局尚未完成时 root.width 还是旧值，检测到就重试，避免吸到错误位置。
+        var snapAttempts = 0
+        fun applyMiniSnap() {
+            runCatching {
+                if (originalWidth > 0 && binding.root.width > originalWidth * 3 / 4 && snapAttempts < 4) {
+                    snapAttempts++
+                    binding.root.post { applyMiniSnap() }
+                    return@runCatching
+                }
+                val params = binding.root.layoutParams as WindowManager.LayoutParams
+                val dm = context.resources.displayMetrics
+                val margin = 8.dpToPx().toInt()
+                val topInset = 140
+                val bottomInset = 120
+                when (corner) {
+                    com.buildsession.betterYAMF.window.core.DropKind.CORNER_TL -> {
+                        params.x = margin
+                        params.y = topInset + margin
+                    }
+                    com.buildsession.betterYAMF.window.core.DropKind.CORNER_BL -> {
+                        params.x = margin
+                        params.y = dm.heightPixels - binding.root.height - bottomInset - margin
+                    }
+                    com.buildsession.betterYAMF.window.core.DropKind.CORNER_BR -> {
+                        params.x = dm.widthPixels - binding.root.width - margin
+                        params.y = dm.heightPixels - binding.root.height - bottomInset - margin
+                    }
+                    com.buildsession.betterYAMF.window.core.DropKind.SIDE_LEFT -> {
+                        params.x = margin
+                        params.y = params.y.coerceIn(0, dm.heightPixels - binding.root.height - frameOffsetY)
+                    }
+                    com.buildsession.betterYAMF.window.core.DropKind.SIDE_RIGHT -> {
+                        params.x = dm.widthPixels - binding.root.width - margin
+                        params.y = params.y.coerceIn(0, dm.heightPixels - binding.root.height - frameOffsetY)
+                    }
+                    else -> {
+                        params.x = dm.widthPixels - binding.root.width - margin
+                        params.y = topInset + margin
+                    }
+                }
+                Instances.windowManager.updateViewLayout(binding.root, params)
+                updateSmoothBounds()
+            }.onFailure {
+                log(TAG, "applyMiniSnap failed", it)
+            }
+        }
+        binding.root.post { applyMiniSnap() }
     }
 
     private fun execExitMini() {
         isResize = true
+        contentTouchThrough = true
         binding.rootClickMask.visibility = View.GONE
 
         binding.cvBackground.updateLayoutParams {
@@ -890,6 +1185,7 @@ class AppWindow(
             setBackgroundWrapContent()
             setParrentWrapContent()
             keepInScreen()
+            binding.root.post(::updateSmoothBounds)
         }
 
         binding.ibRightResize.visibility = View.VISIBLE
@@ -916,6 +1212,7 @@ class AppWindow(
 
     private fun execEnterCollapsed() {
         isResize = false
+        contentTouchThrough = false
         binding.rootClickMask.visibility = View.VISIBLE
         binding.rlBarControllerBottom.visibility = View.GONE
         binding.rlBarControllerSide.visibility = View.GONE
@@ -924,6 +1221,7 @@ class AppWindow(
 
     private fun execExitCollapsed() {
         isResize = false
+        contentTouchThrough = true
         binding.rootClickMask.visibility = View.GONE
         expandWindow()
     }
@@ -979,8 +1277,11 @@ class AppWindow(
                 when(event.action) {
                     MotionEvent.ACTION_DOWN ->
                         dispatchInput(WindowInputEvent.Press(windowId, event.eventTime, RegionId.RESIZE_HANDLE, event.rawX, event.rawY))
-                    MotionEvent.ACTION_MOVE ->
+                    MotionEvent.ACTION_MOVE -> {
                         dispatchInput(WindowInputEvent.Move(windowId, event.eventTime, RegionId.RESIZE_HANDLE, event.rawX, event.rawY))
+                        // 等本帧布局应用后再同步任务矩形，缩放时内容与外壳连续对齐
+                        binding.root.post { updateSmoothBounds() }
+                    }
                     MotionEvent.ACTION_UP -> {
                         dispatchInput(WindowInputEvent.Up(windowId, event.eventTime, RegionId.RESIZE_HANDLE, event.rawX, event.rawY))
                         updateSmoothBounds()

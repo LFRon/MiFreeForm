@@ -28,13 +28,18 @@ import com.buildsession.betterYAMF.common.gson
 import com.buildsession.betterYAMF.common.model.AppInfo
 import com.buildsession.betterYAMF.common.model.Config
 import com.buildsession.betterYAMF.common.model.StartCmd
+import com.buildsession.betterYAMF.common.model.resolveWindowSizePx
 import com.buildsession.betterYAMF.common.runMain
 import com.buildsession.betterYAMF.xposed.IAppIconCallback
 import com.buildsession.betterYAMF.xposed.IAppListCallback
 import com.buildsession.betterYAMF.xposed.IOpenCountListener
 import com.buildsession.betterYAMF.xposed.IYAMFManager
 import com.buildsession.betterYAMF.xposed.hook.HookLauncher
+import com.buildsession.betterYAMF.window.backend.WindowBackend
+import com.buildsession.betterYAMF.window.backend.WindowBackendCallbacks
+import com.buildsession.betterYAMF.window.backend.WindowBackends
 import com.buildsession.betterYAMF.window.host.AppWindow
+import com.buildsession.betterYAMF.xposed.hook.organizer.SmoothWindowBackend
 import com.buildsession.betterYAMF.xposed.utils.Instances
 import com.buildsession.betterYAMF.xposed.utils.Instances.systemContext
 import com.buildsession.betterYAMF.xposed.utils.Instances.systemUiContext
@@ -60,47 +65,75 @@ object YAMFManager : IYAMFManager.Stub() {
     private const val ACTION_CURRENT_TO_WINDOW = "com.buildsession.betterYAMF.action.CURRENT_TO_WINDOW"
     private const val ACTION_OPEN_APP_LIST = "com.buildsession.betterYAMF.action.OPEN_APP_LIST"
     const val ACTION_OPEN_IN_YAMF = "com.buildsession.betterYAMF.ACTION_OPEN_IN_YAMF"
+    const val ACTION_RECENTS_GESTURE = "com.buildsession.betterYAMF.action.RECENTS_GESTURE"
 
     const val EXTRA_COMPONENT_NAME = "componentName"
     const val EXTRA_USER_ID = "userId"
     const val EXTRA_TASK_ID = "taskId"
     const val EXTRA_SOURCE = "source"
+    const val EXTRA_SUPPRESS_MS = "suppressMs"
+    const val EXTRA_FROM_DROP_ZONE = "fromDropZone"
 
     private const val SOURCE_UNSPECIFIED = 0
     const val SOURCE_RECENT = 1
     const val SOURCE_TASKBAR = 2
     const val SOURCE_POPUP = 3
 
+    const val CHROME_WINDOW_TITLE = "reYAMF_chrome"
+
+    private const val LEGACY_DEFAULT_WINDOW_HEIGHT = 380
+
     val windowList = mutableListOf<Int>()
     private val activeWindows = mutableMapOf<Int, AppWindow>()
-    val smoothFreeformTasks = mutableSetOf<Int>()
-    val smoothFreeformBounds = mutableMapOf<Int, android.graphics.Rect>()
+    val smoothFreeformTasks = java.util.concurrent.ConcurrentHashMap.newKeySet<Int>()
+    val smoothFreeformBounds = java.util.concurrent.ConcurrentHashMap<Int, android.graphics.Rect>()
+    val smoothCornerRadiusPx = java.util.concurrent.ConcurrentHashMap<Int, Int>()
+    val smoothTaskActivities = java.util.concurrent.ConcurrentHashMap<Int, ComponentName>()
+    val chromeTouchHoles = java.util.concurrent.ConcurrentHashMap<Int, android.graphics.Rect>()
     val pendingSmoothFreeformApps = mutableMapOf<ComponentName, AppWindow>()
     lateinit var config: Config
     val configFile = File("/data/system/BetterYAMF.json")
+
+    /** 系统窗口后端端口（systemReady 安装；宿主/流程不得绕过它直接操作系统任务语义） */
+    val windowBackend: WindowBackend get() = WindowBackends.current()
+
     private var openWindowCount = 0
     private val iOpenCountListenerSet = mutableSetOf<IOpenCountListener>()
     lateinit var activityManagerService: Any
 
     private const val WINDOWING_MODE_FULLSCREEN = 1
     private const val WINDOWING_MODE_FREEFORM = 5
+    private const val HOME_INJECT_DELAY_MS = 700L
 
     private val taskStackListener by lazy {
         android.app.ITaskStackListenerProxy.newInstance(Instances.systemContext.classLoader) { args, method ->
             runMain {
-                when (method.name) {
+                if (BuildConfig.DEBUG) {
+                    log("reYAMF_debug", "stackEvent ${method.name}")
+                }
+                runCatching {
+                    when (method.name) {
+                    "onTaskStackChanged" -> {
+                        onStackChangedForHome()
+                    }
                     "onTaskMovedToFront" -> {
                         val taskInfo = args[0] as android.app.ActivityManager.RunningTaskInfo
                         activeWindows.values.forEach { it.onTaskMovedToFront(taskInfo) }
+                        activeWindows.values.forEach { w ->
+                            if (w.currentTaskId == taskInfo.taskId) {
+                                w.onTaskVisibilityChanged(taskInfo.isVisible)
+                            }
+                        }
 
                         // 若首帧时任务已是 FREEFORM 的任务尚未登记（例如从菜单直启），补登记并立即套用缩放链路；
                         // 切回 FULLSCREEN 的任务则移出登记。
-                        val windowingMode = XposedHelpers.getIntField(taskInfo, "windowingMode")
+                        val windowingMode = taskWindowingMode(taskInfo)
                         if (windowingMode == WINDOWING_MODE_FREEFORM) {
                             val topActivity = taskInfo.topActivity
                             if (topActivity != null) {
                                 val pendingWindow = pendingSmoothFreeformApps[topActivity]
                                 if (pendingWindow != null) {
+                                    log("reYAMF_debug", "claim task=${taskInfo.taskId} activity=$topActivity")
                                     smoothFreeformTasks.add(taskInfo.taskId)
                                     pendingSmoothFreeformApps.remove(topActivity)
                                     // Trigger a config change to apply spoofing/scaling immediately
@@ -112,6 +145,16 @@ object YAMFManager : IYAMFManager.Stub() {
                         } else if (windowingMode == WINDOWING_MODE_FULLSCREEN) {
                             smoothFreeformTasks.remove(taskInfo.taskId)
                             smoothFreeformBounds.remove(taskInfo.taskId)
+                            smoothCornerRadiusPx.remove(taskInfo.taskId)
+                            smoothTaskActivities.remove(taskInfo.taskId)
+                        }
+                    }
+                    "onTaskInfoChanged" -> {
+                        val taskInfo = args[0] as android.app.ActivityManager.RunningTaskInfo
+                        activeWindows.values.forEach { w ->
+                            if (w.currentTaskId == taskInfo.taskId) {
+                                w.onTaskVisibilityChanged(taskInfo.isVisible)
+                            }
                         }
                     }
                     "onTaskDescriptionChanged" -> {
@@ -119,9 +162,12 @@ object YAMFManager : IYAMFManager.Stub() {
                         activeWindows.values.forEach { it.onTaskDescriptionChanged(taskInfo) }
                     }
                     "onTaskRemovalStarted" -> {
-                        val taskId = args[0] as Int
+                        val arg = args[0]
+                        val taskId = if (arg is Int) arg else XposedHelpers.getIntField(arg, "taskId")
                         smoothFreeformTasks.remove(taskId)
                         smoothFreeformBounds.remove(taskId)
+                        smoothCornerRadiusPx.remove(taskId)
+                        smoothTaskActivities.remove(taskId)
                         // 过滤：只有当被移除的任务 ID 确实属于某个小窗时才触发销
                         activeWindows.values.toList().forEach { window ->
                             if (window.currentTaskId == taskId) {
@@ -130,15 +176,106 @@ object YAMFManager : IYAMFManager.Stub() {
                         }
                     }
                 }
+                }.onFailure {
+                    log("reYAMF_debug", "taskStackListener handling failed: ${method.name}", it)
+                }
             }
         }
     }
     private var isTaskStackListenerRegistered = false
 
+    private var lastStackRecheckAt = 0L
+
+    @Volatile
+    var recentsGestureSuppressUntilMs = 0L
+
+    @Volatile
+    var lastTouchDownAtMs = 0L
+
+    @Volatile
+    var lastTouchUpAtMs = 0L
+
+    /** 是否正有手指按在屏幕上（用于把回置顶推迟到手势结束，避免中途改窗口栈把进行中的手势抢走） */
+    fun isTouchActive(): Boolean {
+        val last = lastTouchDownAtMs
+        val up = lastTouchUpAtMs
+        return last > up && android.os.SystemClock.uptimeMillis() - last < 1500
+    }
+
+    internal fun taskWindowingMode(taskInfo: Any): Int = runCatching {
+        val windowConfig = XposedHelpers.getObjectField(
+            XposedHelpers.getObjectField(taskInfo, "configuration"),
+            "windowConfiguration"
+        )
+        XposedHelpers.callMethod(windowConfig, "getWindowingMode") as Int
+    }.getOrDefault(0)
+
+    private fun onStackChangedForHome() {
+        val now = SystemClock.uptimeMillis()
+        if (now - lastStackRecheckAt < 700) return
+        lastStackRecheckAt = now
+        val tasks = runCatching {
+            XposedHelpers.callMethod(Instances.activityTaskManager, "getTasks", Int.MAX_VALUE, false, false, -1) as List<*>
+        }.getOrNull() ?: return
+        val topTask = tasks.firstOrNull() ?: return
+        val topTaskId = XposedHelpers.getIntField(topTask, "taskId")
+        val topPkg = runCatching {
+            XposedHelpers.getObjectField(topTask, "topActivity")?.let {
+                XposedHelpers.callMethod(it, "getPackageName") as String
+            }
+        }.getOrNull()
+        val topIsHome = runCatching {
+            val windowConfig = XposedHelpers.getObjectField(
+                XposedHelpers.getObjectField(topTask, "configuration"),
+                "windowConfiguration"
+            )
+            (XposedHelpers.callMethod(windowConfig, "getActivityType") as Int) == 2
+        }.getOrDefault(false)
+        if (BuildConfig.DEBUG) {
+            log("reYAMF_debug", "stackChanged topId=$topTaskId pkg=$topPkg isHome=$topIsHome windows=${activeWindows.size}")
+        }
+        val windows = activeWindows.values.toList()
+        if (windows.isEmpty()) return
+        if (topIsHome) {
+            windows.forEach { it.onHomeTop() }
+        } else {
+            windows.forEach { w ->
+                val info = tasks.find {
+                    XposedHelpers.getIntField(it, "taskId") == w.currentTaskId
+                }
+                val visible = info?.let { XposedHelpers.getBooleanField(it, "isVisible") } ?: true
+                if (BuildConfig.DEBUG) {
+                    log("reYAMF_debug", "visibility task=${w.currentTaskId} found=${info != null} visible=$visible")
+                }
+                w.onTaskVisibilityChanged(visible)
+            }
+        }
+    }
+
     @SuppressLint("UnspecifiedRegisterReceiverFlag")
     fun systemReady() {
         Instances.init(activityManagerService)
+        // 系统窗口后端（WindowBackend 端口）：安装 organizer/leash 实现并绑定回灌回调
+        runCatching {
+            WindowBackends.install(SmoothWindowBackend)
+            WindowBackends.current().initialize(object : WindowBackendCallbacks {
+                override fun onTaskAdopted(taskId: Int) {
+                    onOrganizerTaskAppeared(taskId)
+                }
+
+                override fun onTaskVanished(taskId: Int) {
+                    onOrganizerTaskVanished(taskId)
+                }
+            })
+        }.onFailure { log("reYAMF_debug", "window backend init failed", it) }
         systemContext.registerReceiver(ACTION_OPEN_IN_YAMF, OpenInYAMFBroadcastReceiver)
+        systemContext.registerReceiver(ACTION_RECENTS_GESTURE) { _, intent ->
+            val suppressMs = intent.getLongExtra(EXTRA_SUPPRESS_MS, 0L)
+            recentsGestureSuppressUntilMs = SystemClock.uptimeMillis() + suppressMs
+            if (BuildConfig.DEBUG) {
+                log("reYAMF_debug", "recents gesture suppress ${suppressMs}ms")
+            }
+        }
         systemContext.registerReceiver(ACTION_CURRENT_TO_WINDOW) { _, _ ->
             currentToWindow()
         }
@@ -168,6 +305,9 @@ object YAMFManager : IYAMFManager.Stub() {
         config = runCatching {
             gson.fromJson(configFile.readText(), Config::class.java)
         }.getOrNull() ?: Config()
+        if (config.defaultWindowHeight == LEGACY_DEFAULT_WINDOW_HEIGHT) {
+            config.defaultWindowHeight = 0
+        }
         // log(TAG, "config: $config")
     }
 
@@ -180,7 +320,9 @@ object YAMFManager : IYAMFManager.Stub() {
             runCatching {
                 Instances.activityTaskManager.registerTaskStackListener(taskStackListener)
                 isTaskStackListenerRegistered = true
-                // log(TAG, "Global TaskStackListener registered")
+                log("reYAMF_debug", "taskStackListener registered")
+            }.onFailure {
+                log("reYAMF_debug", "registerTaskStackListener failed", it)
             }
         }
 
@@ -220,6 +362,13 @@ object YAMFManager : IYAMFManager.Stub() {
 
         val taskId = startCmd?.taskId ?: -1
         if (taskId != -1) {
+            // 同一任务已在小窗中：静默销毁旧壳（不释放任务），避免双壳互抢
+            activeWindows.values.toList().forEach { w ->
+                if (w.currentTaskId == taskId) {
+                    log("reYAMF_debug", "dedupe old shell window=${w.windowId} task=$taskId")
+                    runCatching { w.onDestroy(releaseTask = false) }
+                }
+            }
             smoothFreeformTasks.add(taskId)
         }
 
@@ -227,6 +376,10 @@ object YAMFManager : IYAMFManager.Stub() {
             CommonContextWrapper.createAppCompatContext(systemUiContext.createContext())
         ) { window, windowId ->
             addWindow(windowId, window)
+
+            if (startCmd?.openAsMini == true) {
+                window.markOpenAsMini()
+            }
 
             if (taskId != -1) {
                 switchToSmoothFreeform(taskId)
@@ -261,73 +414,54 @@ object YAMFManager : IYAMFManager.Stub() {
         }
     }
 
-    fun updateSmoothBounds(taskId: Int, bounds: android.graphics.Rect) {
-        smoothFreeformBounds[taskId] = bounds
-        
-        val classLoader = Instances.systemContext.classLoader
-        val wctClass = classLoader.loadClass("android.window.WindowContainerTransaction")
-        val wct = XposedHelpers.newInstance(wctClass)
-        
-        val runningTasks = XposedHelpers.callMethod(Instances.activityTaskManager, "getTasks", Int.MAX_VALUE, false, false, -1) as List<*>
-        val taskInfo = runningTasks.find { 
-            XposedHelpers.getIntField(it, "taskId") == taskId 
-        } ?: return
-        
-        val token = XposedHelpers.getObjectField(taskInfo, "token")
-        XposedHelpers.callMethod(wct, "setBounds", token, bounds)
-        
-        val windowOrganizerController = XposedHelpers.callMethod(Instances.activityTaskManager, "getWindowOrganizerController")
-        XposedHelpers.callMethod(windowOrganizerController, "applyTransaction", wct)
+    /** organizer 路径：任务的 leash 已就绪，让宿主按当前物理矩形摆放 */
+    fun onOrganizerTaskAppeared(taskId: Int) {
+        activeWindows.values.toList().forEach { w ->
+            if (w.currentTaskId == taskId) {
+                runCatching { w.onOrganizerLeash() }
+            }
+        }
+    }
+
+    /** organizer 路径：任务已消失（含最近任务划掉），销毁对应外壳 */
+    fun onOrganizerTaskVanished(taskId: Int) {
+        activeWindows.values.toList().forEach { w ->
+            if (w.currentTaskId == taskId) {
+                runCatching { w.onDestroy() }
+            }
+        }
     }
 
     fun switchToSmoothFreeform(taskId: Int) {
+        log("reYAMF_debug", "switchToSmoothFreeform task=$taskId")
         smoothFreeformTasks.add(taskId)
-        
-        val classLoader = Instances.systemContext.classLoader
-        val wctClass = classLoader.loadClass("android.window.WindowContainerTransaction")
-        val wct = XposedHelpers.newInstance(wctClass)
-        
+
         val runningTasks = XposedHelpers.callMethod(Instances.activityTaskManager, "getTasks", Int.MAX_VALUE, false, false, -1) as List<*>
-        val taskInfo = runningTasks.find { 
-            XposedHelpers.getIntField(it, "taskId") == taskId 
-        } ?: return
-        
-        val token = XposedHelpers.getObjectField(taskInfo, "token")
-        XposedHelpers.callMethod(wct, "setWindowingMode", token, WINDOWING_MODE_FREEFORM)
-        
-        // Set initial bounds
-        val dm = Instances.systemContext.resources.displayMetrics
-        val width = config.defaultWindowWidth.dpToPx().toInt()
-        val height = config.defaultWindowHeight.dpToPx().toInt()
-        val left = (dm.widthPixels - width) / 2
-        val top = (dm.heightPixels - height) / 2
-        val bounds = android.graphics.Rect(left, top, left + width, top + height)
-        XposedHelpers.callMethod(wct, "setBounds", token, bounds)
-        
-        val windowOrganizerController = XposedHelpers.callMethod(Instances.activityTaskManager, "getWindowOrganizerController")
-        XposedHelpers.callMethod(windowOrganizerController, "applyTransaction", wct)
-        // log(TAG, "Switched task $taskId to smooth freeform")
+        val taskInfo = runningTasks.find {
+            XposedHelpers.getIntField(it, "taskId") == taskId
+        } ?: run {
+            log("reYAMF_debug", "switchToSmoothFreeform task=$taskId NOT FOUND in tasks")
+            return
+        }
+        runCatching {
+            XposedHelpers.getObjectField(taskInfo, "topActivity") as? ComponentName
+        }.getOrNull()?.let { smoothTaskActivities[taskId] = it }
+
+        // 系统窗口后端：认领（organizer/leash）+ 置前 + 恢复可聚焦；
+        // 只走后端路径，失败大声报错，不再悄悄回退旧行为
+        if (!windowBackend.openTask(taskId)) {
+            log("reYAMF_debug", "ERROR organizer adopt failed task=$taskId (no fallback)")
+        }
     }
 
     fun switchTaskToFullscreen(taskId: Int): Boolean {
         smoothFreeformTasks.remove(taskId)
         smoothFreeformBounds.remove(taskId)
-        
-        val classLoader = Instances.systemContext.classLoader
-        val wctClass = classLoader.loadClass("android.window.WindowContainerTransaction")
-        val wct = XposedHelpers.newInstance(wctClass)
-        
-        val runningTasks = XposedHelpers.callMethod(Instances.activityTaskManager, "getTasks", Int.MAX_VALUE, false, false, -1) as List<*>
-        val taskInfo = runningTasks.find { 
-            XposedHelpers.getIntField(it, "taskId") == taskId 
-        } ?: return false
-        
-        val token = XposedHelpers.getObjectField(taskInfo, "token")
-        XposedHelpers.callMethod(wct, "setWindowingMode", token, WINDOWING_MODE_FULLSCREEN)
-        
-        val windowOrganizerController = XposedHelpers.callMethod(Instances.activityTaskManager, "getWindowOrganizerController")
-        XposedHelpers.callMethod(windowOrganizerController, "applyTransaction", wct)
-        return true
+        smoothCornerRadiusPx.remove(taskId)
+        smoothTaskActivities.remove(taskId)
+
+        // 系统窗口后端：释放（organizer 优先，未接管任务走旧 WCT 回全屏兜底）
+        return windowBackend.releaseTask(taskId)
     }
 
     init {
@@ -495,32 +629,41 @@ object YAMFManager : IYAMFManager.Stub() {
                 intent.getParcelableExtra(EXTRA_COMPONENT_NAME, ComponentName::class.java)
             val userId = intent.getIntExtra(EXTRA_USER_ID, 0)
             val source = intent.getIntExtra(EXTRA_SOURCE, SOURCE_UNSPECIFIED)
-            createWindow(StartCmd(componentName, userId, taskId))
+            val fromDropZone = intent.getBooleanExtra(EXTRA_FROM_DROP_ZONE, false)
+            log("reYAMF_debug", "openInYAMF task=$taskId source=$source fromZone=$fromDropZone component=$componentName")
+            createWindow(StartCmd(componentName, userId, taskId, openAsMini = fromDropZone))
 
             // TODO: better way to close recents
-            if (source == SOURCE_RECENT && config.recentBackHome) {
-                val down = KeyEvent(
-                    SystemClock.uptimeMillis(),
-                    SystemClock.uptimeMillis(),
-                    KeyEvent.ACTION_DOWN,
-                    KeyEvent.KEYCODE_HOME,
-                    0
-                ).apply {
-                    this.source = InputDevice.SOURCE_KEYBOARD
-                    this.invokeMethod("setDisplayId", args(0), argTypes(Integer.TYPE))
-                }
-                Instances.inputManager.injectInputEvent(down, 0)
-                val up = KeyEvent(
-                    SystemClock.uptimeMillis(),
-                    SystemClock.uptimeMillis(),
-                    KeyEvent.ACTION_UP,
-                    KeyEvent.KEYCODE_HOME,
-                    0
-                ).apply {
-                    this.source = InputDevice.SOURCE_KEYBOARD
-                    this.invokeMethod("setDisplayId", args(0), argTypes(Integer.TYPE))
-                }
-                Instances.inputManager.injectInputEvent(up, 0)
+            if (source == SOURCE_RECENT) {
+                android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                    runCatching {
+                        val down = KeyEvent(
+                            SystemClock.uptimeMillis(),
+                            SystemClock.uptimeMillis(),
+                            KeyEvent.ACTION_DOWN,
+                            KeyEvent.KEYCODE_HOME,
+                            0
+                        ).apply {
+                            this.source = InputDevice.SOURCE_KEYBOARD
+                            this.invokeMethod("setDisplayId", args(0), argTypes(Integer.TYPE))
+                        }
+                        val up = KeyEvent(
+                            SystemClock.uptimeMillis(),
+                            SystemClock.uptimeMillis(),
+                            KeyEvent.ACTION_UP,
+                            KeyEvent.KEYCODE_HOME,
+                            0
+                        ).apply {
+                            this.source = InputDevice.SOURCE_KEYBOARD
+                            this.invokeMethod("setDisplayId", args(0), argTypes(Integer.TYPE))
+                        }
+                        val r1 = Instances.inputManager.injectInputEvent(down, 0)
+                        val r2 = Instances.inputManager.injectInputEvent(up, 0)
+                        log("reYAMF_debug", "injectHome done down=$r1 up=$r2")
+                    }.onFailure {
+                        log("reYAMF_debug", "injectHome failed", it)
+                    }
+                }, HOME_INJECT_DELAY_MS)
             }
         }
 }

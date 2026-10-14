@@ -88,7 +88,7 @@
         android:visibility="invisible"
         android:clipChildren="false"
         android:clipToPadding="false"
-        app:cardBackgroundColor="?attr/colorSurface"
+        app:cardBackgroundColor="@android:color/transparent"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintTop_toTopOf="parent"
         app:strokeColor="@color/transparentOutline"
@@ -124,14 +124,14 @@
             android:visibility="invisible"
             android:clipChildren="false"
             android:clipToPadding="false"
-            app:cardBackgroundColor="?attr/colorSurface"
+            app:cardBackgroundColor="@android:color/transparent"
             app:strokeWidth="0dp">
 
             <androidx.constraintlayout.widget.ConstraintLayout
                 android:id="@+id/background"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:background="?attr/colorSurface"
+                android:background="@android:color/transparent"
                 android:clipChildren="false"
                 android:clipToPadding="false">
 
@@ -139,7 +139,7 @@
                     android:id="@+id/ibSuper"
                     android:layout_width="match_parent"
                     android:layout_height="25dp"
-                    android:background="@null"
+                    android:background="@drawable/a_top_scrim"
                     android:src="@drawable/three_dot_horiz"
                     app:layout_constraintEnd_toEndOf="parent"
                     app:layout_constraintStart_toStartOf="parent"
