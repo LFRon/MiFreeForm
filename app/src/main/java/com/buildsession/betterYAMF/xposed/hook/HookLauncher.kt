@@ -355,11 +355,12 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                                     }
                                     AndroidAppHelper.currentApplication().sendBroadcast(intent)
                                     log(TAG, "Sent broadcast to open task $mCurrentTaskId in YAMF")
-                                    
+
+                                    val shownTaskId = mCurrentTaskId
                                     mMainHandler.post {
                                         Toast.makeText(
                                             mDropZoneView?.context ?: AndroidAppHelper.currentApplication(),
-                                            "Task $mCurrentTaskId windowed!",
+                                            "Task $shownTaskId windowed!",
                                             Toast.LENGTH_SHORT
                                         ).show()
                                     }

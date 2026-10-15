@@ -40,14 +40,14 @@ object SmoothWindowBackend : WindowBackend {
         return adopted
     }
 
-    override fun releaseTask(taskId: Int): Boolean {
+    override fun releaseTask(taskId: Int, toFront: Boolean): Boolean {
         // 关键：先把任务恢复为可聚焦，再发释放事务。释放事务内的 lifecycle 复算
         // （ensureActivitiesVisible + resumeFocusedTasksTopActivities）需要任务可聚焦，
         // 才会把回全屏后的任务判为可见/可恢复；否则焦点仍留在（已不可见的）launcher 上，
         // 实测 launcher 会随后把 home 置前（以 QuickstepLaunchHome 播放）→"应用看着退出了"。
         if (SmoothTaskOrganizer.isLeashManaged(taskId)) {
             setTaskFocusable(taskId, true)
-            if (SmoothTaskOrganizer.releaseTask(taskId)) {
+            if (SmoothTaskOrganizer.releaseTask(taskId, toFront)) {
                 return true
             }
         }

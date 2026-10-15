@@ -29,9 +29,12 @@ interface WindowBackend {
 
     /**
      * 关闭/释放：任务回到全屏并交还系统管理（含表面变换复位与焦点恢复）。
+     * [toFront]：置顶回前（下拉全屏路径）为 true；关闭小窗为 false——
+     * 任务复位为全屏后沉到原父级栈底（后台、留在最近任务），不抢当前前台，
+     * 既满足"关闭小窗"语义，也避免表面重建黑帧上屏。
      * 返回是否处理成功。
      */
-    fun releaseTask(taskId: Int): Boolean
+    fun releaseTask(taskId: Int, toFront: Boolean = true): Boolean
 
     /**
      * 几何：按物理矩形（屏幕坐标）更新任务表面的缩放/位置/裁剪/圆角。
