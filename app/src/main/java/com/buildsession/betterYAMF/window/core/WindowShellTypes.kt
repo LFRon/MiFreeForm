@@ -85,6 +85,12 @@ sealed interface WindowInputEvent {
         override val screenY: Float = 0f
     ) : Pointer
 
+    /** 外部请求（宿主内部触发，如"打开即 mini"）：进入角落 mini 态，等价于在右上角投放。 */
+    data class RequestMini(
+        override val windowId: Int,
+        override val timeMs: Long
+    ) : WindowInputEvent
+
     data class Fling(
         override val windowId: Int,
         override val timeMs: Long,

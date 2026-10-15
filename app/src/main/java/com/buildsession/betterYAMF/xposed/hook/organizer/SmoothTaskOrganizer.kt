@@ -6,7 +6,6 @@ import android.os.Binder
 import android.view.SurfaceControl
 import android.window.ITaskOrganizer
 import com.buildsession.betterYAMF.xposed.hook.freeform.FreeformBackend
-import com.buildsession.betterYAMF.xposed.services.YAMFManager
 import com.buildsession.betterYAMF.xposed.services.YAMFManager.config
 import com.buildsession.betterYAMF.xposed.utils.Instances
 import com.buildsession.betterYAMF.xposed.utils.log
@@ -810,7 +809,7 @@ object SmoothTaskOrganizer {
      * shell 应用 finish 事务后必须由我们把 leash 变换重新写回，否则缩放会周期性被冲掉。
      */
     fun reapplyLeash(taskId: Int) {
-        val physical = YAMFManager.smoothFreeformBounds[taskId] ?: return
+        val physical = SmoothWindowBackend.geometryOf(taskId) ?: return
         applyLeash(taskId, physical)
         // 转场收尾重施加（系统语义：cleanupRoundedCornerDisableOptTasks 会在转场空闲后把
         // opt 恢复 true；认领前被登记、或源头闸尚未生效的残余路径仍可能翻回）。目标表面
@@ -833,7 +832,7 @@ object SmoothTaskOrganizer {
     fun writeLeashInto(tx: SurfaceControl.Transaction, taskId: Int): Boolean {
         val leash = leashes[taskId] ?: return false
         val logical = logicalBounds[taskId] ?: return false
-        val physical = YAMFManager.smoothFreeformBounds[taskId] ?: return false
+        val physical = SmoothWindowBackend.geometryOf(taskId) ?: return false
         return runCatching { writeLeashTransform(tx, taskId, leash, logical, physical) }
             .getOrDefault(false)
     }

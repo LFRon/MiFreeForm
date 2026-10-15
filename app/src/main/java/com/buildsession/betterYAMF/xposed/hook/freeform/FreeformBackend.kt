@@ -7,8 +7,11 @@ import android.os.Build
 import android.view.SurfaceControl
 import com.buildsession.betterYAMF.BuildConfig
 import com.buildsession.betterYAMF.xposed.services.YAMFManager
+import com.buildsession.betterYAMF.xposed.hook.organizer.SmoothWindowBackend
+import com.buildsession.betterYAMF.xposed.hook.system.SystemSignals
 import com.buildsession.betterYAMF.xposed.utils.Instances
 import com.buildsession.betterYAMF.xposed.utils.log
+import com.buildsession.betterYAMF.window.session.WindowSessions
 import com.github.kyuubiran.ezxhelper.utils.*
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
@@ -94,7 +97,7 @@ object FreeformBackend {
 
     private fun runPendingReassert(taskId: Int) {
         val task = pendingReassertTasks[taskId] ?: return
-        if (!YAMFManager.smoothFreeformTasks.contains(taskId)) {
+        if (!WindowSessions.hostedTasks.contains(taskId)) {
             clearPendingReassert(taskId)
             return
         }
@@ -183,10 +186,10 @@ object FreeformBackend {
                     android.view.MotionEvent.ACTION_DOWN,
                     android.view.MotionEvent.ACTION_MOVE,
                     android.view.MotionEvent.ACTION_POINTER_DOWN ->
-                        YAMFManager.lastTouchDownAtMs = now
+                        SystemSignals.lastTouchDownAtMs = now
                     android.view.MotionEvent.ACTION_UP,
                     android.view.MotionEvent.ACTION_CANCEL ->
-                        YAMFManager.lastTouchUpAtMs = now
+                        SystemSignals.lastTouchUpAtMs = now
                 }
             }
         }
@@ -223,7 +226,7 @@ object FreeformBackend {
                 val task = runCatching { XposedHelpers.callMethod(activityRecord, "getTask") }.getOrNull()
                     ?: return@runCatching
                 val taskId = XposedHelpers.getIntField(task, "mTaskId")
-                if (!YAMFManager.smoothFreeformTasks.contains(taskId)) return@runCatching
+                if (!WindowSessions.hostedTasks.contains(taskId)) return@runCatching
 
                 // 官方开关：永久停用该 Activity 的输入吞噬
                 runCatching { XposedHelpers.setBooleanField(activityRecord, "mActivityRecordInputSinkEnabled", false) }
@@ -271,8 +274,8 @@ object FreeformBackend {
                             .writeLeashInto(transaction, taskId)
                         return@forEach
                     }
-                    if (!YAMFManager.smoothFreeformTasks.contains(taskId)) return@forEach
-                    if (!YAMFManager.smoothFreeformBounds.containsKey(taskId)) return@forEach
+                    if (!WindowSessions.hostedTasks.contains(taskId)) return@forEach
+                    if (SmoothWindowBackend.geometryOf(taskId) == null) return@forEach
                     // 过渡的落点帧直接复用同一套变换：位置/缩放/圆角/crop 随过渡原子提交，
                     // 与其它锚点幂等一致，不再与过渡抢表面
                     applyTaskTransformOnTransaction(task, transaction, policy.clearTaskCrop)
@@ -353,7 +356,7 @@ object FreeformBackend {
             val task = XposedHelpers.callMethod(activityRecord, "getTask") ?: return false
             val taskId = XposedHelpers.getIntField(task, "mTaskId")
 
-            val isSmoothTask = YAMFManager.smoothFreeformTasks.contains(taskId)
+            val isSmoothTask = WindowSessions.hostedTasks.contains(taskId)
             val isForcePrevent = runCatching { YAMFManager.config.forcePreventRelaunch }.getOrDefault(false)
             
             if (isSmoothTask) return true
@@ -499,11 +502,11 @@ object FreeformBackend {
         if (com.buildsession.betterYAMF.xposed.hook.organizer.SmoothTaskOrganizer.isLeashManaged(taskId)) {
             return
         }
-        if (!YAMFManager.smoothFreeformTasks.contains(taskId)) {
+        if (!WindowSessions.hostedTasks.contains(taskId)) {
             logOnce(taskId, "transform skip task=$taskId reason=untracked")
             return
         }
-        val physicalBounds = YAMFManager.smoothFreeformBounds[taskId]
+        val physicalBounds = SmoothWindowBackend.geometryOf(taskId)
         if (physicalBounds == null) {
             logOnce(taskId, "transform skip task=$taskId reason=no-physical-bounds")
             return
@@ -578,10 +581,10 @@ object FreeformBackend {
                     val task = XposedHelpers.callMethod(windowState, "getTask") ?: return
                     val taskId = XposedHelpers.getIntField(task, "mTaskId")
                     
-                    if (YAMFManager.smoothFreeformTasks.contains(taskId) &&
+                    if (WindowSessions.hostedTasks.contains(taskId) &&
                         !com.buildsession.betterYAMF.xposed.hook.organizer.SmoothTaskOrganizer.isLeashManaged(taskId)
                     ) {
-                        val physicalBounds = YAMFManager.smoothFreeformBounds[taskId] ?: return
+                        val physicalBounds = SmoothWindowBackend.geometryOf(taskId) ?: return
                         val config = XposedHelpers.callMethod(task, "getConfiguration") as Configuration
                         val windowConfig = XposedHelpers.getObjectField(config, "windowConfiguration")
                         val spoofedBounds = XposedHelpers.callMethod(windowConfig, "getBounds") as Rect
@@ -660,7 +663,7 @@ object FreeformBackend {
         if (!title.startsWith("ActivityRecordInputSink")) return false
         val component = title.substringAfter(' ', "").trim()
         if (component.isEmpty()) return false
-        val isSmooth = YAMFManager.smoothTaskActivities.values.any {
+        val isSmooth = WindowSessions.taskActivities.values.any {
             runCatching { it.flattenToShortString() }.getOrNull() == component
         }
         if (!isSmooth) return false
@@ -683,7 +686,7 @@ object FreeformBackend {
     }
 
     private fun applyChromeTouchRegion(inputWindowHandleWrapper: Any, windowState: Any) {
-        if (YAMFManager.chromeTouchHoles.isEmpty()) return
+        if (WindowSessions.chromeTouchHoles.isEmpty()) return
         val title = runCatching {
             val attrs = XposedHelpers.getObjectField(windowState, "mAttrs")
             XposedHelpers.callMethod(attrs, "getTitle") as? CharSequence
@@ -698,7 +701,7 @@ object FreeformBackend {
             ?: Region(0, 0, frame.width(), frame.height())
         val holeRegion = Region()
         var changed = false
-        YAMFManager.chromeTouchHoles.values.forEach { hole ->
+        WindowSessions.chromeTouchHoles.values.forEach { hole ->
             if (Rect.intersects(frame, hole)) {
                 holeRegion.set(
                     hole.left - frame.left,

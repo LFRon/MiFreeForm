@@ -1,5 +1,6 @@
 package com.buildsession.betterYAMF.window.backend
 
+import android.app.ActivityManager
 import android.graphics.Rect
 
 /**
@@ -32,4 +33,13 @@ private object NoopWindowBackend : WindowBackend {
     override fun isAlwaysOnTopActive(): Boolean = false
     override fun isTaskManaged(taskId: Int): Boolean = false
     override fun managedTaskIds(): IntArray = IntArray(0)
+    override fun currentGeometry(taskId: Int): Rect? = null
+    override fun forgetTask(taskId: Int) {}
+    override fun requestSnapshotRefresh(taskId: Int) {}
+    override fun windowingModeOf(taskInfo: ActivityManager.RunningTaskInfo): Int = 0
+    override fun isHomeTask(taskInfo: ActivityManager.RunningTaskInfo): Boolean = false
+    override fun isTouchActive(): Boolean = false
+    override fun suppressRecentsGestureFor(durationMs: Long) {}
+    override fun recentsGestureSuppressUntilMs(): Long = 0L
+    override fun injectHomeKey(): Boolean = false
 }

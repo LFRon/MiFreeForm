@@ -6,30 +6,15 @@ import android.content.BroadcastReceiver
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
-import android.content.pm.ActivityInfo
-import android.content.pm.IPackageManagerHidden
-import android.content.pm.PackageManagerHidden
-import android.content.pm.UserInfo
-import android.graphics.Bitmap
-import android.graphics.Canvas
-import android.graphics.drawable.AdaptiveIconDrawable
-import android.graphics.drawable.BitmapDrawable
 import android.os.Process
 import android.os.SystemClock
-import android.util.Log
-import android.view.InputDevice
-import android.view.KeyEvent
-import com.github.kyuubiran.ezxhelper.utils.argTypes
-import com.github.kyuubiran.ezxhelper.utils.args
-import com.github.kyuubiran.ezxhelper.utils.invokeMethod
-import com.github.kyuubiran.ezxhelper.utils.invokeMethodAs
 import com.buildsession.betterYAMF.BuildConfig
 import com.buildsession.betterYAMF.common.gson
 import com.buildsession.betterYAMF.common.model.AppInfo
 import com.buildsession.betterYAMF.common.model.Config
 import com.buildsession.betterYAMF.common.model.StartCmd
-import com.buildsession.betterYAMF.common.model.resolveWindowSizePx
 import com.buildsession.betterYAMF.common.runMain
+import com.buildsession.betterYAMF.common.ui.componentName
 import com.buildsession.betterYAMF.xposed.IAppIconCallback
 import com.buildsession.betterYAMF.xposed.IAppListCallback
 import com.buildsession.betterYAMF.xposed.IOpenCountListener
@@ -39,21 +24,19 @@ import com.buildsession.betterYAMF.window.backend.WindowBackend
 import com.buildsession.betterYAMF.window.backend.WindowBackendCallbacks
 import com.buildsession.betterYAMF.window.backend.WindowBackends
 import com.buildsession.betterYAMF.window.host.AppWindow
+import com.buildsession.betterYAMF.window.host.WindowHost
+import com.buildsession.betterYAMF.window.session.WindowSessions
 import com.buildsession.betterYAMF.xposed.hook.organizer.SmoothWindowBackend
 import com.buildsession.betterYAMF.xposed.utils.Instances
 import com.buildsession.betterYAMF.xposed.utils.Instances.systemContext
 import com.buildsession.betterYAMF.xposed.utils.Instances.systemUiContext
-import com.buildsession.betterYAMF.xposed.utils.componentName
 import com.buildsession.betterYAMF.xposed.utils.createContext
-import com.buildsession.betterYAMF.xposed.utils.dpToPx
-import com.buildsession.betterYAMF.xposed.utils.getActivityInfoCompat
 import com.buildsession.betterYAMF.xposed.utils.getTopRootTask
 import com.buildsession.betterYAMF.xposed.utils.log
 import com.buildsession.betterYAMF.xposed.utils.registerReceiver
 import com.qauxv.ui.CommonContextWrapper
 import de.robv.android.xposed.XposedHelpers
 import rikka.hidden.compat.ActivityManagerApis
-import java.io.ByteArrayOutputStream
 import java.io.File
 
 
@@ -87,13 +70,8 @@ object YAMFManager : IYAMFManager.Stub() {
 
     private const val LEGACY_DEFAULT_WINDOW_HEIGHT = 380
 
-    val windowList = mutableListOf<Int>()
-    private val activeWindows = mutableMapOf<Int, AppWindow>()
-    val smoothFreeformTasks = java.util.concurrent.ConcurrentHashMap.newKeySet<Int>()
-    val smoothFreeformBounds = java.util.concurrent.ConcurrentHashMap<Int, android.graphics.Rect>()
-    val smoothTaskActivities = java.util.concurrent.ConcurrentHashMap<Int, ComponentName>()
-    val chromeTouchHoles = java.util.concurrent.ConcurrentHashMap<Int, android.graphics.Rect>()
-    val pendingSmoothFreeformApps = mutableMapOf<ComponentName, AppWindow>()
+    private val activeWindows = mutableMapOf<Int, WindowHost>()
+    val pendingSmoothFreeformApps = mutableMapOf<ComponentName, WindowHost>()
     lateinit var config: Config
     val configFile = File("/data/system/BetterYAMF.json")
 
@@ -130,14 +108,14 @@ object YAMFManager : IYAMFManager.Stub() {
 
                         // 若首帧时任务已是 FREEFORM 的任务尚未登记（例如从菜单直启），补登记并立即套用缩放链路；
                         // 切回 FULLSCREEN 的任务则移出登记。
-                        val windowingMode = taskWindowingMode(taskInfo)
+                        val windowingMode = windowBackend.windowingModeOf(taskInfo)
                         if (windowingMode == WINDOWING_MODE_FREEFORM) {
                             val topActivity = taskInfo.topActivity
                             if (topActivity != null) {
                                 val pendingWindow = pendingSmoothFreeformApps[topActivity]
                                 if (pendingWindow != null) {
                                     log("reYAMF_debug", "claim task=${taskInfo.taskId} activity=$topActivity")
-                                    smoothFreeformTasks.add(taskInfo.taskId)
+                                    WindowSessions.hostedTasks.add(taskInfo.taskId)
                                     pendingSmoothFreeformApps.remove(topActivity)
                                     // Trigger a config change to apply spoofing/scaling immediately
                                     switchToSmoothFreeform(taskInfo.taskId)
@@ -152,9 +130,9 @@ object YAMFManager : IYAMFManager.Stub() {
                                 it.currentTaskId == taskInfo.taskId
                             }
                             if (!hostedByWindow) {
-                                smoothFreeformTasks.remove(taskInfo.taskId)
-                                smoothFreeformBounds.remove(taskInfo.taskId)
-                                smoothTaskActivities.remove(taskInfo.taskId)
+                                WindowSessions.hostedTasks.remove(taskInfo.taskId)
+                                WindowSessions.taskActivities.remove(taskInfo.taskId)
+                                windowBackend.forgetTask(taskInfo.taskId)
                             }
                         }
                     }
@@ -173,13 +151,13 @@ object YAMFManager : IYAMFManager.Stub() {
                     "onTaskRemovalStarted" -> {
                         val arg = args[0]
                         val taskId = if (arg is Int) arg else XposedHelpers.getIntField(arg, "taskId")
-                        smoothFreeformTasks.remove(taskId)
-                        smoothFreeformBounds.remove(taskId)
-                        smoothTaskActivities.remove(taskId)
+                        WindowSessions.hostedTasks.remove(taskId)
+                        WindowSessions.taskActivities.remove(taskId)
+                        windowBackend.forgetTask(taskId)
                         // 过滤：只有当被移除的任务 ID 确实属于某个小窗时才触发销
                         activeWindows.values.toList().forEach { window ->
                             if (window.currentTaskId == taskId) {
-                                window.onDestroy()
+                                window.onDestroy(releaseTask = true)
                             }
                         }
                     }
@@ -193,30 +171,6 @@ object YAMFManager : IYAMFManager.Stub() {
     private var isTaskStackListenerRegistered = false
 
     private var lastStackRecheckAt = 0L
-
-    @Volatile
-    var recentsGestureSuppressUntilMs = 0L
-
-    @Volatile
-    var lastTouchDownAtMs = 0L
-
-    @Volatile
-    var lastTouchUpAtMs = 0L
-
-    /** 是否正有手指按在屏幕上（用于把回置顶推迟到手势结束，避免中途改窗口栈把进行中的手势抢走） */
-    fun isTouchActive(): Boolean {
-        val last = lastTouchDownAtMs
-        val up = lastTouchUpAtMs
-        return last > up && android.os.SystemClock.uptimeMillis() - last < 1500
-    }
-
-    internal fun taskWindowingMode(taskInfo: Any): Int = runCatching {
-        val windowConfig = XposedHelpers.getObjectField(
-            XposedHelpers.getObjectField(taskInfo, "configuration"),
-            "windowConfiguration"
-        )
-        XposedHelpers.callMethod(windowConfig, "getWindowingMode") as Int
-    }.getOrDefault(0)
 
     private fun onStackChangedForHome() {
         val now = SystemClock.uptimeMillis()
@@ -279,7 +233,7 @@ object YAMFManager : IYAMFManager.Stub() {
         systemContext.registerReceiver(ACTION_OPEN_IN_YAMF, OpenInYAMFBroadcastReceiver)
         systemContext.registerReceiver(ACTION_RECENTS_GESTURE) { _, intent ->
             val suppressMs = intent.getLongExtra(EXTRA_SUPPRESS_MS, 0L)
-            recentsGestureSuppressUntilMs = SystemClock.uptimeMillis() + suppressMs
+            windowBackend.suppressRecentsGestureFor(suppressMs)
             if (BuildConfig.DEBUG) {
                 log("reYAMF_debug", "recents gesture suppress ${suppressMs}ms")
             }
@@ -325,9 +279,8 @@ object YAMFManager : IYAMFManager.Stub() {
         // log(TAG, "config: $config")
     }
 
-    fun addWindow(id: Int, window: AppWindow) {
-        windowList.add(0, id)
-        activeWindows[id] = window
+    fun addWindow(window: WindowHost) {
+        activeWindows[window.windowId] = window
         openWindowCount++
 
         if (!isTaskStackListenerRegistered) {
@@ -340,21 +293,26 @@ object YAMFManager : IYAMFManager.Stub() {
             }
         }
 
-        val toRemove = mutableSetOf<IOpenCountListener>()
-        iOpenCountListenerSet.forEach {
-            runCatching {
-                it.onUpdate(openWindowCount)
-            }.onFailure { _ ->
-                toRemove.add(it)
-            }
-        }
-        iOpenCountListenerSet.removeAll(toRemove)
+        notifyOpenCount()
     }
 
-    fun removeWindow(id: Int) {
-        windowList.remove(id)
-        activeWindows.remove(id)
-        
+    /**
+     * 宿主注销（窗口销毁时由宿主统一调用）：撤销窗口登记 / 待认领表 / 会话表 / 几何缓存，
+     * 并递减打开计数同步 UI。几何释放（releaseTask）由调用方在销毁前完成，此处幂等兜底。
+     */
+    fun unregisterHost(host: WindowHost) {
+        activeWindows.remove(host.windowId)
+        pendingSmoothFreeformApps.entries.removeAll { it.value === host }
+        WindowSessions.chromeTouchHoles.remove(host.windowId)
+        val taskId = host.currentTaskId
+        if (taskId > 0) {
+            WindowSessions.hostedTasks.remove(taskId)
+            WindowSessions.taskActivities.remove(taskId)
+            windowBackend.forgetTask(taskId)
+        }
+        if (openWindowCount > 0) openWindowCount--
+        notifyOpenCount()
+
         if (activeWindows.isEmpty() && isTaskStackListenerRegistered) {
             runCatching {
                 Instances.activityTaskManager.unregisterTaskStackListener(taskStackListener)
@@ -364,11 +322,16 @@ object YAMFManager : IYAMFManager.Stub() {
         }
     }
 
-    fun isTop(id: Int) = if (windowList.isNotEmpty()) windowList[0] == id else true
-
-    fun moveToTop(id: Int) {
-        windowList.remove(id)
-        windowList.add(0, id)
+    private fun notifyOpenCount() {
+        val toRemove = mutableSetOf<IOpenCountListener>()
+        iOpenCountListenerSet.forEach {
+            runCatching {
+                it.onUpdate(openWindowCount)
+            }.onFailure { _ ->
+                toRemove.add(it)
+            }
+        }
+        iOpenCountListenerSet.removeAll(toRemove)
     }
 
     fun createWindow(startCmd: StartCmd?) {
@@ -383,13 +346,13 @@ object YAMFManager : IYAMFManager.Stub() {
                     runCatching { w.onDestroy(releaseTask = false) }
                 }
             }
-            smoothFreeformTasks.add(taskId)
+            WindowSessions.hostedTasks.add(taskId)
         }
 
         AppWindow(
             CommonContextWrapper.createAppCompatContext(systemUiContext.createContext())
-        ) { window, windowId ->
-            addWindow(windowId, window)
+        ) { window, _ ->
+            addWindow(window)
 
             if (startCmd?.openAsMini == true) {
                 window.markOpenAsMini()
@@ -442,7 +405,7 @@ object YAMFManager : IYAMFManager.Stub() {
     fun onOrganizerTaskVanished(taskId: Int) {
         activeWindows.values.toList().forEach { w ->
             if (w.currentTaskId == taskId) {
-                runCatching { w.onDestroy() }
+                runCatching { w.onDestroy(releaseTask = true) }
             }
         }
         broadcastManagedTaskIds()
@@ -474,7 +437,7 @@ object YAMFManager : IYAMFManager.Stub() {
 
     fun switchToSmoothFreeform(taskId: Int) {
         log("reYAMF_debug", "switchToSmoothFreeform task=$taskId")
-        smoothFreeformTasks.add(taskId)
+        WindowSessions.hostedTasks.add(taskId)
 
         val runningTasks = XposedHelpers.callMethod(Instances.activityTaskManager, "getTasks", Int.MAX_VALUE, false, false, -1) as List<*>
         val taskInfo = runningTasks.find {
@@ -485,7 +448,7 @@ object YAMFManager : IYAMFManager.Stub() {
         }
         runCatching {
             XposedHelpers.getObjectField(taskInfo, "topActivity") as? ComponentName
-        }.getOrNull()?.let { smoothTaskActivities[taskId] = it }
+        }.getOrNull()?.let { WindowSessions.taskActivities[taskId] = it }
 
         // 系统窗口后端：认领（organizer/leash）+ 置前 + 恢复可聚焦；
         // 只走后端路径，失败大声报错，不再悄悄回退旧行为
@@ -500,49 +463,14 @@ object YAMFManager : IYAMFManager.Stub() {
      * 任务转后台、留在最近任务，不抢当前前台）。
      */
     fun switchTaskToFullscreen(taskId: Int, toFront: Boolean = true): Boolean {
-        smoothFreeformTasks.remove(taskId)
-        smoothFreeformBounds.remove(taskId)
-        smoothTaskActivities.remove(taskId)
+        WindowSessions.hostedTasks.remove(taskId)
+        WindowSessions.taskActivities.remove(taskId)
 
         // 系统窗口后端：释放（organizer 优先，未接管任务走旧 WCT 回全屏兜底）
         val released = windowBackend.releaseTask(taskId, toFront)
         // 流程层负责把最新受管集合同步给 Launcher（手势目标豁免；M6 批次2）
         broadcastManagedTaskIds()
         return released
-    }
-
-    /**
-     * 关闭前主动刷新任务快照（必须在应用仍完整可见时调用）。
-     * 背景：关闭流程会先把任务表面收缩/隐藏，再沉入后台；系统在"后台化"时刻自动抓的
-     * 快照恰好是空帧 → 最近任务卡片"白屏"。提前用当前完整画面刷新快照即可避免。
-     */
-    fun refreshTaskSnapshot(taskId: Int) {
-        runCatching {
-            val atm = Instances.activityTaskManager
-            val wm = XposedHelpers.getObjectField(atm, "mWindowManager") ?: return
-            val controller = runCatching {
-                val sc = XposedHelpers.getObjectField(wm, "mSnapshotController")
-                XposedHelpers.getObjectField(sc, "mTaskSnapshotController")
-            }.getOrNull()
-                ?: runCatching { XposedHelpers.getObjectField(wm, "mTaskSnapshotController") }.getOrNull()
-                ?: return
-            val runningTasks = XposedHelpers.callMethod(
-                atm, "getTasks", Int.MAX_VALUE, false, false, -1
-            ) as? List<*> ?: return
-            val info = runningTasks.find { XposedHelpers.getIntField(it, "taskId") == taskId } ?: return
-            val token = XposedHelpers.getObjectField(info, "token")
-            val binder = XposedHelpers.callMethod(token, "asBinder") as? android.os.IBinder ?: return
-            val wcClass = Instances.systemContext.classLoader
-                .loadClass("com.android.server.wm.WindowContainer")
-            val wc = XposedHelpers.callStaticMethod(wcClass, "fromBinder", binder) ?: return
-            val task = XposedHelpers.callMethod(wc, "asTask") ?: return
-            val set = android.util.ArraySet<Any>()
-            set.add(task)
-            XposedHelpers.callMethod(controller, "snapshotTasks", set)
-            log("reYAMF_debug", "refreshTaskSnapshot task=$taskId ok")
-        }.onFailure {
-            log("reYAMF_debug", "refreshTaskSnapshot failed task=$taskId", it)
-        }
     }
 
     init {
@@ -608,10 +536,6 @@ object YAMFManager : IYAMFManager.Stub() {
         }
     }
 
-    override fun getAppList(): List<AppInfo?>? {
-        return listOf()
-    }
-
     override fun createWindowUserspace(appInfo: AppInfo?) {
         runMain {
             appInfo?.let {
@@ -621,80 +545,12 @@ object YAMFManager : IYAMFManager.Stub() {
     }
 
     override fun getAppListAsync(callback: IAppListCallback) {
-        runMain {
-            var apps: List<ActivityInfo>
-            val showApps: MutableList<AppInfo> = mutableListOf()
-            val users = mutableMapOf<Int, String>()
-            Instances.userManager.invokeMethodAs<List<UserInfo>>(
-                "getUsers",
-                args(true, true, true),
-                argTypes(java.lang.Boolean.TYPE, java.lang.Boolean.TYPE, java.lang.Boolean.TYPE)
-            )!!
-                .filter { it.isProfile || it.isPrimary }
-                .forEach {
-                    users[it.id] = it.name
-                }
-
-            users.forEach { usr ->
-                apps = (Instances.packageManager as PackageManagerHidden).queryIntentActivitiesAsUser(
-                    Intent(Intent.ACTION_MAIN).apply {
-                        addCategory(Intent.CATEGORY_LAUNCHER)
-                    }, 0, usr.key
-                ).map {
-                    (Instances.iPackageManager as IPackageManagerHidden).getActivityInfoCompat(
-                        ComponentName(it.activityInfo.packageName, it.activityInfo.name),
-                        0, usr.key
-                    )
-                }
-
-                apps.forEach { activityInfo ->
-                    showApps.add(
-                        AppInfo(
-                            activityInfo, usr.key, usr.value
-                        )
-                    )
-                }
-            }
-
-            showApps.chunked(5).forEach { chunk ->
-                callback.onAppListReceived(chunk.toMutableList())
-            }
-
-            callback.onAppListFinished()
-        }
+        AppCatalog.getAppListAsync(callback)
     }
 
     //Might be useful in the future
     override fun getAppIcon(callback: IAppIconCallback, appInfo: AppInfo) {
-        runMain {
-            val drawable = appInfo.activityInfo.loadIcon(Instances.packageManager)
-
-            val bitmap = when (drawable) {
-                is BitmapDrawable -> drawable.bitmap
-                is AdaptiveIconDrawable -> {
-                    val size = 108
-                    val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
-                    val canvas = Canvas(bitmap)
-                    drawable.setBounds(0, 0, canvas.width, canvas.height)
-                    drawable.draw(canvas)
-                    bitmap
-                }
-                else -> {
-                    val width = drawable.intrinsicWidth.takeIf { it > 0 } ?: 1
-                    val height = drawable.intrinsicHeight.takeIf { it > 0 } ?: 1
-                    val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-                    val canvas = Canvas(bitmap)
-                    drawable.setBounds(0, 0, canvas.width, canvas.height)
-                    drawable.draw(canvas)
-                    bitmap
-                }
-            }
-
-            val stream = ByteArrayOutputStream()
-            bitmap.compress(Bitmap.CompressFormat.PNG, 100, stream)
-            val byteArray = stream.toByteArray()
-            callback.onResult(byteArray)
-        }
+        AppCatalog.getAppIcon(callback, appInfo)
     }
 
     override fun collapseStatusBarPanel() {
@@ -717,33 +573,7 @@ object YAMFManager : IYAMFManager.Stub() {
             // TODO: better way to close recents
             if (source == SOURCE_RECENT) {
                 android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-                    runCatching {
-                        val down = KeyEvent(
-                            SystemClock.uptimeMillis(),
-                            SystemClock.uptimeMillis(),
-                            KeyEvent.ACTION_DOWN,
-                            KeyEvent.KEYCODE_HOME,
-                            0
-                        ).apply {
-                            this.source = InputDevice.SOURCE_KEYBOARD
-                            this.invokeMethod("setDisplayId", args(0), argTypes(Integer.TYPE))
-                        }
-                        val up = KeyEvent(
-                            SystemClock.uptimeMillis(),
-                            SystemClock.uptimeMillis(),
-                            KeyEvent.ACTION_UP,
-                            KeyEvent.KEYCODE_HOME,
-                            0
-                        ).apply {
-                            this.source = InputDevice.SOURCE_KEYBOARD
-                            this.invokeMethod("setDisplayId", args(0), argTypes(Integer.TYPE))
-                        }
-                        val r1 = Instances.inputManager.injectInputEvent(down, 0)
-                        val r2 = Instances.inputManager.injectInputEvent(up, 0)
-                        log("reYAMF_debug", "injectHome done down=$r1 up=$r2")
-                    }.onFailure {
-                        log("reYAMF_debug", "injectHome failed", it)
-                    }
+                    runCatching { windowBackend.injectHomeKey() }
                 }, HOME_INJECT_DELAY_MS)
             }
         }

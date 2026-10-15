@@ -16,7 +16,6 @@ import android.content.res.Resources
 import android.graphics.PixelFormat
 import android.hardware.display.DisplayManager
 import android.os.Build
-import android.os.SystemClock
 import android.util.DisplayMetrics
 import android.util.Log
 import android.util.TypedValue
@@ -39,13 +38,12 @@ import androidx.core.view.updateLayoutParams
 import androidx.dynamicanimation.animation.FlingAnimation
 import androidx.dynamicanimation.animation.flingAnimationOf
 import androidx.wear.widget.RoundedDrawable
-import com.github.kyuubiran.ezxhelper.utils.getObject
-import com.github.kyuubiran.ezxhelper.utils.getObjectAs
-import com.github.kyuubiran.ezxhelper.utils.invokeMethod
 import com.google.android.material.color.MaterialColors
 import com.buildsession.betterYAMF.common.getAttr
 import com.buildsession.betterYAMF.common.onException
 import com.buildsession.betterYAMF.common.runMain
+import com.buildsession.betterYAMF.common.ui.animateAlpha
+import com.buildsession.betterYAMF.common.ui.dpToPx
 import com.buildsession.betterYAMF.databinding.WindowAppBinding
 import com.buildsession.betterYAMF.window.core.CloseOrigin
 import com.buildsession.betterYAMF.window.core.FullscreenOrigin
@@ -55,6 +53,7 @@ import com.buildsession.betterYAMF.window.core.WindowInputEvent
 import com.buildsession.betterYAMF.window.core.WindowRegistration
 import com.buildsession.betterYAMF.window.core.WindowShellController
 import com.buildsession.betterYAMF.window.core.WindowShellRegistry
+import com.buildsession.betterYAMF.window.session.WindowSessions
 import com.buildsession.betterYAMF.common.model.resolveWindowSizePx
 import com.buildsession.betterYAMF.xposed.services.YAMFManager
 import com.buildsession.betterYAMF.xposed.services.YAMFManager.config
@@ -62,8 +61,6 @@ import com.buildsession.betterYAMF.xposed.utils.Instances
 import com.buildsession.betterYAMF.xposed.utils.RunMainThreadQueue
 import com.buildsession.betterYAMF.xposed.utils.TipUtil
 import com.buildsession.betterYAMF.xposed.utils.log
-import com.buildsession.betterYAMF.xposed.utils.animateAlpha
-import com.buildsession.betterYAMF.xposed.utils.dpToPx
 import com.buildsession.betterYAMF.xposed.utils.getActivityInfoCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -76,8 +73,8 @@ import kotlin.math.sign
 @SuppressLint("ClickableViewAccessibility", "SetTextI18n")
 class AppWindow(
     val context: Context,
-    private val onWindowInit: (AppWindow, Int) -> Unit
-) {
+    private val onWindowInit: (WindowHost, Int) -> Unit
+) : WindowHost {
     companion object {
         const val TAG = "reYAMF_AppWindow"
         const val ACTION_RESET_ALL_WINDOW = "com.buildsession.betterYAMF.ui.window.action.ACTION_RESET_ALL_WINDOW"
@@ -87,11 +84,11 @@ class AppWindow(
         private val windowIdGen = java.util.concurrent.atomic.AtomicInteger(1)
     }
 
-    val windowId = windowIdGen.getAndIncrement()
+    override val windowId = windowIdGen.getAndIncrement()
     lateinit var binding: WindowAppBinding
     private lateinit var shell: WindowShellController
 
-    var currentTaskId = -1
+    override var currentTaskId = -1
     private var isDestroyed = false
     private var openAsMiniPending = false
     private var miniRequested = false
@@ -316,7 +313,7 @@ class AppWindow(
 
     }
 
-    fun onDestroy(releaseTask: Boolean = true) {
+    override fun onDestroy(releaseTask: Boolean) {
         if (isDestroyed) return
         isDestroyed = true
 
@@ -339,15 +336,11 @@ class AppWindow(
         
         runCatching { context.unregisterReceiver(broadcastReceiver) }
         
-        YAMFManager.removeWindow(windowId)
-        YAMFManager.chromeTouchHoles.remove(windowId)
-        YAMFManager.pendingSmoothFreeformApps.entries.removeAll { it.value === this }
+        // 流程收口：窗口登记 / 待认领表 / 会话表 / 几何缓存 / 打开计数 统一由流程撤销
+        YAMFManager.unregisterHost(this)
         if (::shell.isInitialized) {
             shellRegistry.unregister(shell)
         }
-        YAMFManager.smoothFreeformTasks.remove(currentTaskId)
-        YAMFManager.smoothFreeformBounds.remove(currentTaskId)
-        YAMFManager.smoothTaskActivities.remove(currentTaskId)
         
         runMain {
             // 移除前先隐身：任何延迟都不留残影（白点回归的兜底）
@@ -371,7 +364,6 @@ class AppWindow(
         Instances.windowManager.addView(binding.root, binding.root.layoutParams)
         // 重挂会更换 ViewRoot，布局监听需要重新注册
         binding.root.viewTreeObserver.addOnGlobalLayoutListener(frameOffsetLayoutListener)
-        YAMFManager.moveToTop(windowId)
     }
 
     private fun dispatchInput(event: WindowInputEvent) {
@@ -566,7 +558,7 @@ class AppWindow(
         // 关闭前刷新最近任务快照（应用此刻仍完整可见）：
         // 否则系统在任务后台化时刻抓到的快照是收缩/隐藏后的空帧 → 最近任务卡片白屏。
         if (currentTaskId > 0) {
-            runCatching { YAMFManager.refreshTaskSnapshot(currentTaskId) }
+            runCatching { YAMFManager.windowBackend.requestSnapshotRefresh(currentTaskId) }
         }
         when (origin) {
             CloseOrigin.DRAG_UP_BAR -> {
@@ -603,7 +595,7 @@ class AppWindow(
     private fun animateWindowShrinkAndClose() {
         val from = currentContentRect()
         if (from == null) {
-            onDestroy()
+            onDestroy(releaseTask = true)
             return
         }
         // 关停收尾：控制条/缩放手柄立即撤出——它们不属于收缩动画，
@@ -624,7 +616,7 @@ class AppWindow(
         animateContentRect(from, to, geometryAnimDuration(220L)) {
             // 动画结束先整壳隐身，再做释放/移除：即使移除被延迟也不留"白点"
             binding.root.visibility = View.INVISIBLE
-            onDestroy()
+            onDestroy(releaseTask = true)
         }
     }
 
@@ -636,7 +628,7 @@ class AppWindow(
                     YAMFManager.switchTaskToFullscreen(currentTaskId)
                     YAMFManager.windowBackend.bringTaskToFront(currentTaskId)
                 }.onSuccess {
-                    onDestroy()
+                    onDestroy(releaseTask = true)
                 }.onFailure {
                     execResetWindowScale()
                 }
@@ -722,24 +714,24 @@ class AppWindow(
     private fun applySmoothBounds(rect: android.graphics.Rect) {
         if (contentTouchThrough) {
             val handleHeight = binding.ibSuper.height.takeIf { it > 0 } ?: 25.dpToPx().toInt()
-            YAMFManager.chromeTouchHoles[windowId] = android.graphics.Rect(
+            WindowSessions.chromeTouchHoles[windowId] = android.graphics.Rect(
                 rect.left,
                 rect.top + handleHeight,
                 rect.right,
                 rect.bottom
             )
         } else {
-            YAMFManager.chromeTouchHoles.remove(windowId)
+            WindowSessions.chromeTouchHoles.remove(windowId)
         }
 
-        if (YAMFManager.smoothFreeformBounds[currentTaskId] != rect) {
+        if (YAMFManager.windowBackend.currentGeometry(currentTaskId) != rect) {
             // 系统窗口后端：几何落地（leash 变换或兼容路径由实现决定，宿主不感知）
             YAMFManager.windowBackend.applyGeometry(currentTaskId, rect)
         }
     }
 
     /** 系统窗口后端把任务 leash 交给我们（onTaskAdopted 回灌）后，按当前几何立即摆放 */
-    fun onOrganizerLeash() {
+    override fun onOrganizerLeash() {
         runMain {
             runCatching {
                 // leash 刚到手：按当前几何立即摆一次位（首帧布局未完成时 updateSmoothBounds 会
@@ -748,7 +740,7 @@ class AppWindow(
                 val taskId = currentTaskId
                 val backend = YAMFManager.windowBackend
                 if (taskId > 0 && backend.isTaskManaged(taskId)) {
-                    if (YAMFManager.smoothFreeformBounds[taskId] != null) {
+                    if (backend.currentGeometry(taskId) != null) {
                         backend.reapplyGeometry(taskId)
                     } else {
                         // 几何未知（首帧布局尚未完成）：先保证任务表面可见，避免后端迁移后
@@ -808,8 +800,8 @@ class AppWindow(
         }
     }
 
-    fun onTaskMovedToFront(taskInfo: ActivityManager.RunningTaskInfo) {
-        val isHome = isHomeTask(taskInfo)
+    override fun onTaskMovedToFront(taskInfo: ActivityManager.RunningTaskInfo) {
+        val isHome = YAMFManager.windowBackend.isHomeTask(taskInfo)
         log(TAG, "onTaskMovedToFront task=${taskInfo.taskId} isHome=$isHome current=$currentTaskId")
         if (isHome) {
             keepAboveHome()
@@ -823,18 +815,18 @@ class AppWindow(
         }
 
         // 其他应用到前台：本窗作为浮窗保持在最前（全局覆盖语义）。
-        // 另一个小窗（smooth 任务）到前台则允许压在上一层，不抢。
-        if (!YAMFManager.smoothFreeformTasks.contains(taskInfo.taskId) && !isDestroyed) {
+        // 另一个小窗（受管任务）到前台则允许压在上一层，不抢。
+        if (!WindowSessions.hostedTasks.contains(taskInfo.taskId) && !isDestroyed) {
             keepAboveHome()
         }
     }
 
-    fun onTaskDescriptionChanged(taskInfo: ActivityManager.RunningTaskInfo) {
+    override fun onTaskDescriptionChanged(taskInfo: ActivityManager.RunningTaskInfo) {
         if (!taskInfo.isVisible) {
             return
         }
 
-        if (isHomeTask(taskInfo)) {
+        if (YAMFManager.windowBackend.isHomeTask(taskInfo)) {
             keepAboveHome()
             return
         }
@@ -844,7 +836,7 @@ class AppWindow(
         }
     }
 
-    fun markOpenAsMini() {
+    override fun markOpenAsMini() {
         openAsMiniPending = true
     }
 
@@ -863,13 +855,8 @@ class AppWindow(
     private fun requestMiniAtCorner() {
         if (isDestroyed || currentTaskId <= 0) return
         runCatching {
-            val dm = context.resources.displayMetrics
-            val cx = (dm.widthPixels - 12).toFloat()
-            val cy = 150f
-            val t = System.currentTimeMillis()
-            dispatchInput(WindowInputEvent.Press(windowId, t, RegionId.BODY_MASK, cx, cy))
-            dispatchInput(WindowInputEvent.Move(windowId, t, RegionId.BODY_MASK, cx, cy))
-            dispatchInput(WindowInputEvent.Up(windowId, t, RegionId.BODY_MASK, cx, cy))
+            // 核心事件（而非合成手势）：NORMAL→MINI 迁移与 EnterMini(CORNER_TR) 由核心状态机决策
+            dispatchInput(WindowInputEvent.RequestMini(windowId, System.currentTimeMillis()))
         }.onFailure {
             log(TAG, "requestMiniAtCorner failed", it)
         }
@@ -878,7 +865,7 @@ class AppWindow(
     private var pendingHide: Runnable? = null
     private var reFrontScheduled = false
 
-    fun onTaskVisibilityChanged(visible: Boolean) {
+    override fun onTaskVisibilityChanged(visible: Boolean) {
         if (isDestroyed) return
         runMain {
             runCatching {
@@ -913,7 +900,7 @@ class AppWindow(
         }
     }
 
-    fun onHomeTop() {
+    override fun onHomeTop() {
         keepAboveHome()
     }
 
@@ -936,7 +923,7 @@ class AppWindow(
         if (reFrontScheduled) return
         reFrontScheduled = true
         val now = android.os.SystemClock.uptimeMillis()
-        val suppressUntil = YAMFManager.recentsGestureSuppressUntilMs
+        val suppressUntil = YAMFManager.windowBackend.recentsGestureSuppressUntilMs()
         val delay = if (suppressUntil > now) suppressUntil - now + 60L else HOME_REFRONT_DELAY_MS
         log(TAG, "keepAboveHome schedule task=$taskId delay=$delay")
         runMain {
@@ -953,7 +940,7 @@ class AppWindow(
             reFrontScheduled = false
             return
         }
-        if (YAMFManager.isTouchActive() && attempts < 40) {
+        if (YAMFManager.windowBackend.isTouchActive() && attempts < 40) {
             binding.root.postDelayed({ reFrontWhenTouchIdle(taskId, attempts + 1) }, 150)
             return
         }
@@ -969,28 +956,6 @@ class AppWindow(
             reFrontScheduled = true
             binding.root.postDelayed({ reFrontWhenTouchIdle(taskId, attempts + 1) }, 400)
         }
-    }
-
-    private fun isHomeTask(taskInfo: ActivityManager.RunningTaskInfo): Boolean {
-        val activityType = runCatching {
-            val config = taskInfo.getObject("configuration")
-            val windowConfig = config.getObject("windowConfiguration")
-            windowConfig.invokeMethod("getActivityType") as Int
-        }.getOrElse {
-            val topActivity = taskInfo.topActivity
-            if (topActivity != null) {
-                val pkg = topActivity.packageName
-                val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)
-                val resolveInfo = context.packageManager.resolveActivity(intent, PackageManager.MATCH_DEFAULT_ONLY)
-                val defaultLauncher = resolveInfo?.activityInfo?.packageName
-
-                if (pkg == defaultLauncher ||
-                    pkg == "com.android.launcher3" ||
-                    pkg == "com.google.android.apps.nexuslauncher" ||
-                    (pkg.contains("launcher", ignoreCase = true) && !pkg.contains("service", ignoreCase = true))) 2 else 0
-            } else 0
-        }
-        return activityType == 2
     }
 
     /**
@@ -1163,7 +1128,7 @@ class AppWindow(
     }
 
     /** 几何诊断：输出本窗口几何/可见性/透明度全景（adb: am broadcast -a com.buildsession.betterYAMF.action.DUMP_GEOMETRY） */
-    fun dumpGeometry() {
+    override fun dumpGeometry() {
         runMain {
             runCatching {
                 val p = binding.root.layoutParams as? WindowManager.LayoutParams
@@ -1242,7 +1207,7 @@ class AppWindow(
 
         // mini 状态下整卡可点（点任意位置放大回正常窗口），关闭内容透传洞
         contentTouchThrough = false
-        YAMFManager.chromeTouchHoles.remove(windowId)
+        WindowSessions.chromeTouchHoles.remove(windowId)
 
         // 侧边最小化比角落 mini 再小一档（1/3），角落为 1/2
         val isSide = corner == com.buildsession.betterYAMF.window.core.DropKind.SIDE_LEFT ||

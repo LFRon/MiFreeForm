@@ -57,3 +57,8 @@ internal fun fling(
     windowId: Int = 1,
     timeMs: Long = 2L
 ) = WindowInputEvent.Fling(windowId, timeMs, velocityX, velocityY)
+
+internal fun requestMini(
+    windowId: Int = 1,
+    timeMs: Long = 0L
+) = WindowInputEvent.RequestMini(windowId, timeMs)

@@ -89,10 +89,6 @@ object YAMFManagerProxy : IYAMFManager, DeathRecipient {
         service?.resetAllWindow()
     }
 
-    override fun getAppList(): List<AppInfo?>? {
-        return service?.getAppList()
-    }
-
     override fun createWindowUserspace(appInfo: AppInfo?) {
         service?.createWindowUserspace(appInfo)
     }
