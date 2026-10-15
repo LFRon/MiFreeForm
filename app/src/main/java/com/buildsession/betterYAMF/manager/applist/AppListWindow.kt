@@ -7,7 +7,6 @@ import android.graphics.drawable.ColorDrawable
 import android.os.IBinder
 import android.text.Editable
 import android.text.TextWatcher
-import android.util.Log
 import android.view.Gravity
 import android.view.LayoutInflater
 import android.view.View
@@ -17,21 +16,18 @@ import androidx.appcompat.view.ContextThemeWrapper
 import androidx.appcompat.widget.PopupMenu
 import androidx.core.graphics.ColorUtils
 import androidx.core.view.isVisible
-import androidx.core.widget.doOnTextChanged
 import androidx.lifecycle.LifecycleService
 import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.GridLayoutManager
 import com.buildsession.betterYAMF.R
 import com.buildsession.betterYAMF.common.model.AppInfo
+import com.buildsession.betterYAMF.common.ui.vibratePhone
 import com.buildsession.betterYAMF.databinding.WindowAppListBinding
 import com.buildsession.betterYAMF.manager.adapter.AppListAdapter
 import com.buildsession.betterYAMF.manager.core.domain.repository.IReyamfRepository
 import com.buildsession.betterYAMF.manager.services.YAMFManagerProxy
+import com.buildsession.betterYAMF.manager.utils.animateScaleThenResize
 import com.buildsession.betterYAMF.xposed.IAppListCallback
-import com.buildsession.betterYAMF.xposed.utils.AppInfoCache
-import com.buildsession.betterYAMF.xposed.utils.animateScaleThenResize
-import com.buildsession.betterYAMF.xposed.utils.log
-import com.buildsession.betterYAMF.xposed.utils.vibratePhone
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -43,8 +39,6 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.Locale
 import javax.inject.Inject
-import kotlin.collections.sortedBy
-import kotlin.time.Duration.Companion.milliseconds
 
 @AndroidEntryPoint
 class AppListWindow :  LifecycleService() {

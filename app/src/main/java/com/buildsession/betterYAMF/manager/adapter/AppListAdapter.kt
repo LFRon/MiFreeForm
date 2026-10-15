@@ -1,22 +1,15 @@
 package com.buildsession.betterYAMF.manager.adapter
 
-import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
-import android.graphics.BitmapFactory
-import android.graphics.drawable.Drawable
-import android.util.Log
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
 import androidx.core.content.ContextCompat
 import androidx.recyclerview.widget.RecyclerView
-import androidx.wear.widget.RoundedDrawable
 import com.buildsession.betterYAMF.R
 import com.buildsession.betterYAMF.common.model.AppInfo
+import com.buildsession.betterYAMF.common.ui.componentName
 import com.buildsession.betterYAMF.databinding.ItemAppBinding
-import com.buildsession.betterYAMF.manager.services.YAMFManagerProxy
-import com.buildsession.betterYAMF.xposed.IAppIconCallback
-import com.buildsession.betterYAMF.xposed.utils.componentName
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch

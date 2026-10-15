@@ -1,6 +1,6 @@
 package com.buildsession.betterYAMF.common.model
 
-import com.buildsession.betterYAMF.xposed.utils.dpToPx
+import com.buildsession.betterYAMF.common.ui.dpToPx
 
 data class Config(
     var coloredController: Boolean = false,
@@ -9,7 +9,6 @@ data class Config(
     var hookLauncher: HookLauncher = HookLauncher(),
     var portraitY: Int = 0,
     var landscapeY: Int = 0,
-    var favApps: MutableList<FavApps> = mutableListOf(),
     var launchSideBarAtBoot: Boolean = false,
     var enableSidebar: Boolean = true,
     var sidebarTransparency: Int = 80,

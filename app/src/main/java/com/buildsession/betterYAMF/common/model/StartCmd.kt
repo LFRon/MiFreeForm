@@ -7,11 +7,5 @@ data class StartCmd(
     val userId: Int? = null,
     val taskId: Int? = null,
     val openAsMini: Boolean = false
-) {
-    val canStartActivity
-        get() = componentName != null && userId != null
-
-    val canMoveTask
-        get() = taskId != null && taskId != 0
-}
+)
 
