@@ -68,6 +68,7 @@ object YAMFManager : IYAMFManager.Stub() {
     const val ACTION_RECENTS_GESTURE = "com.buildsession.betterYAMF.action.RECENTS_GESTURE"
     const val ACTION_MANAGED_TASKS = "com.buildsession.betterYAMF.action.MANAGED_TASKS"
     const val ACTION_QUERY_MANAGED_TASKS = "com.buildsession.betterYAMF.action.QUERY_MANAGED_TASKS"
+    const val ACTION_DUMP_GEOMETRY = "com.buildsession.betterYAMF.action.DUMP_GEOMETRY"
 
     const val EXTRA_COMPONENT_NAME = "componentName"
     const val EXTRA_USER_ID = "userId"
@@ -281,6 +282,11 @@ object YAMFManager : IYAMFManager.Stub() {
         }
         systemContext.registerReceiver(ACTION_QUERY_MANAGED_TASKS) { _, _ ->
             broadcastManagedTaskIds()
+        }
+        systemContext.registerReceiver(ACTION_DUMP_GEOMETRY) { _, _ ->
+            activeWindows.values.toList().forEach { w ->
+                runCatching { w.dumpGeometry() }
+            }
         }
         systemContext.registerReceiver(ACTION_CURRENT_TO_WINDOW) { _, _ ->
             currentToWindow()
