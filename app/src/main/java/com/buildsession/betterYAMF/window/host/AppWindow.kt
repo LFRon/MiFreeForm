@@ -67,8 +67,6 @@ import com.buildsession.betterYAMF.xposed.utils.RunMainThreadQueue
 import com.buildsession.betterYAMF.xposed.utils.TipUtil
 import com.buildsession.betterYAMF.xposed.utils.log
 import com.buildsession.betterYAMF.xposed.utils.animateAlpha
-import com.buildsession.betterYAMF.xposed.utils.animateResize
-import com.buildsession.betterYAMF.xposed.utils.animateScaleThenResize
 import com.buildsession.betterYAMF.xposed.utils.dpToPx
 import com.buildsession.betterYAMF.xposed.utils.getActivityInfoCompat
 import kotlinx.coroutines.CoroutineScope
@@ -108,6 +106,19 @@ class AppWindow(
     private var orientation = 0
     private var params = WindowManager.LayoutParams()
     private var keepInScreenAnimator: ValueAnimator? = null
+
+    // ==== M7：几何唯一事实源——内容矩形动画（chrome 与 leash 逐帧同源） ====
+    /** 当前正在运行的内容矩形动画器（同一时刻只允许一个几何动画）。 */
+    private var boundsAnimator: ValueAnimator? = null
+    private var animDeltaW = 0
+    private var animDeltaH = 0
+    /** 打开后等待内容就绪的淡入（消除"孤钮/空白卡"帧）。 */
+    private var pendingReveal = false
+    @Volatile
+    private var chromeRevealed = false
+    private val revealRunnable = Runnable { revealChrome() }
+    /** M7：进 mini 前的内容矩形（位置记忆）；退出 mini 回到此位置（见视频规范 §2.2） */
+    private var preMiniRect: android.graphics.Rect? = null
     private var flingXAnimation: FlingAnimation? = null
     private var flingYAnimation: FlingAnimation? = null
     private var dragAnchorX = 0
@@ -209,6 +220,10 @@ class AppWindow(
                 }
             }
         }
+
+        // M7：打开即隐藏，等内容就绪（onOrganizerLeash/超时）再淡入——避免空卡闪帧
+        pendingReveal = true
+        binding.root.alpha = 0f
 
         binding.root.let { layout ->
             Instances.windowManager.addView(layout, params)
@@ -315,23 +330,13 @@ class AppWindow(
             originalHeight = binding.cvParent.height
             binding.cvParent.visibility = View.VISIBLE
 
-            animateScaleThenResize(
-                binding.cvBackground,
-                0F, 0F,
-                1F, 1F,
-                0.5F, 0.5F,
-                originalWidth, originalHeight,
-                context
-            ) {
-                setBackgroundWrapContent()
-
-                CoroutineScope(Dispatchers.Main).launch {
-                    delay(200)
-
-                    binding.cvParent.strokeWidth = 2.dpToPx().toInt()
-                }
-
-                isResize = true
+            // M7：内容就绪前整卡不可见（消除打开时的"孤钮/空白卡"帧）。
+            // 就绪信号 = onOrganizerLeash（任务 leash 到手并摆放）；另有超时兜底。
+            // 若 reveal 已先行（内容先到、布局后到），这里不再回退隐藏。
+            if (!chromeRevealed) {
+                pendingReveal = true
+                binding.root.alpha = 0f
+                runMain { binding.root.postDelayed(revealRunnable, 700) }
             }
         }
 
@@ -340,6 +345,12 @@ class AppWindow(
     fun onDestroy(releaseTask: Boolean = true) {
         if (isDestroyed) return
         isDestroyed = true
+
+        // M7：几何动画/淡入兜底清理
+        boundsAnimator?.cancel()
+        boundsAnimator = null
+        pendingReveal = false
+        runMain { runCatching { binding.root.removeCallbacks(revealRunnable) } }
 
         // 关闭小窗时任务回到全屏（否则任务会残留为没有外壳的 freeform 小窗）；
         // 任务移交新壳（同任务重复开窗）时静默销毁，不做释放。
@@ -587,16 +598,7 @@ class AppWindow(
     private fun execRequestClose(origin: CloseOrigin) {
         when (origin) {
             CloseOrigin.DRAG_UP_BAR -> {
-                animateScaleThenResize(
-                    binding.cvParent,
-                    binding.cvParent.scaleX, binding.cvParent.scaleY,
-                    0f, 0f,
-                    0.5f, 0.5f,
-                    0, 0,
-                    context
-                ) {
-                    onDestroy()
-                }
+                animateWindowShrinkAndClose()
             }
             CloseOrigin.BUTTON_X, CloseOrigin.DOUBLE_TAP_BAR -> {
                 isResize = false
@@ -616,20 +618,27 @@ class AppWindow(
                     delay(200)
 
                     withContext(Dispatchers.Main) {
-                        animateScaleThenResize(
-                            binding.cvParent,
-                            1F, 1F,
-                            0F, 0F,
-                            0.5F, 0.5F,
-                            0, 0,
-                            context
-                        ) {
-                            onDestroy()
-                        }
+                        animateWindowShrinkAndClose()
                     }
                 }
             }
         }
+    }
+
+    /**
+     * M7：关闭 = "框 + 内容"按同一矩形收缩到中心后再释放任务。
+     * 消除旧实现"边框缩走、内容僵持/抢先回全屏"的错位；收尾的 releaseTask 由 onDestroy 执行。
+     */
+    private fun animateWindowShrinkAndClose() {
+        val from = currentContentRect()
+        if (from == null) {
+            onDestroy()
+            return
+        }
+        val cx = (from.left + from.right) / 2
+        val cy = (from.top + from.bottom) / 2
+        val to = android.graphics.Rect(cx - 2, cy - 2, cx + 2, cy + 2)
+        animateContentRect(from, to, geometryAnimDuration(220L)) { onDestroy() }
     }
 
     private fun execRequestFullscreen(origin: FullscreenOrigin) {
@@ -719,6 +728,22 @@ class AppWindow(
             return
         }
 
+        applySmoothBounds(rect)
+    }
+
+    /**
+     * 显式矩形入口（M7 几何动画逐帧调用）：跳过 params/布局推导，其余语义与推导路径一致。
+     * 不做 "rect 不得大于 root" 守卫——那是推导路径的异常检测；动画中的目标矩形由我们
+     * 自己计算，root 的布局尺寸可能滞后一帧，守卫会误伤动画帧。
+     */
+    private fun updateSmoothBounds(rect: android.graphics.Rect) {
+        if (currentTaskId == -1) return
+        if (rect.width() <= 0 || rect.height() <= 0) return
+        applySmoothBounds(rect)
+    }
+
+    /** 几何落地共享尾部（两条入口必须一致）：触摸洞 + 圆角 + 后端应用。 */
+    private fun applySmoothBounds(rect: android.graphics.Rect) {
         if (contentTouchThrough) {
             val handleHeight = binding.ibSuper.height.takeIf { it > 0 } ?: 25.dpToPx().toInt()
             YAMFManager.chromeTouchHoles[windowId] = android.graphics.Rect(
@@ -731,7 +756,7 @@ class AppWindow(
             YAMFManager.chromeTouchHoles.remove(windowId)
         }
         YAMFManager.smoothCornerRadiusPx[currentTaskId] = (config.windowRoundedCorner + 2).dpToPx().toInt()
-        
+
         if (YAMFManager.smoothFreeformBounds[currentTaskId] != rect) {
             // 系统窗口后端：几何落地（leash 变换或兼容路径由实现决定，宿主不感知）
             YAMFManager.windowBackend.applyGeometry(currentTaskId, rect)
@@ -757,6 +782,8 @@ class AppWindow(
                     }
                 }
             }.onFailure { log(TAG, "onOrganizerLeash failed", it) }
+            // M7：内容已就绪 → 打开淡入（与首帧摆放同帧完成，杜绝空卡帧）
+            revealChrome()
         }
     }
 
@@ -912,6 +939,10 @@ class AppWindow(
                         log(TAG, "onTaskVisibilityChanged visible=true set=VISIBLE")
                         binding.root.visibility = View.VISIBLE
                     }
+                    // M7 热修：可见性恢复时同步修正透明度（淡入曾被 View 动画回落到 0 的兜底）
+                    if (chromeRevealed && binding.root.alpha < 1f) {
+                        binding.root.alpha = 1f
+                    }
                 } else {
                     // 250ms 宽限：浮窗回置顶/过渡期间不要闪隐
                     val hide = Runnable {
@@ -1062,149 +1093,249 @@ class AppWindow(
         }
     }
 
-    private fun animateResizeCentered(
-        view: View,
-        startWidth: Int,
-        endWidth: Int,
-        startHeight: Int,
-        endHeight: Int,
+    // ==== M7：几何唯一事实源——内容矩形动画（逐帧同时驱动 chrome 与内容 leash） ====
+
+    /** 当前内容矩形（与 updateSmoothBounds 推导一致；布局未就绪返回 null）。 */
+    private fun currentContentRect(): android.graphics.Rect? {
+        val params = binding.root.layoutParams as? WindowManager.LayoutParams ?: return null
+        if (binding.cvParent.width <= 0 || binding.cvParent.height <= 0) return null
+        val left = params.x + (if (frameOffsetKnown) frameOffsetX else 0) + binding.cvParent.left
+        val top = params.y + (if (frameOffsetKnown) frameOffsetY else 0) + binding.cvParent.top
+        return android.graphics.Rect(left, top, left + binding.cvParent.width, top + binding.cvParent.height)
+    }
+
+    /**
+     * 屏内夹取（安全边距）：任何"自动定位"都必须保证窗口四边可见——
+     * 贴屏会让圆角/边框/阴影被屏幕边界裁掉（"边缘消失"回归的根因）。
+     */
+    private fun clampContentRect(leftIn: Int, topIn: Int, w: Int, h: Int): android.graphics.Rect {
+        val dm = context.resources.displayMetrics
+        val margin = 8.dpToPx().toInt()
+        val maxLeft = (dm.widthPixels - w - margin).coerceAtLeast(margin)
+        val maxTop = (dm.heightPixels - h - margin).coerceAtLeast(margin)
+        val left = leftIn.coerceIn(margin, maxLeft)
+        val top = topIn.coerceIn(margin, maxTop)
+        return android.graphics.Rect(left, top, left + w, top + h)
+    }
+
+    /** 逐帧应用内容矩形：窗口位置 + 卡片尺寸 + leash 一次到位（同一几何事实源）。 */
+    private fun applyContentRectFrame(rect: android.graphics.Rect) {
+        val params = binding.root.layoutParams as? WindowManager.LayoutParams ?: return
+        params.x = rect.left - (if (frameOffsetKnown) frameOffsetX else 0) - binding.cvParent.left
+        params.y = rect.top - (if (frameOffsetKnown) frameOffsetY else 0) - binding.cvParent.top
+        binding.cvBackground.updateLayoutParams {
+            width = (rect.width() - animDeltaW).coerceAtLeast(1)
+            height = (rect.height() - animDeltaH).coerceAtLeast(1)
+        }
+        runCatching { Instances.windowManager.updateViewLayout(binding.root, params) }
+        updateSmoothBounds(rect)
+    }
+
+    /**
+     * 内容矩形动画：from → to，逐帧驱动 [applyContentRectFrame]。
+     * 时长为 0（用户关闭动画/配置为 0）时直接到终态（leash 同步一次到位）。
+     */
+    private fun animateContentRect(
+        from: android.graphics.Rect,
+        to: android.graphics.Rect,
+        durationMs: Long,
         onEnd: (() -> Unit)? = null
     ) {
-        val params = binding.root.layoutParams as WindowManager.LayoutParams
-        val initialWindowWidth = binding.root.width
-        val initialWindowHeight = binding.root.height
-        val initialViewWidth = if (view.width > 0) view.width else startWidth
-        val initialViewHeight = if (view.height > 0) view.height else startHeight
-        
-        val centerX = params.x + initialWindowWidth / 2
-        val centerY = params.y + initialWindowHeight / 2
-
-        animateResize(
-            view, startWidth, endWidth, startHeight, endHeight, context,
-            onUpdate = { currentViewWidth, currentViewHeight ->
-                val currentParams = binding.root.layoutParams as WindowManager.LayoutParams
-                val displayMetrics = context.resources.displayMetrics
-                val screenWidth = displayMetrics.widthPixels
-                val screenHeight = displayMetrics.heightPixels
-                
-                val currentWindowWidth = initialWindowWidth + (currentViewWidth - initialViewWidth)
-                val currentWindowHeight = initialWindowHeight + (currentViewHeight - initialViewHeight)
-                
-                // Keep window within screen boundaries during resize
-                val targetX = centerX - currentWindowWidth / 2
-                val targetY = centerY - currentWindowHeight / 2
-                
-                currentParams.x = targetX.coerceIn(0, screenWidth - currentWindowWidth)
-                currentParams.y = targetY.coerceIn(0, screenHeight - currentWindowHeight)
-                
-                runCatching {
-                    Instances.windowManager.updateViewLayout(binding.root, currentParams)
+        boundsAnimator?.cancel()
+        animDeltaW = (binding.cvParent.width - binding.cvBackground.width).coerceAtLeast(0)
+        animDeltaH = (binding.cvParent.height - binding.cvBackground.height).coerceAtLeast(0)
+        if (durationMs <= 0L || from == to) {
+            applyContentRectFrame(to)
+            onEnd?.invoke()
+            return
+        }
+        boundsAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = durationMs
+            interpolator = DecelerateInterpolator()
+            addUpdateListener { anim ->
+                val f = anim.animatedValue as Float
+                applyContentRectFrame(
+                    android.graphics.Rect(
+                        (from.left + (to.left - from.left) * f).toInt(),
+                        (from.top + (to.top - from.top) * f).toInt(),
+                        (from.right + (to.right - from.right) * f).toInt(),
+                        (from.bottom + (to.bottom - from.bottom) * f).toInt()
+                    )
+                )
+            }
+            addListener(object : android.animation.AnimatorListenerAdapter() {
+                override fun onAnimationEnd(animation: android.animation.Animator) {
+                    if (boundsAnimator === animation) boundsAnimator = null
+                    onEnd?.invoke()
                 }
-            },
-            onEnd = onEnd
-        )
+            })
+            start()
+        }
+    }
+
+    /** 几何动画时长：尊重开发者选项动画缩放；缩放为 0 时立即完成；跟随模块动画速度配置。 */
+    private fun geometryAnimDuration(base: Long = 260L): Long {
+        val scale = runCatching {
+            android.provider.Settings.Global.getFloat(
+                context.contentResolver,
+                android.provider.Settings.Global.ANIMATOR_DURATION_SCALE
+            )
+        }.getOrDefault(1f)
+        if (scale <= 0f) return 0L
+        val configured = if (config.animationSpeed < 5100) config.animationSpeed.toLong() else base
+        return (configured * scale).toLong()
+    }
+
+    /** 几何诊断：输出本窗口几何/可见性/透明度全景（adb: am broadcast -a com.buildsession.betterYAMF.action.DUMP_GEOMETRY） */
+    fun dumpGeometry() {
+        runMain {
+            runCatching {
+                val p = binding.root.layoutParams as? WindowManager.LayoutParams
+                val loc = IntArray(2)
+                binding.root.getLocationOnScreen(loc)
+                log(
+                    TAG,
+                    "GEOM window=$windowId task=$currentTaskId destroyed=$isDestroyed " +
+                        "params=(${p?.x},${p?.y}) loc=(${loc[0]},${loc[1]}) " +
+                        "root=${binding.root.width}x${binding.root.height} alpha=${binding.root.alpha} vis=${binding.root.visibility} " +
+                        "revealed=$chromeRevealed pendingReveal=$pendingReveal " +
+                        "cvParent=(l=${binding.cvParent.left},t=${binding.cvParent.top}," +
+                        "${binding.cvParent.width}x${binding.cvParent.height},vis=${binding.cvParent.visibility}) " +
+                        "cvBackground=(l=${binding.cvBackground.left},t=${binding.cvBackground.top}," +
+                        "${binding.cvBackground.width}x${binding.cvBackground.height},vis=${binding.cvBackground.visibility}) " +
+                        "ibSuper=(l=${binding.ibSuper.left},t=${binding.ibSuper.top}," +
+                        "${binding.ibSuper.width}x${binding.ibSuper.height},vis=${binding.ibSuper.visibility}) " +
+                        "offset=(${frameOffsetX},${frameOffsetY},known=$frameOffsetKnown)"
+                )
+            }.onFailure { log(TAG, "dumpGeometry failed", it) }
+        }
+    }
+
+    /** 打开后的内容就绪淡入（消除"孤钮/空白卡"帧）。 */
+    private fun revealChrome() {
+        if (!pendingReveal || isDestroyed) return
+        pendingReveal = false
+        chromeRevealed = true
+        runMain {
+            runCatching {
+                binding.root.removeCallbacks(revealRunnable)
+                // M7 热修：属性驱动的淡入。View 动画（AlphaAnimation）只在动画期间生效，
+                // 结束后会回落到 View.alpha 属性——打开时属性=0 则动画结束又变透明
+                // （"小窗边框消失"回归的根因）。这里直接动画属性本身并把终态钉在 1f。
+                val fromAlpha = binding.root.alpha.coerceIn(0f, 1f)
+                if (fromAlpha < 1f) {
+                    ValueAnimator.ofFloat(fromAlpha, 1f).apply {
+                        duration = 250
+                        addUpdateListener { anim -> binding.root.alpha = anim.animatedValue as Float }
+                        addListener(object : android.animation.AnimatorListenerAdapter() {
+                            override fun onAnimationEnd(animation: android.animation.Animator) {
+                                binding.root.alpha = 1f
+                            }
+                        })
+                        start()
+                    }
+                } else {
+                    binding.root.alpha = 1f
+                }
+                setBackgroundWrapContent()
+
+                CoroutineScope(Dispatchers.Main).launch {
+                    delay(200)
+                    binding.cvParent.strokeWidth = 2.dpToPx().toInt()
+                }
+
+                if (binding.ibRightResize.visibility == View.VISIBLE) {
+                    isResize = true
+                }
+            }.onFailure { log(TAG, "revealChrome failed", it) }
+        }
     }
 
     private fun execEnterMini(corner: com.buildsession.betterYAMF.window.core.DropKind) {
+        if (originalWidth <= 0 || originalHeight <= 0) {
+            log(TAG, "execEnterMini skipped: size not measured")
+            return
+        }
+
         isResize = false
 
         binding.rootClickMask.visibility = View.VISIBLE
         binding.rlBarControllerBottom.visibility = View.GONE
         binding.rlBarControllerSide.visibility = View.GONE
-
-        // 侧边最小化比角落 mini 再小一档（1/3），角落为 1/2
-        val isSide = corner == com.buildsession.betterYAMF.window.core.DropKind.SIDE_LEFT ||
-                corner == com.buildsession.betterYAMF.window.core.DropKind.SIDE_RIGHT
-        val miniDivisor = if (isSide) 3 else 2
-        binding.cvBackground.updateLayoutParams {
-            width = originalWidth / miniDivisor
-            height = originalHeight / miniDivisor
-        }
-
         binding.ibRightResize.visibility = View.GONE
 
         // mini 状态下整卡可点（点任意位置放大回正常窗口），关闭内容透传洞
         contentTouchThrough = false
         YAMFManager.chromeTouchHoles.remove(windowId)
 
-        // 收起后吸附到触发的角落（与演示一致）。
-        // 半尺寸布局尚未完成时 root.width 还是旧值，检测到就重试，避免吸到错误位置。
-        var snapAttempts = 0
-        fun applyMiniSnap() {
-            runCatching {
-                if (originalWidth > 0 && binding.root.width > originalWidth * 3 / 4 && snapAttempts < 4) {
-                    snapAttempts++
-                    binding.root.post { applyMiniSnap() }
-                    return@runCatching
-                }
-                val params = binding.root.layoutParams as WindowManager.LayoutParams
-                val dm = context.resources.displayMetrics
-                val margin = 8.dpToPx().toInt()
-                val topInset = 140
-                val bottomInset = 120
-                when (corner) {
-                    com.buildsession.betterYAMF.window.core.DropKind.CORNER_TL -> {
-                        params.x = margin
-                        params.y = topInset + margin
-                    }
-                    com.buildsession.betterYAMF.window.core.DropKind.CORNER_BL -> {
-                        params.x = margin
-                        params.y = dm.heightPixels - binding.root.height - bottomInset - margin
-                    }
-                    com.buildsession.betterYAMF.window.core.DropKind.CORNER_BR -> {
-                        params.x = dm.widthPixels - binding.root.width - margin
-                        params.y = dm.heightPixels - binding.root.height - bottomInset - margin
-                    }
-                    com.buildsession.betterYAMF.window.core.DropKind.SIDE_LEFT -> {
-                        params.x = margin
-                        params.y = params.y.coerceIn(0, dm.heightPixels - binding.root.height - frameOffsetY)
-                    }
-                    com.buildsession.betterYAMF.window.core.DropKind.SIDE_RIGHT -> {
-                        params.x = dm.widthPixels - binding.root.width - margin
-                        params.y = params.y.coerceIn(0, dm.heightPixels - binding.root.height - frameOffsetY)
-                    }
-                    else -> {
-                        params.x = dm.widthPixels - binding.root.width - margin
-                        params.y = topInset + margin
-                    }
-                }
-                Instances.windowManager.updateViewLayout(binding.root, params)
-                updateSmoothBounds()
-            }.onFailure {
-                log(TAG, "applyMiniSnap failed", it)
-            }
+        // 侧边最小化比角落 mini 再小一档（1/3），角落为 1/2
+        val isSide = corner == com.buildsession.betterYAMF.window.core.DropKind.SIDE_LEFT ||
+                corner == com.buildsession.betterYAMF.window.core.DropKind.SIDE_RIGHT
+        val miniDivisor = if (isSide) 3 else 2
+        val w = originalWidth / miniDivisor
+        val h = originalHeight / miniDivisor
+
+        val dm = context.resources.displayMetrics
+        val margin = 8.dpToPx().toInt()
+        val topInset = 140
+        val bottomInset = 120
+        val from = currentContentRect()
+        // 位置记忆：记住进 mini 前的位置（重复进入不覆盖；退出 mini 回此位置）
+        if (preMiniRect == null) {
+            preMiniRect = from
         }
-        binding.root.post { applyMiniSnap() }
+        // M7：内容矩形动画（chrome 与 leash 同源）——收缩与贴角在一个动画里完成
+        val to = when (corner) {
+            com.buildsession.betterYAMF.window.core.DropKind.CORNER_TL ->
+                android.graphics.Rect(margin, topInset + margin, margin + w, topInset + margin + h)
+            com.buildsession.betterYAMF.window.core.DropKind.CORNER_BL ->
+                android.graphics.Rect(margin, dm.heightPixels - bottomInset - margin - h,
+                    margin + w, dm.heightPixels - bottomInset - margin)
+            com.buildsession.betterYAMF.window.core.DropKind.CORNER_BR ->
+                android.graphics.Rect(dm.widthPixels - margin - w, dm.heightPixels - bottomInset - margin - h,
+                    dm.widthPixels - margin, dm.heightPixels - bottomInset - margin)
+            com.buildsession.betterYAMF.window.core.DropKind.SIDE_LEFT -> {
+                val y = (from?.top ?: 0).coerceIn(margin, (dm.heightPixels - h - margin).coerceAtLeast(margin))
+                android.graphics.Rect(margin, y, margin + w, y + h)
+            }
+            com.buildsession.betterYAMF.window.core.DropKind.SIDE_RIGHT -> {
+                val y = (from?.top ?: 0).coerceIn(margin, (dm.heightPixels - h - margin).coerceAtLeast(margin))
+                android.graphics.Rect(dm.widthPixels - margin - w, y, dm.widthPixels - margin, y + h)
+            }
+            else -> android.graphics.Rect(dm.widthPixels - margin - w, topInset + margin,
+                dm.widthPixels - margin, topInset + margin + h)
+        }
+        animateContentRect(from ?: to, to, geometryAnimDuration())
     }
 
     private fun execExitMini() {
         isResize = true
         contentTouchThrough = true
         binding.rootClickMask.visibility = View.GONE
-
-        binding.cvBackground.updateLayoutParams {
-            width = originalWidth
-            height = originalHeight
-        }
-        animateScaleThenResize(
-            binding.cvBackground,
-            0.5F, 0.5F,
-            1F, 1F,
-            0.5F, 0.5F,
-            originalWidth, originalHeight,
-            context
-        ){
-            setBackgroundWrapContent()
-            setParrentWrapContent()
-            keepInScreen()
-            binding.root.post(::updateSmoothBounds)
-        }
-
         binding.ibRightResize.visibility = View.VISIBLE
         if (orientation == 0) {
             binding.rlBarControllerBottom.visibility = View.VISIBLE
         } else {
             binding.rlBarControllerSide.visibility = View.VISIBLE
+        }
+
+        val from = currentContentRect() ?: return
+        // M7：位置记忆——回到进 mini 前的矩形；无记忆则围绕当前中心展开。
+        // 两者都经安全边距夹取（贴屏会让圆角/边框/阴影出屏 = "边缘消失"缺陷）。
+        val remembered = preMiniRect
+        preMiniRect = null
+        val to = if (remembered != null) {
+            clampContentRect(remembered.left, remembered.top, originalWidth, originalHeight)
+        } else {
+            val cx = (from.left + from.right) / 2
+            val cy = (from.top + from.bottom) / 2
+            clampContentRect(cx - originalWidth / 2, cy - originalHeight / 2, originalWidth, originalHeight)
+        }
+        animateContentRect(from, to, geometryAnimDuration()) {
+            // 终态恢复 wrap-content（保持既有布局约定，后续测量与吸附基于自然尺寸）
+            setBackgroundWrapContent()
+            setParrentWrapContent()
+            binding.root.post(::updateSmoothBounds)
         }
     }
 
@@ -1240,28 +1371,33 @@ class AppWindow(
 
     private fun expandWindow() {
         binding.background.visibility = View.VISIBLE
+        binding.cvappIcon.visibility = View.GONE
 
-        animateResizeCentered(
-            binding.appIcon, 40.dpToPx().toInt(), 0, 40.dpToPx().toInt(), 0) {
-            binding.cvappIcon.visibility = View.GONE
-            animateResizeCentered(binding.cvBackground, 0, originalWidth, 0, originalHeight) {
-                setBackgroundWrapContent()
-                setParrentWrapContent()
-                binding.cvappIcon.visibility = View.VISIBLE
+        val from = currentContentRect()
+        if (from == null) {
+            isResize = true
+            keepInScreen()
+            return
+        }
+        val cx = (from.left + from.right) / 2
+        val cy = (from.top + from.bottom) / 2
+        val to = clampContentRect(cx - originalWidth / 2, cy - originalHeight / 2, originalWidth, originalHeight)
 
-                CoroutineScope(Dispatchers.Main).launch {
-                    delay(200)
+        // M7：收起态→正常态的几何动画（chrome 与 leash 逐帧同源）
+        animateContentRect(from, to, geometryAnimDuration()) {
+            setBackgroundWrapContent()
+            setParrentWrapContent()
+            isResize = true
+            keepInScreen(animate = false)
 
-                    if (orientation == 0) {
-                        binding.rlBarControllerBottom.visibility = View.VISIBLE
-                    } else {
-                        binding.rlBarControllerSide.visibility = View.VISIBLE
-                    }
+            CoroutineScope(Dispatchers.Main).launch {
+                delay(200)
+
+                if (orientation == 0) {
+                    binding.rlBarControllerBottom.visibility = View.VISIBLE
+                } else {
+                    binding.rlBarControllerSide.visibility = View.VISIBLE
                 }
-
-                binding.cvappIcon.visibility = View.GONE
-                isResize = true
-                keepInScreen()
             }
         }
     }
@@ -1270,15 +1406,22 @@ class AppWindow(
         CoroutineScope(Dispatchers.Main).launch {
             delay(200)
 
-            animateResizeCentered(binding.cvBackground, binding.cvBackground.width, 0, binding.cvBackground.height, 0) {
-                binding.cvappIcon.visibility = View.VISIBLE
-                binding.cvappIcon.radius = 20.dpToPx() // 使其变成圆球 (40dp的一半)
-                binding.background.visibility = View.GONE
-                animateResizeCentered(binding.appIcon, 0, 40.dpToPx().toInt(), 0, 40.dpToPx().toInt()) {
-                    keepInScreen()
-                }
+            val from = currentContentRect() ?: return@launch
+            val cx = (from.left + from.right) / 2
+            val cy = (from.top + from.bottom) / 2
+            val ballSize = 44.dpToPx().toInt()
+            val to = android.graphics.Rect(
+                cx - ballSize / 2, cy - ballSize / 2,
+                cx + ballSize / 2, cy + ballSize / 2
+            )
 
+            // M7：正常态→收起态的几何动画；终态切换为图标球
+            animateContentRect(from, to, geometryAnimDuration()) {
+                binding.cvappIcon.radius = 20.dpToPx() // 使其变成圆球 (40dp的一半)
+                binding.cvappIcon.visibility = View.VISIBLE
+                binding.background.visibility = View.GONE
                 isResize = true
+                keepInScreen(animate = false)
             }
         }
     }
