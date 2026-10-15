@@ -26,20 +26,16 @@
         <service
             android:name=".manager.sidebar.SidebarService"
             android:enabled="true"
-            android:exported="true"
+            android:exported="false"
             android:foregroundServiceType="specialUse" >
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="persistent floating sidebar overlay" />
         </service>
-<!--        <service-->
-<!--            android:name=".manager.services.Window"-->
-<!--            android:enabled="true"-->
-<!--            android:exported="true" />-->
         <service
             android:name=".manager.applist.AppListWindow"
             android:enabled="true"
-            android:exported="true" />
+            android:exported="false" />
         <service
             android:name=".manager.sidebar.SidebarMenuService"
             android:foregroundServiceType="specialUse"
@@ -70,10 +66,6 @@
         </activity>
 
         <service
-            android:name=".manager.services.CurrentToFloatingService"
-            android:exported="false"
-            android:label="Move To Floating Service" />
-        <service
             android:name=".manager.services.QSResetAllWindow"
             android:exported="true"
             android:icon="@drawable/ic_picture_in_picture_alt_24"
@@ -100,7 +92,7 @@
         <receiver
             android:name=".manager.broadcastreceiver.BootReceiver"
             android:enabled="true"
-            android:exported="true" >
+            android:exported="false" >
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
             </intent-filter>
