@@ -15,10 +15,7 @@
     <string name="donate_juan">Donate Juan</string>
     <string name="donate">捐赠</string>
     <string name="back_desc">返回</string>
-    <string name="minimize_desc">最小化</string>
     <string name="resize_desc">调整窗口大小</string>
-    <string name="fullscreen_desc">最大化</string>
-    <string name="close_desc">关闭</string>
     <string name="xposeddescription">为类 AOSP 系统提供自由窗口</string>
     <string name="info_system_version">系统版本</string>
     <string name="open_with_yamf">自由窗口</string>
@@ -29,7 +26,6 @@
     <string name="default_window_size_text">默认窗口大小</string>
     <string name="window_size_auto">自动</string>
     <string name="keep_alive_service_text">保持 BetterYAMF 在后台运行</string>
-    <string name="collapsed_app_icon">折叠视图的应用图标</string>
     <string name="wow_nsuch_empty">哇！\n空荡荡~</string>
     <string name="enable_sidebar">启用侧边栏</string>
     <string name="launch_at_startup">开机自启</string>
@@ -61,10 +57,6 @@
     <string name="animation_speed">Animation Speed</string>
     <string name="default_speed">Default</string>
     <string name="_300">300</string>
-    <string name="minimize">Minimize</string>
-    <string name="fullscreen">Fullscreen</string>
-    <string name="collapse">Collapse</string>
-    <string name="close">Close</string>
     <string name="reset_config">重置为默认配置</string>
     <string name="reset_config_title">重置配置</string>
     <string name="reset_config_message">确定要将所有设置恢复为默认值吗？</string>

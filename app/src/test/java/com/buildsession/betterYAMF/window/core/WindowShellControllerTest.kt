@@ -150,26 +150,6 @@ class WindowShellControllerTest {
     }
 
     @Test
-    fun collapsedDragShowsZoneWithoutHoverAndClamps() {
-        val c = controller()
-        c.feed(tap(RegionId.BUTTON_COLLAPSE))
-        assertEquals(ShellMode.COLLAPSED, c.snapshot().mode)
-
-        c.feed(press(RegionId.BODY_MASK, 10f, 1000f))
-        assertEquals(
-            listOf<WindowCommand>(
-                WindowCommand.MoveBy(1, 10f, 0f),
-                WindowCommand.DropZoneShow(1)
-            ),
-            c.feed(move(RegionId.BODY_MASK, 20f, 1000f))
-        )
-        assertEquals(
-            listOf(WindowCommand.ClampToScreen(1, animated = true), WindowCommand.DropZoneHide(1)),
-            c.feed(up(RegionId.BODY_MASK, 20f, 1000f))
-        )
-    }
-
-    @Test
     fun invalidScreenMetricsSkipsHoverComputation() {
         val c = WindowShellController(registration, CoreConfig(), FakeTopPort())
         c.feed(press(RegionId.BODY_MASK, 10f, 10f))
@@ -294,71 +274,6 @@ class WindowShellControllerTest {
             listOf(WindowCommand.RequestClose(1, CloseOrigin.DOUBLE_TAP_BAR)),
             c.feed(tap(RegionId.BAR_SIDE, timeMs = 1899L))
         )
-    }
-
-    @Test
-    fun buttonCloseRequestsClose() {
-        val c = controller()
-        assertEquals(
-            listOf(WindowCommand.RequestClose(1, CloseOrigin.BUTTON_X)),
-            c.feed(tap(RegionId.BUTTON_CLOSE))
-        )
-    }
-
-    @Test
-    fun buttonFullscreenHidesMenuWithoutClearingSuperState() {
-        val c = controller()
-        c.feed(tap(RegionId.HANDLE))
-        assertTrue(c.snapshot().superMenuVisible)
-        assertEquals(
-            listOf<WindowCommand>(
-                WindowCommand.HideSuperMenu(1),
-                WindowCommand.RequestFullscreen(1, FullscreenOrigin.BUTTON)
-            ),
-            c.feed(tap(RegionId.BUTTON_FULLSCREEN))
-        )
-        assertTrue(c.snapshot().superMenuVisible)
-    }
-
-    @Test
-    fun buttonMinimizeTogglesMiniState() {
-        val c = controller()
-        c.feed(tap(RegionId.HANDLE))
-        assertEquals(
-            listOf<WindowCommand>(WindowCommand.HideSuperMenu(1), WindowCommand.EnterMini(1)),
-            c.feed(tap(RegionId.BUTTON_MINIMIZE))
-        )
-        assertEquals(ShellMode.MINI, c.snapshot().mode)
-        assertFalse(c.snapshot().superMenuVisible)
-        assertEquals(
-            listOf<WindowCommand>(WindowCommand.HideSuperMenu(1), WindowCommand.ExitMini(1)),
-            c.feed(tap(RegionId.BUTTON_MINIMIZE))
-        )
-        assertEquals(ShellMode.NORMAL, c.snapshot().mode)
-    }
-
-    @Test
-    fun buttonCollapseTogglesCollapsedState() {
-        val c = controller()
-        assertEquals(
-            listOf<WindowCommand>(WindowCommand.HideSuperMenu(1), WindowCommand.EnterCollapsed(1)),
-            c.feed(tap(RegionId.BUTTON_COLLAPSE))
-        )
-        assertEquals(ShellMode.COLLAPSED, c.snapshot().mode)
-        assertEquals(
-            listOf<WindowCommand>(WindowCommand.HideSuperMenu(1), WindowCommand.ExitCollapsed(1)),
-            c.feed(tap(RegionId.BUTTON_COLLAPSE))
-        )
-        assertEquals(ShellMode.NORMAL, c.snapshot().mode)
-    }
-
-    @Test
-    fun handleTapShowsMenuAndSuperCloseHidesIt() {
-        val c = controller()
-        assertEquals(listOf<WindowCommand>(WindowCommand.ShowSuperMenu(1)), c.feed(tap(RegionId.HANDLE)))
-        assertTrue(c.snapshot().superMenuVisible)
-        assertEquals(listOf<WindowCommand>(WindowCommand.HideSuperMenu(1)), c.feed(tap(RegionId.SUPER_CLOSE)))
-        assertFalse(c.snapshot().superMenuVisible)
     }
 
     @Test
