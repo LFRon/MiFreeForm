@@ -1,5 +1,6 @@
 package com.buildsession.betterYAMF.window.backend
 
+import android.app.ActivityManager
 import android.graphics.Rect
 
 /**
@@ -69,6 +70,37 @@ interface WindowBackend {
      * 供流程层做跨进程同步（如 Launcher 手势目标豁免）；未接管的实现返回空数组。
      */
     fun managedTaskIds(): IntArray
+
+    /** 最近一次落地的任务物理矩形（会话内）；未落地/已释放返回 null。 */
+    fun currentGeometry(taskId: Int): Rect?
+
+    /** 任务消失等场景清理本后端的残留会话状态（几何缓存等）；幂等。 */
+    fun forgetTask(taskId: Int)
+
+    /**
+     * 关闭前主动刷新任务快照（必须在应用仍完整可见时调用）。
+     * 背景：关闭流程会先把任务表面收缩/隐藏，再沉入后台；系统在"后台化"时刻自动抓的
+     * 快照恰好是空帧 → 最近任务卡片"白屏"。实现负责用当前完整画面刷新快照。
+     */
+    fun requestSnapshotRefresh(taskId: Int)
+
+    /** 任务当前窗口模式（WINDOWING_MODE_*）；流程事件分拣用，反射细节由实现收口。 */
+    fun windowingModeOf(taskInfo: ActivityManager.RunningTaskInfo): Int
+
+    /** 该任务是否属于 Home（宿主置顶/让路判定用；实现封装系统判定细节）。 */
+    fun isHomeTask(taskInfo: ActivityManager.RunningTaskInfo): Boolean
+
+    /** 是否正有手指按在屏幕上（用于把回置顶推迟到手势结束）。 */
+    fun isTouchActive(): Boolean
+
+    /** 抑制最近任务手势（Launcher 协作信号；由系统侧接收器转发）。 */
+    fun suppressRecentsGestureFor(durationMs: Long)
+
+    /** 最近任务手势抑制截止时间戳（uptimeMillis；0 = 未抑制）。 */
+    fun recentsGestureSuppressUntilMs(): Long
+
+    /** 注入 HOME 键（"从最近任务打开即小窗"后关闭最近任务界面）。 */
+    fun injectHomeKey(): Boolean
 }
 
 /** 后端 → 宿主的回灌事件。 */

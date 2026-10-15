@@ -341,4 +341,20 @@ class WindowShellControllerTest {
         assertEquals(emptyList<WindowCommand>(), c.feed(press(RegionId.CONTENT, 100f, 100f)))
         assertEquals(emptyList<WindowCommand>(), c.feed(up(RegionId.CONTENT, 100f, 100f)))
     }
+
+    @Test
+    fun requestMiniEntersCornerMiniAndTapExpands() {
+        val c = controller()
+        assertEquals(
+            listOf(WindowCommand.EnterMini(1, DropKind.CORNER_TR)),
+            c.feed(requestMini())
+        )
+        assertEquals(ShellMode.MINI, c.snapshot().mode)
+        assertEquals(emptyList<WindowCommand>(), c.feed(requestMini()))
+        assertEquals(
+            listOf(WindowCommand.ExitMini(1)),
+            c.feed(tapConfirmed())
+        )
+        assertEquals(ShellMode.NORMAL, c.snapshot().mode)
+    }
 }

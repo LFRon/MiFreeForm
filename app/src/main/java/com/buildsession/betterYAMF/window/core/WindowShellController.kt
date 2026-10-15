@@ -38,8 +38,16 @@ class WindowShellController(
             is WindowInputEvent.Cancel -> onCancel(event)
             is WindowInputEvent.TapConfirmed -> onTapConfirmed()
             is WindowInputEvent.Tap -> onTap(event)
+            is WindowInputEvent.RequestMini -> onRequestMini()
             is WindowInputEvent.Fling -> listOf(WindowCommand.FlingBy(windowId, event.velocityX, event.velocityY))
         }
+    }
+
+    /** 外部请求进入 mini（如"打开即 mini"）：仅 NORMAL→MINI 迁移，幂等。 */
+    private fun onRequestMini(): List<WindowCommand> {
+        if (mode == ShellMode.MINI) return emptyList()
+        mode = ShellMode.MINI
+        return listOf(WindowCommand.EnterMini(windowId, DropKind.CORNER_TR))
     }
 
     private fun onPress(event: WindowInputEvent.Press): List<WindowCommand> {

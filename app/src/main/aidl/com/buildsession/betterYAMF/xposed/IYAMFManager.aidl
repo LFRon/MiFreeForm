@@ -30,8 +30,6 @@ interface IYAMFManager {
 
     void resetAllWindow();
 
-    List<AppInfo> getAppList();
-
     void createWindowUserspace(in AppInfo appInfo);
 
     void getAppListAsync(IAppListCallback callback);

@@ -1,21 +1,26 @@
 package com.buildsession.betterYAMF.xposed.hook.organizer
 
+import android.app.ActivityManager
 import android.graphics.Rect
 import com.buildsession.betterYAMF.window.backend.WindowBackend
 import com.buildsession.betterYAMF.window.backend.WindowBackendCallbacks
 import com.buildsession.betterYAMF.xposed.hook.freeform.FreeformBackend
-import com.buildsession.betterYAMF.xposed.services.YAMFManager
+import com.buildsession.betterYAMF.xposed.hook.system.SystemSignals
+import com.buildsession.betterYAMF.xposed.hook.system.TaskSystemOps
 import com.buildsession.betterYAMF.xposed.utils.Instances
 import com.buildsession.betterYAMF.xposed.utils.log
 import de.robv.android.xposed.XposedHelpers
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * `WindowBackend` 的实现：TaskOrganizer 悬浮根 + leash 承载（唯一实现）。
  *
  * 本类也是系统侧细节的收口点：
  * - 认领/释放 = `SmoothTaskOrganizer`（organizer/leash/WCT）；
- * - 几何 = leash 变换（被接管）或旧变换重断言（未接管）；
+ * - 几何 = leash 变换（被接管）或旧变换重断言（未接管）；几何缓存由本后端持有；
  * - 焦点 = `Task.setFocusable` + `adjustFocusToNextFocusableTask`（浮窗语义）；
+ * - 系统操作（快照/Home/HOME 注入/窗口模式）= `TaskSystemOps`（反射细节不外泄）；
+ * - 输入信号 = `SystemSignals`（触摸在屏态 / 最近任务手势抑制）；
  * - 未接管的平滑任务走旧 WCT 释放兜底。
  */
 object SmoothWindowBackend : WindowBackend {
@@ -24,6 +29,17 @@ object SmoothWindowBackend : WindowBackend {
 
     @Volatile
     private var callbacks: WindowBackendCallbacks? = null
+
+    /** 会话几何缓存：唯一写入者 = 本后端（applyGeometry 写、release/forget 清）。 */
+    private val geometryByTask = ConcurrentHashMap<Int, Rect>()
+
+    /** 供实现层（SmoothTaskOrganizer / FreeformBackend）读取的几何访问器。 */
+    fun geometryOf(taskId: Int): Rect? = geometryByTask[taskId]
+
+    /** 供实现层清理的几何访问器（任务消失等；幂等）。 */
+    fun forgetGeometry(taskId: Int) {
+        geometryByTask.remove(taskId)
+    }
 
     override fun initialize(callbacks: WindowBackendCallbacks) {
         // 先绑回调再初始化：初始化过程中可能触发任务事件
@@ -41,6 +57,8 @@ object SmoothWindowBackend : WindowBackend {
     }
 
     override fun releaseTask(taskId: Int, toFront: Boolean): Boolean {
+        // 会话几何先清：无论走 organizer 释放还是旧路径兜底，几何缓存都不应残留
+        forgetGeometry(taskId)
         // 关键：先把任务恢复为可聚焦，再发释放事务。释放事务内的 lifecycle 复算
         // （ensureActivitiesVisible + resumeFocusedTasksTopActivities）需要任务可聚焦，
         // 才会把回全屏后的任务判为可见/可恢复；否则焦点仍留在（已不可见的）launcher 上，
@@ -67,7 +85,7 @@ object SmoothWindowBackend : WindowBackend {
             setTaskFocusable(taskId, true)
 
             // 已是全屏的任务（如全屏按钮路径的二次调用）不再重发事务
-            if (YAMFManager.taskWindowingMode(taskInfo) == WINDOWING_MODE_FULLSCREEN) {
+            if (TaskSystemOps.windowingMode(taskInfo) == WINDOWING_MODE_FULLSCREEN) {
                 return true
             }
 
@@ -87,7 +105,7 @@ object SmoothWindowBackend : WindowBackend {
     }
 
     override fun applyGeometry(taskId: Int, physicalBounds: Rect) {
-        YAMFManager.smoothFreeformBounds[taskId] = physicalBounds
+        geometryByTask[taskId] = physicalBounds
         if (SmoothTaskOrganizer.isLeashManaged(taskId)) {
             SmoothTaskOrganizer.applyLeash(taskId, physicalBounds)
         } else {
@@ -96,7 +114,7 @@ object SmoothWindowBackend : WindowBackend {
     }
 
     override fun reapplyGeometry(taskId: Int) {
-        val bounds = YAMFManager.smoothFreeformBounds[taskId] ?: return
+        val bounds = geometryByTask[taskId] ?: return
         applyGeometry(taskId, bounds)
     }
 
@@ -167,6 +185,32 @@ object SmoothWindowBackend : WindowBackend {
     override fun isTaskManaged(taskId: Int): Boolean = SmoothTaskOrganizer.isLeashManaged(taskId)
 
     override fun managedTaskIds(): IntArray = SmoothTaskOrganizer.managedTaskIds()
+
+    override fun currentGeometry(taskId: Int): Rect? = geometryOf(taskId)
+
+    override fun forgetTask(taskId: Int) {
+        forgetGeometry(taskId)
+    }
+
+    override fun requestSnapshotRefresh(taskId: Int) {
+        TaskSystemOps.refreshTaskSnapshot(taskId)
+    }
+
+    override fun windowingModeOf(taskInfo: ActivityManager.RunningTaskInfo): Int =
+        TaskSystemOps.windowingMode(taskInfo)
+
+    override fun isHomeTask(taskInfo: ActivityManager.RunningTaskInfo): Boolean =
+        TaskSystemOps.isHomeTask(taskInfo)
+
+    override fun isTouchActive(): Boolean = SystemSignals.isTouchActive()
+
+    override fun suppressRecentsGestureFor(durationMs: Long) {
+        SystemSignals.suppressRecentsGestureFor(durationMs)
+    }
+
+    override fun recentsGestureSuppressUntilMs(): Long = SystemSignals.recentsGestureSuppressUntilMs
+
+    override fun injectHomeKey(): Boolean = TaskSystemOps.injectHomeKey()
 
     // === 后端 → 宿主回灌（由 SmoothTaskOrganizer 在系统回调内调用） ===
 
