@@ -2,9 +2,9 @@
 
 <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
     android:description="@string/keep_alive_service_text"
-    android:packageNames="com.mja.reyamf"
+    android:packageNames="com.buildsession.betterYAMF"
     android:accessibilityFlags="flagDefault"
     android:accessibilityFeedbackType="feedbackGeneric"
     android:canRetrieveWindowContent="false"
-    android:settingsActivity="com.mja.reyamf.manager.ui.SettingsActivity"
+    android:settingsActivity="com.buildsession.betterYAMF.manager.ui.main.MainActivity"
     />

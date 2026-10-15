@@ -6,7 +6,7 @@
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SYSTEM_EXEMPTED" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
     <uses-permission
         android:name="android.permission.QUERY_ALL_PACKAGES"
@@ -26,7 +26,11 @@
         <service
             android:name=".manager.sidebar.SidebarService"
             android:enabled="true"
-            android:exported="true" >
+            android:exported="true"
+            android:foregroundServiceType="specialUse" >
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="persistent floating sidebar overlay" />
         </service>
 <!--        <service-->
 <!--            android:name=".manager.services.Window"-->
@@ -38,8 +42,12 @@
             android:exported="true" />
         <service
             android:name=".manager.sidebar.SidebarMenuService"
-            android:foregroundServiceType="systemExempted"
-            android:enabled="true" />
+            android:foregroundServiceType="specialUse"
+            android:enabled="true" >
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="persistent floating sidebar overlay" />
+        </service>
 
         <activity
             android:name=".manager.ui.setting.SettingActivity"
