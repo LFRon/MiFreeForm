@@ -406,8 +406,8 @@ class AppWindow(
 
     private fun translateMoveGesture(region: RegionId, event: MotionEvent) {
         if (event.action == MotionEvent.ACTION_DOWN) {
-            flingXAnimation?.cancel()
-            flingYAnimation?.cancel()
+            // 触下即接管几何：取消惯性/夹取/内容矩形动画（修复"框自己跳走"）
+            cancelGeometryAnimators()
             gestureRegion = region
             val params = binding.root.layoutParams as WindowManager.LayoutParams
             dragAnchorX = params.x
@@ -448,6 +448,9 @@ class AppWindow(
     }
 
     private fun execFlingBy(command: WindowCommand.FlingBy) {
+        // 落点收缩动画运行期间丢弃手势惯性：几何由落点动画独占（修复"框自己跳走"）
+        if (boundsAnimator?.isRunning == true) return
+        cancelGeometryAnimators(includeBounds = false)
         val params = binding.root.layoutParams as WindowManager.LayoutParams
         val displayMetrics = context.resources.displayMetrics
         val screenWidth = displayMetrics.widthPixels
@@ -478,8 +481,8 @@ class AppWindow(
                         setMaxValue(maxX)
                     }
                 }
-            flingXAnimation?.addEndListener { _, _, _, _ ->
-                keepInScreen()
+            flingXAnimation?.addEndListener { _, canceled, _, _ ->
+                if (!canceled) keepInScreen()
             }
             flingXAnimation?.start()
         }
@@ -501,8 +504,8 @@ class AppWindow(
                         setMaxValue(maxY)
                     }
                 }
-            flingYAnimation?.addEndListener { _, _, _, _ ->
-                keepInScreen()
+            flingYAnimation?.addEndListener { _, canceled, _, _ ->
+                if (!canceled) keepInScreen()
             }
             flingYAnimation?.start()
         }
@@ -965,8 +968,33 @@ class AppWindow(
         return activityType == 2
     }
 
+    /**
+     * 几何动画所有权（修复"框自己跳走"）：同一时刻只允许一个几何写者。
+     * 惯性动画（onFling）先于 Up 触发、其结束回调又会以"收缩中的过时 root 宽度"
+     * 夹取——与落点收缩动画并发时逐帧互抢 params/leash。任何一方开始前先取消其余写者。
+     */
+    private fun cancelGeometryAnimators(includeBounds: Boolean = true) {
+        flingXAnimation?.cancel()
+        flingXAnimation = null
+        flingYAnimation?.cancel()
+        flingYAnimation = null
+        keepInScreenAnimator?.cancel()
+        keepInScreenAnimator = null
+        if (includeBounds) {
+            boundsAnimator?.cancel()
+            boundsAnimator = null
+        }
+    }
+
     private fun keepInScreen(animate: Boolean = true) {
         binding.root.post {
+            // 几何动画（收缩/惯性）运行期间不改写几何：动画自行收敛，惯性结束回调会再触发夹取。
+            if (boundsAnimator?.isRunning == true ||
+                flingXAnimation?.isRunning == true ||
+                flingYAnimation?.isRunning == true
+            ) {
+                return@post
+            }
             val params = binding.root.layoutParams as WindowManager.LayoutParams
             val displayMetrics = context.resources.displayMetrics
             val screenWidth = displayMetrics.widthPixels
@@ -1063,7 +1091,8 @@ class AppWindow(
         durationMs: Long,
         onEnd: (() -> Unit)? = null
     ) {
-        boundsAnimator?.cancel()
+        // 内容矩形动画独占几何：取消惯性/夹取/上一次几何动画（修复"框自己跳走"）
+        cancelGeometryAnimators()
         animDeltaW = (binding.cvParent.width - binding.cvBackground.width).coerceAtLeast(0)
         animDeltaH = (binding.cvParent.height - binding.cvBackground.height).coerceAtLeast(0)
         if (durationMs <= 0L || from == to) {
@@ -1279,8 +1308,11 @@ class AppWindow(
         ibResize.setOnTouchListener(object : View.OnTouchListener {
             override fun onTouch(v: View, event: MotionEvent): Boolean {
                 when(event.action) {
-                    MotionEvent.ACTION_DOWN ->
+                    MotionEvent.ACTION_DOWN -> {
+                        // 触下即接管几何：取消惯性/夹取/内容矩形动画（同拖拽路径）
+                        cancelGeometryAnimators()
                         dispatchInput(WindowInputEvent.Press(windowId, event.eventTime, RegionId.RESIZE_HANDLE, event.rawX, event.rawY))
+                    }
                     MotionEvent.ACTION_MOVE -> {
                         dispatchInput(WindowInputEvent.Move(windowId, event.eventTime, RegionId.RESIZE_HANDLE, event.rawX, event.rawY))
                         // 等本帧布局应用后再同步任务矩形，缩放时内容与外壳连续对齐
