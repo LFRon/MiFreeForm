@@ -3,6 +3,7 @@ package com.buildsession.betterYAMF.manager.services
 import android.content.Intent
 import android.service.voice.VoiceInteractionService
 import android.util.Log
+import com.buildsession.betterYAMF.BuildConfig
 
 class CurrentToFloatingService : VoiceInteractionService() {
     override fun onCreate() {
@@ -13,7 +14,7 @@ class CurrentToFloatingService : VoiceInteractionService() {
         intent.addCategory(Intent.CATEGORY_DEFAULT)
         intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
 
-        Log.d("reYAMFDWOO", "long pressed")
+        if (BuildConfig.DEBUG) Log.d("reYAMFDWOO", "long pressed")
 
         sendBroadcast(intent)
     }
@@ -21,6 +22,6 @@ class CurrentToFloatingService : VoiceInteractionService() {
     override fun onReady() {
         super.onReady()
 
-        Log.d("reYAMFWOO", "readyyyyyyyy")
+        if (BuildConfig.DEBUG) Log.d("reYAMFWOO", "readyyyyyyyy")
     }
 }

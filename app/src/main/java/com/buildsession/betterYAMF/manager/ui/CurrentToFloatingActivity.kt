@@ -3,6 +3,7 @@ package com.buildsession.betterYAMF.manager.ui
 import android.app.Activity
 import android.os.Bundle
 import android.util.Log
+import com.buildsession.betterYAMF.BuildConfig
 import com.buildsession.betterYAMF.manager.services.YAMFManagerProxy
 
 
@@ -19,7 +20,7 @@ class CurrentToFloatingActivity : Activity() {
 //        intent.addCategory(Intent.CATEGORY_DEFAULT)
 //        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
 
-        Log.d("reYAMFWOO", "long pressed")
+        if (BuildConfig.DEBUG) Log.d("reYAMFWOO", "long pressed")
 
 //        startService(intent)
 //        sendBroadcast(intent)

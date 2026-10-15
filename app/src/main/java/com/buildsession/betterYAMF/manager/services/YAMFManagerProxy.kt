@@ -3,6 +3,7 @@ package com.buildsession.betterYAMF.manager.services
 import android.os.IBinder
 import android.os.IBinder.DeathRecipient
 import android.util.Log
+import com.buildsession.betterYAMF.BuildConfig
 import com.buildsession.betterYAMF.common.model.AppInfo
 import com.buildsession.betterYAMF.xposed.IAppIconCallback
 import com.buildsession.betterYAMF.xposed.IAppListCallback
@@ -18,11 +19,13 @@ object YAMFManagerProxy : IYAMFManager, DeathRecipient {
     private class ServiceProxy(private val obj: IYAMFManager) : InvocationHandler {
         override fun invoke(proxy: Any?, method: Method, args: Array<out Any?>?): Any? {
             val result = method.invoke(obj, *args.orEmpty())
-            if (result == null) Log.i(TAG, "Call service method ${method.name}")
-            else Log.i(
-                TAG,
-                "Call service method ${method.name} with result " + result.toString().take(20)
-            )
+            if (BuildConfig.DEBUG) {
+                if (result == null) Log.i(TAG, "Call service method ${method.name}")
+                else Log.i(
+                    TAG,
+                    "Call service method ${method.name} with result " + result.toString().take(20)
+                )
+            }
             return result
         }
     }

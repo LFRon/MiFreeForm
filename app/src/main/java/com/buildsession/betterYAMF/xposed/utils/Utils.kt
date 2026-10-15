@@ -30,6 +30,7 @@ import android.widget.LinearLayout
 import com.bumptech.glide.Glide
 import com.bumptech.glide.load.resource.bitmap.CenterCrop
 import com.bumptech.glide.load.resource.drawable.DrawableTransitionOptions
+import com.buildsession.betterYAMF.BuildConfig
 import com.buildsession.betterYAMF.common.gson
 import com.buildsession.betterYAMF.manager.services.YAMFManagerProxy
 import com.buildsession.betterYAMF.xposed.services.YAMFManager
@@ -37,12 +38,19 @@ import de.robv.android.xposed.XposedBridge
 import com.buildsession.betterYAMF.common.model.Config as YAMFConfig
 
 fun log(tag: String, message: String) {
+    // 非警告/错误日志：仅 DEBUG 构建输出，Release 静默（避免 logd/IPC 徒增功耗）
+    if (!BuildConfig.DEBUG) return
     XposedBridge.log("[$tag] $message")
 }
 
 fun log(tag: String, message: String, t: Throwable) {
-    XposedBridge.log("[$tag] $message")
-    XposedBridge.log(t)
+    // 错误：Release 保留——走 logcat ERROR 级（轻量，不写 Xposed 日志文件）；DEBUG 完整输出
+    if (BuildConfig.DEBUG) {
+        XposedBridge.log("[$tag] $message")
+        XposedBridge.log(t)
+    } else {
+        android.util.Log.e(tag, message, t)
+    }
 }
 
 fun Number.dpToPx() =

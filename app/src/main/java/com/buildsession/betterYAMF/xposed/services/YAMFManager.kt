@@ -91,7 +91,6 @@ object YAMFManager : IYAMFManager.Stub() {
     private val activeWindows = mutableMapOf<Int, AppWindow>()
     val smoothFreeformTasks = java.util.concurrent.ConcurrentHashMap.newKeySet<Int>()
     val smoothFreeformBounds = java.util.concurrent.ConcurrentHashMap<Int, android.graphics.Rect>()
-    val smoothCornerRadiusPx = java.util.concurrent.ConcurrentHashMap<Int, Int>()
     val smoothTaskActivities = java.util.concurrent.ConcurrentHashMap<Int, ComponentName>()
     val chromeTouchHoles = java.util.concurrent.ConcurrentHashMap<Int, android.graphics.Rect>()
     val pendingSmoothFreeformApps = mutableMapOf<ComponentName, AppWindow>()
@@ -155,7 +154,6 @@ object YAMFManager : IYAMFManager.Stub() {
                             if (!hostedByWindow) {
                                 smoothFreeformTasks.remove(taskInfo.taskId)
                                 smoothFreeformBounds.remove(taskInfo.taskId)
-                                smoothCornerRadiusPx.remove(taskInfo.taskId)
                                 smoothTaskActivities.remove(taskInfo.taskId)
                             }
                         }
@@ -177,7 +175,6 @@ object YAMFManager : IYAMFManager.Stub() {
                         val taskId = if (arg is Int) arg else XposedHelpers.getIntField(arg, "taskId")
                         smoothFreeformTasks.remove(taskId)
                         smoothFreeformBounds.remove(taskId)
-                        smoothCornerRadiusPx.remove(taskId)
                         smoothTaskActivities.remove(taskId)
                         // 过滤：只有当被移除的任务 ID 确实属于某个小窗时才触发销
                         activeWindows.values.toList().forEach { window ->
@@ -507,7 +504,6 @@ object YAMFManager : IYAMFManager.Stub() {
     fun switchTaskToFullscreen(taskId: Int, toFront: Boolean = true): Boolean {
         smoothFreeformTasks.remove(taskId)
         smoothFreeformBounds.remove(taskId)
-        smoothCornerRadiusPx.remove(taskId)
         smoothTaskActivities.remove(taskId)
 
         // 系统窗口后端：释放（organizer 优先，未接管任务走旧 WCT 回全屏兜底）

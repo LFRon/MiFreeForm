@@ -61,6 +61,11 @@ object FreeformBackend {
                 null
             )
             XposedHelpers.callMethod(transaction, "setCornerRadius", surfaceControl, 0f)
+            // 恢复系统默认的客户端自绘圆角开关（与 TransitionController 转场收尾语义一致；
+            // 不恢复的话应用在回归全屏后仍保持"不自绘"状态，属我们不应留的全局副作用）
+            XposedHelpers.callMethod(
+                transaction, "toggleClientDrawnRoundedCornersOpt", surfaceControl, true
+            )
         }.onFailure {
             log(TAG, "releaseTaskTransforms failed task=$taskId", it)
         }
@@ -129,30 +134,11 @@ object FreeformBackend {
 
     private fun reassertTaskTransform(task: Any, clearCrop: Boolean, source: String) {
         if (isTaskAnimating(task)) {
-            applyTaskCornerRadius(task)
             schedulePendingReassert(task)
-            logOnceTask(task, "transform skip source=$source reason=animating (radius only)")
+            logOnceTask(task, "transform skip source=$source reason=animating")
             return
         }
         applyTaskTransform(task, clearCrop)
-    }
-
-    private fun applyTaskCornerRadius(task: Any) {
-        val taskId = runCatching { XposedHelpers.getIntField(task, "mTaskId") }.getOrDefault(-1)
-        if (!YAMFManager.smoothFreeformTasks.contains(taskId)) return
-        // leash 受管任务的圆角由 leash 链独占（含 /scale 补偿）；此处再写原始值会互相打架。
-        if (com.buildsession.betterYAMF.xposed.hook.organizer.SmoothTaskOrganizer.isLeashManaged(taskId)) return
-        val cornerRadiusPx = YAMFManager.smoothCornerRadiusPx[taskId] ?: return
-        if (cornerRadiusPx <= 0) return
-        val surfaceControl = runCatching {
-            XposedHelpers.getObjectField(task, "mSurfaceControl") as? SurfaceControl
-        }.getOrNull() ?: return
-        val transaction = runCatching {
-            XposedHelpers.callMethod(task, "getSyncTransaction") as SurfaceControl.Transaction
-        }.getOrNull() ?: return
-        runCatching {
-            XposedHelpers.callMethod(transaction, "setCornerRadius", surfaceControl, cornerRadiusPx.toFloat())
-        }
     }
 
     fun init(classLoader: ClassLoader) {
@@ -457,9 +443,8 @@ object FreeformBackend {
             name == "updateSurfaceSize" && paramCount == 1
         }.hookAfter { param ->
             if (isTaskAnimating(param.thisObject)) {
-                applyTaskCornerRadius(param.thisObject)
                 schedulePendingReassert(param.thisObject)
-                logOnceTask(param.thisObject, "transform skip source=updateSurfaceSize reason=animating (radius only)")
+                logOnceTask(param.thisObject, "transform skip source=updateSurfaceSize reason=animating")
                 return@hookAfter
             }
             val transaction = param.args[0] as? SurfaceControl.Transaction ?: return@hookAfter
@@ -560,18 +545,6 @@ object FreeformBackend {
 
         XposedHelpers.callMethod(transaction, "setMatrix", surfaceControl, transform.scaleX, 0f, 0f, transform.scaleY)
         XposedHelpers.callMethod(transaction, "setPosition", surfaceControl, transform.positionX, transform.positionY)
-
-        val cornerRadiusPx = YAMFManager.smoothCornerRadiusPx[taskId] ?: 0
-        if (cornerRadiusPx > 0) {
-            runCatching {
-                XposedHelpers.callMethod(
-                    transaction,
-                    "setCornerRadius",
-                    surfaceControl,
-                    cornerRadiusPx / transform.scaleX
-                )
-            }
-        }
 
         if (clearCrop) {
             runCatching {
