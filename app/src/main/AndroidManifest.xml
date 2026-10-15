@@ -66,26 +66,6 @@
             android:exported="false"
             android:label="Move To Floating Service" />
         <service
-            android:name=".manager.services.QSNewWindowService"
-            android:exported="true"
-            android:icon="@drawable/ic_picture_in_picture_alt_24"
-            android:label="@string/new_window"
-            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE" >
-            <intent-filter>
-                <action android:name="android.service.quicksettings.action.QS_TILE" />
-            </intent-filter>
-        </service>
-        <service
-            android:name=".manager.services.QSEnterWindow"
-            android:exported="true"
-            android:icon="@drawable/ic_picture_in_picture_alt_24"
-            android:label="@string/enter_window"
-            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE" >
-            <intent-filter>
-                <action android:name="android.service.quicksettings.action.QS_TILE" />
-            </intent-filter>
-        </service>
-        <service
             android:name=".manager.services.QSResetAllWindow"
             android:exported="true"
             android:icon="@drawable/ic_picture_in_picture_alt_24"

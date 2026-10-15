@@ -1,12 +1,10 @@
 package com.buildsession.betterYAMF.manager.ui.setting
 
-import android.content.SharedPreferences
 import android.os.Bundle
 import androidx.activity.enableEdgeToEdge
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
-import androidx.preference.PreferenceManager
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.slider.Slider
 import com.buildsession.betterYAMF.R
@@ -21,7 +19,6 @@ class SettingActivity : AppCompatActivity() {
     private val binding get() = _binding
 
     lateinit var config: YAMFConfig
-    private val preference: SharedPreferences by lazy { PreferenceManager.getDefaultSharedPreferences(this) }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -49,7 +46,6 @@ class SettingActivity : AppCompatActivity() {
                     .setNegativeButton(R.string.cancel, null)
                     .setPositiveButton(R.string.reset) { _, _ ->
                         config = YAMFConfig()
-                        preference.edit().putBoolean("useAppList", true).apply()
                         applyConfigToViews()
                         YAMFManagerProxy.updateConfig(gson.toJson(config))
                     }
@@ -84,18 +80,9 @@ class SettingActivity : AppCompatActivity() {
 
     private fun applyConfigToViews() {
         binding?.apply {
-            sColoerd.isChecked = config.coloredController
-            sBackHome.isChecked = config.recentBackHome
             etSizeH.hint = getString(R.string.window_size_auto)
             etSizeH.setText(if (config.defaultWindowHeight > 0) config.defaultWindowHeight.toString() else "")
             etSizeW.setText(config.defaultWindowWidth.toString())
-            sHookLauncherHookRecents.isChecked = config.hookLauncher.hookRecents
-            sHookLauncherHookTaskbar.isChecked = config.hookLauncher.hookTaskbar
-            sHookLauncherHookPopup.isChecked = config.hookLauncher.hookPopup
-            sHookLauncherHookTransientTaskbar.isChecked = config.hookLauncher.hookTransientTaskbar
-            sUseAppList.isChecked = preference.getBoolean("useAppList", true)
-            sForceShowIME.isChecked = config.showForceShowIME
-            sForcePreventRelaunch.isChecked = config.forcePreventRelaunch
             sliderRounded.value = config.windowRoundedCorner.toFloat()
             sliderAnimationSpeed.value = config.animationSpeed
             tvRoundedValue.text = "${config.windowRoundedCorner}"
@@ -110,17 +97,8 @@ class SettingActivity : AppCompatActivity() {
     override fun onDestroy() {
         super.onDestroy()
         binding?.apply {
-            config.coloredController = sColoerd.isChecked
-            config.recentBackHome = sBackHome.isChecked
             config.defaultWindowHeight = etSizeH.text.toString().toIntOrNull() ?: 0
             config.defaultWindowWidth = etSizeW.text.toString().toIntOrNull() ?: config.defaultWindowWidth
-            config.hookLauncher.hookRecents = sHookLauncherHookRecents.isChecked
-            config.hookLauncher.hookTaskbar = sHookLauncherHookTaskbar.isChecked
-            config.hookLauncher.hookPopup = sHookLauncherHookPopup.isChecked
-            config.hookLauncher.hookTransientTaskbar = sHookLauncherHookTransientTaskbar.isChecked
-            config.showForceShowIME = sForceShowIME.isChecked
-            config.forcePreventRelaunch = sForcePreventRelaunch.isChecked
-            preference.edit().putBoolean("useAppList", sUseAppList.isChecked).apply()
             YAMFManagerProxy.updateConfig(gson.toJson(config))
         }
     }

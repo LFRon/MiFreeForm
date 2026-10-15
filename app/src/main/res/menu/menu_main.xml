@@ -8,18 +8,6 @@
         android:title="@string/settings"
         app:showAsAction="ifRoom" />
     <item
-        android:id="@+id/new_window"
-        android:title="@string/new_window"
-        app:showAsAction="never" />
-    <item
-        android:id="@+id/open_app_list"
-        android:title="@string/open_app_list"
-        app:showAsAction="never" />
-    <item
-        android:id="@+id/current_to_window"
-        android:title="@string/current_to_window"
-        app:showAsAction="never" />
-    <item
         android:id="@+id/channel"
         android:title="@string/telegram_channel"
         app:showAsAction="never" />

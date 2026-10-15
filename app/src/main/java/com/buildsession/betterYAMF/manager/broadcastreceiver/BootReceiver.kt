@@ -7,7 +7,6 @@ import android.util.Log
 import com.buildsession.betterYAMF.application
 import com.buildsession.betterYAMF.common.gson
 import com.buildsession.betterYAMF.common.model.Config
-import com.buildsession.betterYAMF.manager.applist.AppListWindow
 import com.buildsession.betterYAMF.manager.services.YAMFManagerProxy
 import com.buildsession.betterYAMF.manager.sidebar.Action
 import com.buildsession.betterYAMF.manager.sidebar.SidebarMenuService

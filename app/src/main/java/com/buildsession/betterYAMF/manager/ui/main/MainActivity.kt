@@ -28,7 +28,6 @@ import com.buildsession.betterYAMF.common.gson
 import com.buildsession.betterYAMF.common.model.Config
 import com.buildsession.betterYAMF.common.runMain
 import com.buildsession.betterYAMF.databinding.ActivityMainBinding
-import com.buildsession.betterYAMF.manager.applist.AppListWindow
 import com.buildsession.betterYAMF.manager.services.YAMFManagerProxy
 import com.buildsession.betterYAMF.manager.sidebar.Action
 import com.buildsession.betterYAMF.manager.sidebar.SidebarMenuService
@@ -228,18 +227,10 @@ class MainActivity : AppCompatActivity() {
 
     override fun onOptionsItemSelected(item: MenuItem): Boolean {
         return when(item.itemId) {
-            R.id.new_window -> {
-                YAMFManagerProxy.createWindow()
-                true
-            }
             R.id.channel -> {
                 startActivity(Intent(Intent.ACTION_VIEW).apply {
                     data = "https://t.me/+HjGegWE9jBM0N2Rl".toUri()
                 })
-                true
-            }
-            R.id.open_app_list -> {
-                startService(Intent(this, AppListWindow::class.java))
                 true
             }
             R.id.settings -> {
@@ -262,10 +253,6 @@ class MainActivity : AppCompatActivity() {
                 startActivity(Intent(Intent.ACTION_VIEW).apply {
                     data = "https://duzhaokun123.github.io/donate.html".toUri()
                 })
-                true
-            }
-            R.id.current_to_window -> {
-                YAMFManagerProxy.currentToWindow()
                 true
             }
             else -> false
