@@ -53,7 +53,6 @@ import com.buildsession.betterYAMF.R
 import com.buildsession.betterYAMF.xposed.hook.launcher.LauncherInputAnchors
 import com.buildsession.betterYAMF.xposed.hook.launcher.ManagedTaskFilter
 import com.buildsession.betterYAMF.xposed.services.YAMFManager
-import com.buildsession.betterYAMF.xposed.utils.dpToPx
 import com.buildsession.betterYAMF.xposed.utils.log
 import com.buildsession.betterYAMF.xposed.utils.registerReceiver
 import de.robv.android.xposed.IXposedHookLoadPackage

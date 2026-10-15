@@ -21,15 +21,12 @@ import android.view.WindowManager
 import androidx.appcompat.view.ContextThemeWrapper
 import androidx.core.app.NotificationCompat
 import androidx.core.graphics.toColorInt
-import com.juanarton.batterysense.batterymonitorservice.ServiceState
-import com.juanarton.batterysense.batterymonitorservice.setServiceState
 import com.buildsession.betterYAMF.R
 import com.buildsession.betterYAMF.common.gson
+import com.buildsession.betterYAMF.common.ui.vibratePhone
 import com.buildsession.betterYAMF.databinding.SidebarLayoutBinding
 import com.buildsession.betterYAMF.manager.services.YAMFManagerProxy
-import com.buildsession.betterYAMF.manager.sidebar.SidebarMenuService.Companion.SERVICE_NOTIFICATION_ID
 import com.buildsession.betterYAMF.manager.sidebar.SidebarMenuService.Companion.SERVICE_NOTIF_CHANNEL_ID
-import com.buildsession.betterYAMF.xposed.utils.vibratePhone
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job

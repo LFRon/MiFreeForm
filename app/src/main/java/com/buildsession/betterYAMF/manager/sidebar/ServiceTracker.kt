@@ -1,4 +1,4 @@
-package com.juanarton.batterysense.batterymonitorservice
+package com.buildsession.betterYAMF.manager.sidebar
 
 import android.content.Context
 

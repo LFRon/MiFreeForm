@@ -1,4 +1,4 @@
-package com.mja.reyamf
+package com.buildsession.betterYAMF
 
 import org.junit.Test
 

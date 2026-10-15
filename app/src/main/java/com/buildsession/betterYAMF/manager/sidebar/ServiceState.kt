@@ -1,4 +1,4 @@
-package com.juanarton.batterysense.batterymonitorservice
+package com.buildsession.betterYAMF.manager.sidebar
 
 enum class ServiceState {
     STARTED,

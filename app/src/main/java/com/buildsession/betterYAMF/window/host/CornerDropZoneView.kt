@@ -8,8 +8,8 @@ import android.graphics.Paint
 import android.graphics.RectF
 import android.util.DisplayMetrics
 import android.view.View
+import com.buildsession.betterYAMF.common.ui.dpToPx
 import com.buildsession.betterYAMF.window.core.DropKind
-import com.buildsession.betterYAMF.xposed.utils.dpToPx
 
 internal class CornerDropZoneView(context: Context) : View(context) {
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
