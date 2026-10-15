@@ -25,9 +25,10 @@ import com.buildsession.betterYAMF.common.ui.vibratePhone
 import com.buildsession.betterYAMF.databinding.WindowAppListBinding
 import com.buildsession.betterYAMF.manager.adapter.AppListAdapter
 import com.buildsession.betterYAMF.manager.core.domain.repository.IReyamfRepository
-import com.buildsession.betterYAMF.manager.services.YAMFManagerProxy
+import com.buildsession.betterYAMF.manager.core.gateway.AppCatalogGateway
+import com.buildsession.betterYAMF.manager.core.gateway.WindowGateway
+import com.buildsession.betterYAMF.manager.sidebar.core.AppListQuery
 import com.buildsession.betterYAMF.manager.utils.animateScaleThenResize
-import com.buildsession.betterYAMF.xposed.IAppListCallback
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -37,7 +38,6 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.util.Locale
 import javax.inject.Inject
 
 @AndroidEntryPoint
@@ -50,8 +50,6 @@ class AppListWindow :  LifecycleService() {
     lateinit var iReyamfRepository: IReyamfRepository
 
     private lateinit var binding: WindowAppListBinding
-    private val users = mutableMapOf<Int, String>()
-    var userId = 0
     private var apps: MutableList<AppInfo> = mutableListOf()
     private var showApps: MutableList<AppInfo> = mutableListOf()
     private lateinit var rvAdapter: AppListAdapter
@@ -139,12 +137,9 @@ class AppListWindow :  LifecycleService() {
                 lifecycleScope.launch {
                     binding.pv.isVisible = true
 
-                    YAMFManagerProxy.getAppListAsync(object : IAppListCallback.Stub() {
-                        override fun onAppListReceived(appList: MutableList<AppInfo>) {
-                            apps.addAll(appList)
-                        }
-
-                        override fun onAppListFinished() {
+                    AppCatalogGateway.loadAsync(
+                        onChunk = { apps.addAll(it) },
+                        onFinished = {
                             lifecycleScope.launch(Dispatchers.Main) {
 
                                 val userIds = apps.map { it.userId }.distinct()
@@ -157,13 +152,10 @@ class AppListWindow :  LifecycleService() {
 
                                     binding.btnUser.text = selectedUserName
 
-                                    showApps = apps.filter { it.userId == selectedUserId }
-                                        .sortedBy {
-                                            it.activityInfo
-                                                .loadLabel(this@AppListWindow.packageManager).toString()
-                                                .lowercase(Locale.ROOT)
-                                        }
-                                        .toMutableList()
+                                    showApps = AppListQuery.sortByLabel(
+                                        apps.filter { it.userId == selectedUserId },
+                                        labelOf = { it.activityInfo.loadLabel(this@AppListWindow.packageManager).toString() }
+                                    ).toMutableList()
                                 } else {
                                     showApps.clear()
                                 }
@@ -175,17 +167,11 @@ class AppListWindow :  LifecycleService() {
                                         searchJob?.cancel()
                                         searchJob = scope.launch {
                                             delay(300)
-                                            val query = s.toString().lowercase(Locale.ROOT)
-
-                                            val filteredApps = if (query.isEmpty()) {
-                                                showApps
-                                            } else {
-                                                showApps.filter {
-                                                    it.activityInfo.loadLabel(packageManager).toString()
-                                                        .lowercase(Locale.ROOT)
-                                                        .contains(query)
-                                                }
-                                            }
+                                            val filteredApps = AppListQuery.filterByQuery(
+                                                showApps,
+                                                query = s.toString(),
+                                                labelOf = { it.activityInfo.loadLabel(packageManager).toString() }
+                                            )
 
                                             withContext(Dispatchers.Main) {
                                                 rvAdapter.setData(filteredApps)
@@ -221,7 +207,7 @@ class AppListWindow :  LifecycleService() {
                                     ) {
                                         binding.root.visibility = View.GONE
 
-                                        YAMFManagerProxy.createWindowUserspace(it)
+                                        WindowGateway.createWindow(it)
                                         close()
                                     }
                                 }
@@ -245,20 +231,19 @@ class AppListWindow :  LifecycleService() {
                                 binding.etSearch.isEnabled = true
                             }
                         }
-                    })
+                    )
                 }
             }
         }
     }
 
     private fun onSelectUser(userId: Int) {
-        showApps = apps
-        showApps = showApps.filter { app -> app.userId == userId } as MutableList<AppInfo>
-        showApps.sortedBy {
-            it.activityInfo
-                .loadLabel(this@AppListWindow.packageManager).toString()
-                .lowercase(Locale.ROOT)
-        }.toMutableList()
+        showApps = apps.filter { app -> app.userId == userId }.toMutableList()
+        // 顺带修复：此前排序结果被丢弃，切换用户后列表未按名称排序
+        showApps = AppListQuery.sortByLabel(
+            showApps,
+            labelOf = { it.activityInfo.loadLabel(this@AppListWindow.packageManager).toString() }
+        ).toMutableList()
 
         rvAdapter.setData(showApps)
         rvAdapter.notifyDataSetChanged()

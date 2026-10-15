@@ -4,10 +4,7 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
 import android.provider.Settings
-import android.util.Log
 import android.util.TypedValue
 import android.view.Menu
 import android.view.MenuItem
@@ -24,21 +21,14 @@ import com.google.android.material.slider.Slider
 import com.buildsession.betterYAMF.BuildConfig
 import com.buildsession.betterYAMF.R
 import com.buildsession.betterYAMF.common.getAttr
-import com.buildsession.betterYAMF.common.gson
 import com.buildsession.betterYAMF.common.model.Config
-import com.buildsession.betterYAMF.common.runMain
 import com.buildsession.betterYAMF.databinding.ActivityMainBinding
-import com.buildsession.betterYAMF.manager.services.YAMFManagerProxy
-import com.buildsession.betterYAMF.manager.sidebar.Action
-import com.buildsession.betterYAMF.manager.sidebar.SidebarMenuService
-import com.buildsession.betterYAMF.manager.sidebar.SidebarService
+import com.buildsession.betterYAMF.manager.core.gateway.ModuleInfoGateway
+import com.buildsession.betterYAMF.manager.core.gateway.WindowGateway
+import com.buildsession.betterYAMF.manager.core.settings.SettingsRepository
+import com.buildsession.betterYAMF.manager.sidebar.SidebarLauncher
 import com.buildsession.betterYAMF.manager.ui.setting.SettingActivity
 import com.buildsession.betterYAMF.manager.utils.TipUtil
-import com.buildsession.betterYAMF.xposed.IOpenCountListener
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
 
 class MainActivity : AppCompatActivity() {
 
@@ -51,12 +41,8 @@ class MainActivity : AppCompatActivity() {
         const val TAG = "reYAMF_MainActivity"
     }
 
-    private val openCountListener = object : IOpenCountListener.Stub() {
-        override fun onUpdate(count: Int) {
-            runMain {
-                binding?.tvOpenCount?.text = count.toString()
-            }
-        }
+    private val openCountListener: (Int) -> Unit = { count ->
+        binding?.tvOpenCount?.text = count.toString()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -76,7 +62,7 @@ class MainActivity : AppCompatActivity() {
         setSupportActionBar(binding?.toolbar)
         supportActionBar?.setDisplayShowTitleEnabled(false)
 
-        YAMFManagerProxy.registerOpenCountListener(openCountListener)
+        WindowGateway.registerOpenCountListener(openCountListener)
         initUi()
 
         if (!Settings.canDrawOverlays(this)) {
@@ -89,8 +75,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun initUi() {
-        config = gson.fromJson(YAMFManagerProxy.configJson, Config::class.java)
-        val buildTime = YAMFManagerProxy.buildTime
+        config = SettingsRepository.load()
+        val buildTime = ModuleInfoGateway.buildTime
         when(buildTime) {
             0L -> {
                 binding?.apply {
@@ -113,8 +99,8 @@ class MainActivity : AppCompatActivity() {
                     ivIcon.setImageResource(R.drawable.ic_round_check_circle_24)
                     tvActive.setText(R.string.activated)
                     tvVersion.text = buildString {
-                        append(YAMFManagerProxy.versionName)
-                        append(" (${YAMFManagerProxy.versionCode})")
+                        append(ModuleInfoGateway.versionName)
+                        append(" (${ModuleInfoGateway.versionCode})")
                     }
                 }
             }
@@ -123,7 +109,7 @@ class MainActivity : AppCompatActivity() {
                     ivIcon.setImageResource(R.drawable.ic_warning_amber_24)
                     tvActive.setText(R.string.need_reboot)
                     tvVersion.text = buildString {
-                        append("system: ${YAMFManagerProxy.versionName} (${YAMFManagerProxy.versionCode})\n")
+                        append("system: ${ModuleInfoGateway.versionName} (${ModuleInfoGateway.versionCode})\n")
                         append("module: ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})")
                     }
                     mcvStatus.setCardBackgroundColor(MaterialColors.harmonizeWithPrimary(this@MainActivity, getColor(R.color.color_warning)))
@@ -157,24 +143,19 @@ class MainActivity : AppCompatActivity() {
 
         binding?.apply {
             btLaunchSideBar.setOnClickListener {
-                launchSidebar(Action.START.name)
+                SidebarLauncher.start(this@MainActivity)
             }
 
             msSideBar.isChecked = config.launchSideBarAtBoot
             msSideBar.setOnCheckedChangeListener { _, isChecked ->
-                config.launchSideBarAtBoot = isChecked
-                YAMFManagerProxy.updateConfig(gson.toJson(config))
+                SettingsRepository.setLaunchSideBarAtBoot(isChecked)
             }
 
             msSideBarPosition.isChecked = config.sidebarPosition
             msSideBarPosition.setOnCheckedChangeListener { _, isChecked ->
-                config.sidebarPosition = isChecked
-                YAMFManagerProxy.updateConfig(gson.toJson(config))
-                CoroutineScope(Dispatchers.IO).launch {
-                    launchSidebar(Action.STOP.name)
-                    delay(1000)
-                    launchSidebar(Action.START.name)
-                }
+                SettingsRepository.setSidebarPosition(isChecked)
+                // 重启侧边栏以应用左右（镜像）变更：先停后启（宽限 1s 待服务完全退出）
+                SidebarLauncher.restart(this@MainActivity, 1000L)
             }
 
             if (config.enableSidebar) {
@@ -192,8 +173,7 @@ class MainActivity : AppCompatActivity() {
                     innerClSidebar.visibility = View.GONE
                 }
 
-                config.enableSidebar = isChecked
-                YAMFManagerProxy.updateConfig(gson.toJson(config))
+                SettingsRepository.setEnableSidebar(isChecked)
             }
 
             sliderTransparency.addOnSliderTouchListener(object : Slider.OnSliderTouchListener {
@@ -201,23 +181,12 @@ class MainActivity : AppCompatActivity() {
 
                 override fun onStopTrackingTouch(slider: Slider) {
                     tvTransparencyValue.text = "${slider.value.toInt()}"
-                    config.sidebarTransparency = slider.value.toInt()
-                    YAMFManagerProxy.updateConfig(gson.toJson(config))
-                    launchSidebar(Action.STOP.name)
-
-                    Handler(Looper.getMainLooper()).postDelayed({
-                        try {
-                            launchSidebar(Action.START.name)
-                        } catch (e: Exception) {
-                        }
-                    }, 500)
+                    SettingsRepository.setSidebarTransparency(slider.value.toInt())
+                    // 重启侧边栏以应用透明度（先停后启，宽限 500ms）
+                    SidebarLauncher.restart(this@MainActivity, 500L)
                 }
             })
         }
-    }
-
-    private fun launchSidebar(action: String) {
-        startService(Intent(this, SidebarService::class.java))
     }
 
     override fun onCreateOptionsMenu(menu: Menu?): Boolean {
@@ -279,6 +248,6 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        YAMFManagerProxy.unregisterOpenCountListener(openCountListener)
+        WindowGateway.unregisterOpenCountListener(openCountListener)
     }
 }

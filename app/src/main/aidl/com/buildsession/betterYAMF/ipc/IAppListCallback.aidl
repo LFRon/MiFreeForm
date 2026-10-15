@@ -1,4 +1,4 @@
-package com.buildsession.betterYAMF.xposed;
+package com.buildsession.betterYAMF.ipc;
 
 import com.buildsession.betterYAMF.common.model.AppInfo;
 

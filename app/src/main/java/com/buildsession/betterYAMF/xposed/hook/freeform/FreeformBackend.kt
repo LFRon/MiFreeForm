@@ -6,6 +6,7 @@ import android.graphics.Region
 import android.os.Build
 import android.view.SurfaceControl
 import com.buildsession.betterYAMF.BuildConfig
+import com.buildsession.betterYAMF.common.ipc.Protocol
 import com.buildsession.betterYAMF.xposed.services.YAMFManager
 import com.buildsession.betterYAMF.xposed.hook.organizer.SmoothWindowBackend
 import com.buildsession.betterYAMF.xposed.hook.system.SystemSignals
@@ -691,7 +692,7 @@ object FreeformBackend {
             val attrs = XposedHelpers.getObjectField(windowState, "mAttrs")
             XposedHelpers.callMethod(attrs, "getTitle") as? CharSequence
         }.getOrNull()?.toString() ?: return
-        if (title != YAMFManager.CHROME_WINDOW_TITLE) return
+        if (title != Protocol.CHROME_WINDOW_TITLE) return
         
         val frame = runCatching {
             XposedHelpers.callMethod(windowState, "getFrame") as Rect

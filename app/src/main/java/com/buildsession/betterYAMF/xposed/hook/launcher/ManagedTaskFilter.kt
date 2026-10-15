@@ -4,7 +4,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
-import com.buildsession.betterYAMF.xposed.services.YAMFManager
+import com.buildsession.betterYAMF.common.ipc.Protocol
 import com.buildsession.betterYAMF.xposed.utils.log
 import com.github.kyuubiran.ezxhelper.utils.findMethod
 import com.github.kyuubiran.ezxhelper.utils.hookAfter
@@ -40,7 +40,7 @@ object ManagedTaskFilter {
 
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
-            val ids = intent.getIntArrayExtra(YAMFManager.EXTRA_MANAGED_TASK_IDS) ?: return
+            val ids = intent.getIntArrayExtra(Protocol.EXTRA_MANAGED_TASK_IDS) ?: return
             managedTaskIds.clear()
             ids.forEach { managedTaskIds.add(it) }
             log(TAG, "managed tasks updated: [${ids.joinToString()}]")
@@ -53,12 +53,12 @@ object ManagedTaskFilter {
             if (!receiverRegistered) {
                 context.registerReceiver(
                     receiver,
-                    IntentFilter(YAMFManager.ACTION_MANAGED_TASKS),
+                    IntentFilter(Protocol.ACTION_MANAGED_TASKS),
                     Context.RECEIVER_EXPORTED
                 )
                 receiverRegistered = true
             }
-            context.sendBroadcast(Intent(YAMFManager.ACTION_QUERY_MANAGED_TASKS))
+            context.sendBroadcast(Intent(Protocol.ACTION_QUERY_MANAGED_TASKS))
             log(TAG, "managed tasks receiver registered")
         }.onFailure { log(TAG, "managed tasks receiver setup failed", it) }
     }

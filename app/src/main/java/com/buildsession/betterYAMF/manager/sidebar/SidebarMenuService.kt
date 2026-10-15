@@ -14,9 +14,7 @@ import android.view.Gravity
 import android.view.LayoutInflater
 import android.view.Surface
 import android.view.View
-import android.view.ViewGroup
 import android.view.WindowManager
-import android.widget.LinearLayout
 import androidx.appcompat.view.ContextThemeWrapper
 import androidx.constraintlayout.widget.ConstraintLayout
 import androidx.core.graphics.toColorInt
@@ -28,7 +26,6 @@ import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.LinearLayoutManager
 import com.github.kyuubiran.ezxhelper.utils.runOnMainThread
 import com.buildsession.betterYAMF.R
-import com.buildsession.betterYAMF.common.gson
 import com.buildsession.betterYAMF.common.model.AppInfo
 import com.buildsession.betterYAMF.common.runMain
 import com.buildsession.betterYAMF.common.ui.animateAlpha
@@ -40,9 +37,11 @@ import com.buildsession.betterYAMF.manager.adapter.SideBarAdapter
 import com.buildsession.betterYAMF.manager.adapter.VerticalSpaceItemDecoration
 import com.buildsession.betterYAMF.manager.applist.AppListWindow
 import com.buildsession.betterYAMF.manager.core.domain.repository.IReyamfRepository
-import com.buildsession.betterYAMF.manager.services.YAMFManagerProxy
+import com.buildsession.betterYAMF.manager.core.gateway.AppCatalogGateway
+import com.buildsession.betterYAMF.manager.core.gateway.WindowGateway
+import com.buildsession.betterYAMF.manager.core.settings.SettingsRepository
 import com.buildsession.betterYAMF.manager.utils.animateResize
-import com.buildsession.betterYAMF.xposed.IAppListCallback
+import com.buildsession.betterYAMF.manager.sidebar.core.SidebarAppsMerger
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -97,7 +96,7 @@ class SidebarMenuService() : LifecycleService() {
         val inflater = LayoutInflater.from(themedContext)
         binding = SidebarMenuLayoutBinding.inflate(inflater)
 
-        config = gson.fromJson(YAMFManagerProxy.configJson, YAMFConfig::class.java)
+        config = SettingsRepository.load()
 
         params = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
@@ -135,18 +134,16 @@ class SidebarMenuService() : LifecycleService() {
 
         showApp.observe(this) { sidebarApp ->
             val receivedApps = mutableListOf<AppInfo>()
-            YAMFManagerProxy.getAppListAsync(object : IAppListCallback.Stub() {
-                override fun onAppListReceived(appList: MutableList<AppInfo>) {
-                    receivedApps.addAll(appList)
-                }
-
-                override fun onAppListFinished() {
+            AppCatalogGateway.loadAsync(
+                onChunk = { receivedApps.addAll(it) },
+                onFinished = {
                     lifecycleScope.launch(Dispatchers.Main) {
-                        val commonApps = sidebarApp.filter { app1 ->
-                            receivedApps.any { app2 ->
-                                app1.activityInfo.componentName == app2.activityInfo.componentName
-                            }
-                        }.toMutableList()
+                        val commonApps = SidebarAppsMerger.intersectBy(
+                            favorites = sidebarApp,
+                            catalog = receivedApps,
+                            keyOfFavorite = { it.activityInfo.componentName },
+                            keyOfCatalog = { it.activityInfo.componentName }
+                        ).toMutableList()
 
                         rvAdapter.setData(commonApps)
                         rvAdapter.notifyDataSetChanged()
@@ -154,17 +151,13 @@ class SidebarMenuService() : LifecycleService() {
                         binding.cpiLoading.isVisible = false
                     }
                 }
-            })
+            )
         }
 
         handleSidebar()
     }
 
     private fun handleSidebar() {
-
-        binding.ivExtraTool.setOnClickListener {
-            hideMenu()
-        }
 
         binding.cvSideBarMenu.post {
             if (config.sidebarPosition) {
@@ -191,7 +184,7 @@ class SidebarMenuService() : LifecycleService() {
         }
 
         binding.ibCurrentToWindow.setOnClickListener {
-            YAMFManagerProxy.currentToWindow()
+            WindowGateway.currentToWindow()
             hideMenu()
         }
 
@@ -244,7 +237,7 @@ class SidebarMenuService() : LifecycleService() {
             hideMenu()
             lifecycleScope.launch {
                 delay(200)
-                YAMFManagerProxy.createWindowUserspace(it)
+                WindowGateway.createWindow(it)
             }
         }
 
@@ -341,7 +334,7 @@ class SidebarMenuService() : LifecycleService() {
         try {
             windowManager.removeView(binding.root)
             stopSelf()
-            startService(Intent(this, SidebarService::class.java))
+            SidebarLauncher.start(this)
         } catch (e: Exception) {
             if (BuildConfig.DEBUG) Log.d("reYAMF", "Sidebar killed")
         }

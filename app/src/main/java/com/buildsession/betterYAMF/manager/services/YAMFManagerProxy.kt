@@ -5,10 +5,10 @@ import android.os.IBinder.DeathRecipient
 import android.util.Log
 import com.buildsession.betterYAMF.BuildConfig
 import com.buildsession.betterYAMF.common.model.AppInfo
-import com.buildsession.betterYAMF.xposed.IAppIconCallback
-import com.buildsession.betterYAMF.xposed.IAppListCallback
-import com.buildsession.betterYAMF.xposed.IOpenCountListener
-import com.buildsession.betterYAMF.xposed.IYAMFManager
+import com.buildsession.betterYAMF.ipc.IAppIconCallback
+import com.buildsession.betterYAMF.ipc.IAppListCallback
+import com.buildsession.betterYAMF.ipc.IOpenCountListener
+import com.buildsession.betterYAMF.ipc.IYAMFManager
 import java.lang.reflect.InvocationHandler
 import java.lang.reflect.Method
 import java.lang.reflect.Proxy

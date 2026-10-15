@@ -2,15 +2,14 @@ package com.buildsession.betterYAMF.manager.sidebar
 
 import android.app.Notification
 import android.app.NotificationChannel
-import com.buildsession.betterYAMF.BuildConfig
 import android.app.NotificationManager
 import android.app.Service
 import android.content.Intent
-import android.content.pm.ServiceInfo
 import android.graphics.PixelFormat
 import android.hardware.display.DisplayManager
-import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.util.Log
 import android.view.Display
 import android.view.Gravity
@@ -21,20 +20,28 @@ import android.view.WindowManager
 import androidx.appcompat.view.ContextThemeWrapper
 import androidx.core.app.NotificationCompat
 import androidx.core.graphics.toColorInt
+import com.buildsession.betterYAMF.BuildConfig
 import com.buildsession.betterYAMF.R
-import com.buildsession.betterYAMF.common.gson
 import com.buildsession.betterYAMF.common.ui.vibratePhone
 import com.buildsession.betterYAMF.databinding.SidebarLayoutBinding
-import com.buildsession.betterYAMF.manager.services.YAMFManagerProxy
+import com.buildsession.betterYAMF.manager.core.settings.SettingsRepository
 import com.buildsession.betterYAMF.manager.sidebar.SidebarMenuService.Companion.SERVICE_NOTIF_CHANNEL_ID
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
+import com.buildsession.betterYAMF.manager.sidebar.core.SidebarCommand
+import com.buildsession.betterYAMF.manager.sidebar.core.SidebarController
+import com.buildsession.betterYAMF.manager.sidebar.core.SidebarInputEvent
 import com.buildsession.betterYAMF.common.model.Config as YAMFConfig
 
+/**
+ * 侧边栏宿主（UI 层）：只做"输入采集 → 逻辑核心 → 命令执行"。
+ * 交互语义全部固化在 [SidebarController]（纯逻辑，JVM 单测覆盖）。
+ */
 class SidebarService : Service() {
+
+    companion object {
+        const val ACTION_START = "com.buildsession.betterYAMF.action.SIDEBAR_START"
+        const val ACTION_STOP = "com.buildsession.betterYAMF.action.SIDEBAR_STOP"
+        private const val HOLD_TO_DRAG_DELAY_MS = 200L
+    }
 
     lateinit var config: YAMFConfig
     private lateinit var binding: SidebarLayoutBinding
@@ -42,31 +49,27 @@ class SidebarService : Service() {
     private lateinit var windowManager: WindowManager
     private var isServiceRunning = false
 
-    private var initialX: Int = 0
-    private var initialY: Int = 0
-    private var initialTouchX: Float = 0.toFloat()
-    private var initialTouchY: Float = 0.toFloat()
-    private var job: Job? = null
-    private var movable = false
-    private var swipeX = 0
-
-    var userId = 0
     private var orientation = 0
-    private var isShown = false
 
     private var colorString = "#FFFFFF"
+
+    private val controller = SidebarController()
+    private val holdHandler = Handler(Looper.getMainLooper())
+    private val holdRunnable = Runnable { dispatch(SidebarInputEvent.HoldElapsed) }
 
     override fun onBind(intent: Intent): IBinder? {
         return null
     }
 
-    override fun onCreate() {
-        super.onCreate()
-
-        if (!isServiceRunning) {
-            isServiceRunning = true
-            initSidebar()
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        when (intent?.action) {
+            ACTION_STOP -> stopService()
+            else -> if (!isServiceRunning) {
+                isServiceRunning = true
+                initSidebar()
+            }
         }
+        return super.onStartCommand(intent, flags, startId)
     }
 
     private fun initSidebar() {
@@ -74,7 +77,7 @@ class SidebarService : Service() {
         val inflater = LayoutInflater.from(themedContext)
         binding = SidebarLayoutBinding.inflate(inflater)
 
-        config = gson.fromJson(YAMFManagerProxy.configJson, YAMFConfig::class.java)
+        config = SettingsRepository.load()
 
         params = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -139,17 +142,20 @@ class SidebarService : Service() {
         binding.clickMask.setOnTouchListener { v, event ->
             when (event.action) {
                 MotionEvent.ACTION_DOWN -> {
-                    storeTouchs(event)
+                    dispatch(SidebarInputEvent.Press(event.rawX, event.rawY, params.y))
+                    startHoldTimer()
                     true
                 }
 
                 MotionEvent.ACTION_MOVE -> {
-                    moveSidebar(event)
+                    dispatch(SidebarInputEvent.Move(event.rawX, event.rawY))
                     true
                 }
 
                 MotionEvent.ACTION_UP -> {
-                    openApp(event)
+                    cancelHoldTimer()
+                    dispatch(SidebarInputEvent.Up(event.rawX, event.rawY))
+                    SettingsRepository.flushSidebarY()
                     v.performClick()
                     true
                 }
@@ -193,68 +199,40 @@ class SidebarService : Service() {
         }
     }
 
-    private fun openApp(event: MotionEvent): Boolean {
-        job?.cancel()
-        movable = false
-        if (initialTouchY == event.rawY) {
-            vibratePhone(this)
-            startService(Intent(this, SidebarMenuService::class.java))
-            stopService()
-            isShown = false
-        }
+    // —— 输入采集 → 逻辑核心 → 命令执行 ——
 
-        if (swipeX > 200) {
-            vibratePhone(this)
-            startService(Intent(this, SidebarMenuService::class.java))
-            stopService()
-            isShown = false
-            swipeX = 0
-        }
-        return true
+    private fun dispatch(event: SidebarInputEvent) {
+        controller.onInput(event).forEach(::execute)
     }
 
-    private fun moveSidebar(event: MotionEvent): Boolean {
-        swipeX = event.rawX.toInt()
-        params.y = initialY + (event.rawY - initialTouchY).toInt()
-
-        if (movable) {
-            windowManager.updateViewLayout(binding.root, params)
-
-            val displayManager = getSystemService(DISPLAY_SERVICE) as DisplayManager
-            val display = displayManager.getDisplay(Display.DEFAULT_DISPLAY)
-
-            display?.let {
-                when (it.rotation) {
-                    Surface.ROTATION_0, Surface.ROTATION_180 -> {
-                        config.portraitY = params.y
-                    }
-                    Surface.ROTATION_90, Surface.ROTATION_270 -> {
-                        config.landscapeY = params.y
-                    }
+    private fun execute(command: SidebarCommand) {
+        when (command) {
+            is SidebarCommand.MoveToY -> {
+                params.y = command.y
+                windowManager.updateViewLayout(binding.root, params)
+                if (command.persist) {
+                    SettingsRepository.scheduleSidebarY(command.y, isLandscape())
                 }
             }
-
-            YAMFManagerProxy.updateConfig(gson.toJson(config))
+            SidebarCommand.Haptic -> vibratePhone(this)
+            SidebarCommand.OpenMenu -> SidebarLauncher.startMenu(this)
+            SidebarCommand.StopSidebar -> stopService()
         }
-        return true
     }
 
-
-    private fun storeTouchs(event: MotionEvent): Boolean {
-        startCounter()
-        initialX = params.x
-        initialY = params.y
-        initialTouchX = (event.rawX)
-        initialTouchY = (event.rawY)
-        return true
+    private fun startHoldTimer() {
+        holdHandler.removeCallbacks(holdRunnable)
+        holdHandler.postDelayed(holdRunnable, HOLD_TO_DRAG_DELAY_MS)
     }
 
-    private fun startCounter() {
-        job = CoroutineScope(Dispatchers.IO).launch {
-            delay(200)
-            movable = true
-            vibratePhone(this@SidebarService)
-        }
+    private fun cancelHoldTimer() {
+        holdHandler.removeCallbacks(holdRunnable)
+    }
+
+    private fun isLandscape(): Boolean {
+        val displayManager = getSystemService(DISPLAY_SERVICE) as DisplayManager
+        val rotation = displayManager.getDisplay(Display.DEFAULT_DISPLAY)?.rotation ?: Surface.ROTATION_0
+        return rotation == Surface.ROTATION_90 || rotation == Surface.ROTATION_270
     }
 
     private fun createNotification(): Notification {
@@ -274,13 +252,15 @@ class SidebarService : Service() {
     }
 
     private fun stopService() {
+        SettingsRepository.flushSidebarY()
+        cancelHoldTimer()
         try {
             windowManager.removeView(binding.root)
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
         } catch (e: Exception) {
             if (BuildConfig.DEBUG) Log.d("reYAMF", "Sidebar killed")
         }
+        runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
+        stopSelf()
         setServiceState(this, ServiceState.STOPPED)
     }
 }
