@@ -8,7 +8,6 @@ class WindowShellController(
     val windowId: Int = registration.windowId
 
     private var mode = ShellMode.NORMAL
-    private var superMenuVisible = false
     private var screenWidth = 0
     private var screenHeight = 0
 
@@ -26,7 +25,6 @@ class WindowShellController(
     fun snapshot(): ShellSnapshot = ShellSnapshot(
         windowId = windowId,
         mode = mode,
-        superMenuVisible = superMenuVisible,
         dragging = pressedRegion == RegionId.BODY_MASK || pressedRegion == RegionId.HANDLE,
         resizing = pressedRegion == RegionId.RESIZE_HANDLE
     )
@@ -71,7 +69,7 @@ class WindowShellController(
         val out = mutableListOf<WindowCommand>()
         out += WindowCommand.MoveBy(windowId, event.screenX - pressX, event.screenY - pressY)
         out += WindowCommand.DropZoneShow(windowId)
-        if (mode != ShellMode.COLLAPSED && screenWidth > 0 && screenHeight > 0) {
+        if (screenWidth > 0 && screenHeight > 0) {
             val highlight = DropTargetCalculator.compute(
                 event.screenX,
                 event.screenY,
@@ -167,15 +165,11 @@ class WindowShellController(
     }
 
     private fun onTapConfirmed(): List<WindowCommand> = when (mode) {
-        ShellMode.COLLAPSED -> {
-            mode = ShellMode.NORMAL
-            listOf(WindowCommand.ExitCollapsed(windowId))
-        }
         ShellMode.MINI -> {
             mode = ShellMode.NORMAL
             listOf(WindowCommand.ExitMini(windowId))
         }
-        ShellMode.NORMAL -> emptyList()
+        else -> emptyList()
     }
 
     private fun onTap(event: WindowInputEvent.Tap): List<WindowCommand> {
@@ -187,47 +181,6 @@ class WindowShellController(
                 }
                 lastBarTapMs = event.timeMs
                 out
-            }
-            RegionId.BUTTON_CLOSE -> listOf(WindowCommand.RequestClose(windowId, CloseOrigin.BUTTON_X))
-            RegionId.BUTTON_FULLSCREEN -> listOf(
-                WindowCommand.HideSuperMenu(windowId),
-                WindowCommand.RequestFullscreen(windowId, FullscreenOrigin.BUTTON)
-            )
-            RegionId.BUTTON_MINIMIZE -> {
-                superMenuVisible = false
-                val out = mutableListOf<WindowCommand>(WindowCommand.HideSuperMenu(windowId))
-                when (mode) {
-                    ShellMode.NORMAL -> {
-                        mode = ShellMode.MINI
-                        out += WindowCommand.EnterMini(windowId)
-                    }
-                    ShellMode.MINI -> {
-                        mode = ShellMode.NORMAL
-                        out += WindowCommand.ExitMini(windowId)
-                    }
-                    ShellMode.COLLAPSED -> {}
-                }
-                out
-            }
-            RegionId.BUTTON_COLLAPSE -> {
-                superMenuVisible = false
-                val out = mutableListOf<WindowCommand>(WindowCommand.HideSuperMenu(windowId))
-                if (mode == ShellMode.COLLAPSED) {
-                    mode = ShellMode.NORMAL
-                    out += WindowCommand.ExitCollapsed(windowId)
-                } else {
-                    mode = ShellMode.COLLAPSED
-                    out += WindowCommand.EnterCollapsed(windowId)
-                }
-                out
-            }
-            RegionId.SUPER_CLOSE -> {
-                superMenuVisible = false
-                listOf(WindowCommand.HideSuperMenu(windowId))
-            }
-            RegionId.HANDLE -> {
-                superMenuVisible = true
-                listOf(WindowCommand.ShowSuperMenu(windowId))
             }
             else -> emptyList()
         }

@@ -9,14 +9,11 @@ import android.content.Context
 import android.content.Context.DISPLAY_SERVICE
 import android.content.Intent
 import android.content.IntentFilter
-import android.content.pm.IPackageManagerHidden
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
 import android.content.res.Configuration
 import android.content.res.Resources
-import android.graphics.Bitmap
 import android.graphics.PixelFormat
-import android.graphics.drawable.BitmapDrawable
 import android.hardware.display.DisplayManager
 import android.os.Build
 import android.os.SystemClock
@@ -35,7 +32,6 @@ import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.view.animation.DecelerateInterpolator
-import android.widget.ImageView
 import android.widget.ImageButton
 import androidx.core.graphics.ColorUtils
 import androidx.core.view.isVisible
@@ -251,10 +247,6 @@ class AppWindow(
             false
         }
 
-        binding.ibSuper.setOnClickListener {
-            dispatchInput(WindowInputEvent.Tap(windowId, System.currentTimeMillis(), RegionId.HANDLE))
-        }
-
         binding.cvBarClickMask.setOnTouchListener(object : View.OnTouchListener {
             override fun onTouch(v: View, event: MotionEvent): Boolean {
                 translateBarGesture(RegionId.BAR_BOTTOM, event)
@@ -283,26 +275,6 @@ class AppWindow(
 
         rightResize(binding.ibRightResize)
 
-        binding.ibClose.setOnClickListener {
-            dispatchInput(WindowInputEvent.Tap(windowId, System.currentTimeMillis(), RegionId.BUTTON_CLOSE))
-        }
-
-        binding.ibFullscreen.setOnClickListener {
-            dispatchInput(WindowInputEvent.Tap(windowId, System.currentTimeMillis(), RegionId.BUTTON_FULLSCREEN))
-        }
-
-        binding.ibMinimize.setOnClickListener {
-            dispatchInput(WindowInputEvent.Tap(windowId, System.currentTimeMillis(), RegionId.BUTTON_MINIMIZE))
-        }
-
-        binding.ibCollapse.setOnClickListener {
-            dispatchInput(WindowInputEvent.Tap(windowId, System.currentTimeMillis(), RegionId.BUTTON_COLLAPSE))
-        }
-
-        binding.ibSuperClose.setOnClickListener {
-            dispatchInput(WindowInputEvent.Tap(windowId, System.currentTimeMillis(), RegionId.SUPER_CLOSE))
-        }
-
         shell = shellRegistry.register(
             WindowRegistration(windowId, Resources.getSystem().displayMetrics.density)
         )
@@ -322,7 +294,6 @@ class AppWindow(
             binding.cvBackground.visibility = View.VISIBLE
 
             binding.cvBackground.radius = config.windowRoundedCorner.dpToPx()
-            binding.cvappIcon.radius = config.windowRoundedCorner.dpToPx()
 
 
             binding.cvParent.radius = (config.windowRoundedCorner+2).dpToPx()
@@ -421,10 +392,6 @@ class AppWindow(
             is WindowCommand.ResizePreviewCommit -> execResizePreviewCommit()
             is WindowCommand.EnterMini -> execEnterMini(command.corner)
             is WindowCommand.ExitMini -> execExitMini()
-            is WindowCommand.EnterCollapsed -> execEnterCollapsed()
-            is WindowCommand.ExitCollapsed -> execExitCollapsed()
-            is WindowCommand.ShowSuperMenu -> execShowSuperMenu()
-            is WindowCommand.HideSuperMenu -> execHideSuperMenu()
             is WindowCommand.RequestClose -> execRequestClose(command.origin)
             is WindowCommand.RequestFullscreen -> execRequestFullscreen(command.origin)
             is WindowCommand.RaiseWindow -> moveToTop()
@@ -587,23 +554,14 @@ class AppWindow(
         binding.tvFullScreenPrompt.visibility = View.GONE
     }
 
-    private fun execShowSuperMenu() {
-        animateAlpha(binding.clSuperLayout, 0f, 1f)
-    }
-
-    private fun execHideSuperMenu() {
-        animateAlpha(binding.clSuperLayout, 1f, 0f)
-    }
-
     private fun execRequestClose(origin: CloseOrigin) {
         when (origin) {
             CloseOrigin.DRAG_UP_BAR -> {
                 animateWindowShrinkAndClose()
             }
-            CloseOrigin.BUTTON_X, CloseOrigin.DOUBLE_TAP_BAR -> {
+            CloseOrigin.DOUBLE_TAP_BAR -> {
                 isResize = false
 
-                binding.cvappIcon.visibility = View.INVISIBLE
                 if (orientation == 0) {
                     animateAlpha(binding.rlBarControllerBottom, 1f, 0f) {
                         binding.rlBarControllerBottom.visibility = View.GONE
@@ -644,17 +602,6 @@ class AppWindow(
     private fun execRequestFullscreen(origin: FullscreenOrigin) {
         if (currentTaskId == -1) return
         when (origin) {
-            FullscreenOrigin.BUTTON -> {
-                runCatching {
-                    YAMFManager.switchTaskToFullscreen(currentTaskId)
-                    YAMFManager.windowBackend.bringTaskToFront(currentTaskId)
-                }.onFailure { t ->
-                    if (t is Error) throw t
-                    TipUtil.showToast("${t.message}")
-                }.onSuccess {
-                    execRequestClose(CloseOrigin.BUTTON_X)
-                }
-            }
             FullscreenOrigin.DRAG_DOWN_BAR -> {
                 runCatching {
                     YAMFManager.switchTaskToFullscreen(currentTaskId)
@@ -795,39 +742,23 @@ class AppWindow(
             }
 
             var backgroundColor = 0
-            var statusBarColor = 0
             var navigationBarColor = 0
             var taskDescription: ActivityManager.TaskDescription?
 
             if (Build.VERSION.SDK_INT < 35) {
-                val topActivity = taskInfo.topActivity ?: return@add
                 taskDescription = Instances.activityTaskManager.getTaskDescription(taskInfo.taskId) ?: return@add
-                val activityInfo = (Instances.iPackageManager as IPackageManagerHidden).getActivityInfoCompat(topActivity, 0, taskInfo.getObjectAs("userId"))
 
                 backgroundColor = taskDescription.backgroundColor
-                statusBarColor = taskDescription.backgroundColor
                 navigationBarColor = taskDescription.backgroundColor
-                
-                val iconDrawable = runCatching { taskDescription.icon }.getOrNull()?.let { BitmapDrawable(context.resources, it) } 
-                    ?: activityInfo.loadIcon(Instances.packageManager)
-                
-                binding.appIcon.setImageDrawable(iconDrawable)
-                binding.appIcon.scaleType = ImageView.ScaleType.CENTER_CROP
             } else {
                 val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
                 val runningTasks = activityManager.getRunningTasks(5)
 
                 for (task in runningTasks) {
                     if (task.taskId == taskInfo.taskId) {
-                        val packageName = task.baseActivity?.packageName
                         try {
-                            val packageManager = context.packageManager
                             backgroundColor = task.taskDescription!!.backgroundColor
-                            statusBarColor = task.taskDescription!!.backgroundColor
                             navigationBarColor = task.taskDescription!!.backgroundColor
-                            val iconDrawable = packageManager.getApplicationIcon(packageName!!)
-                            binding.appIcon.setImageDrawable(iconDrawable)
-                            binding.appIcon.scaleType = ImageView.ScaleType.CENTER_CROP
                         } catch (e: PackageManager.NameNotFoundException) {
                             e.printStackTrace()
                         }
@@ -836,13 +767,6 @@ class AppWindow(
             }
 
             if (config.coloredController) {
-                val onStateBar = if (MaterialColors.isColorLight(ColorUtils.compositeColors(statusBarColor, backgroundColor)) xor ((context.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES)) {
-                    context.theme.getAttr(com.google.android.material.R.attr.colorOnPrimaryContainer).data
-                } else {
-                    context.theme.getAttr(com.google.android.material.R.attr.colorOnPrimary).data
-                }
-
-                binding.ibClose.imageTintList = ColorStateList.valueOf(onStateBar)
                 binding.background.setBackgroundColor(navigationBarColor)
 
                 val onNavigationBar = if (MaterialColors.isColorLight(ColorUtils.compositeColors(navigationBarColor, backgroundColor)) xor ((context.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES)) {
@@ -851,8 +775,6 @@ class AppWindow(
                     context.theme.getAttr(com.google.android.material.R.attr.colorOnPrimary).data
                 }
 
-                binding.ibMinimize.imageTintList = ColorStateList.valueOf(onNavigationBar)
-                binding.ibFullscreen.imageTintList = ColorStateList.valueOf(onNavigationBar)
                 binding.ibRightResize.imageTintList = ColorStateList.valueOf(onNavigationBar)
             }
         }
@@ -1351,79 +1273,6 @@ class AppWindow(
         layoutParams.width = ViewGroup.LayoutParams.WRAP_CONTENT
         layoutParams.height = ViewGroup.LayoutParams.WRAP_CONTENT
         binding.cvParent.layoutParams = layoutParams
-    }
-
-    private fun execEnterCollapsed() {
-        isResize = false
-        contentTouchThrough = false
-        binding.rootClickMask.visibility = View.VISIBLE
-        binding.rlBarControllerBottom.visibility = View.GONE
-        binding.rlBarControllerSide.visibility = View.GONE
-        collapseWindow()
-    }
-
-    private fun execExitCollapsed() {
-        isResize = false
-        contentTouchThrough = true
-        binding.rootClickMask.visibility = View.GONE
-        expandWindow()
-    }
-
-    private fun expandWindow() {
-        binding.background.visibility = View.VISIBLE
-        binding.cvappIcon.visibility = View.GONE
-
-        val from = currentContentRect()
-        if (from == null) {
-            isResize = true
-            keepInScreen()
-            return
-        }
-        val cx = (from.left + from.right) / 2
-        val cy = (from.top + from.bottom) / 2
-        val to = clampContentRect(cx - originalWidth / 2, cy - originalHeight / 2, originalWidth, originalHeight)
-
-        // M7：收起态→正常态的几何动画（chrome 与 leash 逐帧同源）
-        animateContentRect(from, to, geometryAnimDuration()) {
-            setBackgroundWrapContent()
-            setParrentWrapContent()
-            isResize = true
-            keepInScreen(animate = false)
-
-            CoroutineScope(Dispatchers.Main).launch {
-                delay(200)
-
-                if (orientation == 0) {
-                    binding.rlBarControllerBottom.visibility = View.VISIBLE
-                } else {
-                    binding.rlBarControllerSide.visibility = View.VISIBLE
-                }
-            }
-        }
-    }
-
-    private fun collapseWindow() {
-        CoroutineScope(Dispatchers.Main).launch {
-            delay(200)
-
-            val from = currentContentRect() ?: return@launch
-            val cx = (from.left + from.right) / 2
-            val cy = (from.top + from.bottom) / 2
-            val ballSize = 44.dpToPx().toInt()
-            val to = android.graphics.Rect(
-                cx - ballSize / 2, cy - ballSize / 2,
-                cx + ballSize / 2, cy + ballSize / 2
-            )
-
-            // M7：正常态→收起态的几何动画；终态切换为图标球
-            animateContentRect(from, to, geometryAnimDuration()) {
-                binding.cvappIcon.radius = 20.dpToPx() // 使其变成圆球 (40dp的一半)
-                binding.cvappIcon.visibility = View.VISIBLE
-                binding.background.visibility = View.GONE
-                isResize = true
-                keepInScreen(animate = false)
-            }
-        }
     }
 
     private fun rightResize(ibResize: ImageButton) {

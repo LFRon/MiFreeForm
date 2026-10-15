@@ -1,6 +1,6 @@
 package com.buildsession.betterYAMF.window.core
 
-enum class ShellMode { NORMAL, MINI, COLLAPSED }
+enum class ShellMode { NORMAL, MINI }
 
 enum class RegionId {
     BODY_MASK,
@@ -8,19 +8,14 @@ enum class RegionId {
     BAR_BOTTOM,
     BAR_SIDE,
     RESIZE_HANDLE,
-    CONTENT,
-    BUTTON_CLOSE,
-    BUTTON_FULLSCREEN,
-    BUTTON_MINIMIZE,
-    BUTTON_COLLAPSE,
-    SUPER_CLOSE
+    CONTENT
 }
 
 enum class DropKind { CORNER_TL, CORNER_TR, CORNER_BL, CORNER_BR, SIDE_LEFT, SIDE_RIGHT }
 
-enum class CloseOrigin { BUTTON_X, DOUBLE_TAP_BAR, DRAG_UP_BAR }
+enum class CloseOrigin { DOUBLE_TAP_BAR, DRAG_UP_BAR }
 
-enum class FullscreenOrigin { BUTTON, DRAG_DOWN_BAR }
+enum class FullscreenOrigin { DRAG_DOWN_BAR }
 
 data class WindowRegistration(
     val windowId: Int,
@@ -119,10 +114,6 @@ sealed interface WindowCommand {
     data class ResizePreviewCommit(override val windowId: Int) : WindowCommand
     data class EnterMini(override val windowId: Int, val corner: DropKind = DropKind.CORNER_TR) : WindowCommand
     data class ExitMini(override val windowId: Int) : WindowCommand
-    data class EnterCollapsed(override val windowId: Int) : WindowCommand
-    data class ExitCollapsed(override val windowId: Int) : WindowCommand
-    data class ShowSuperMenu(override val windowId: Int) : WindowCommand
-    data class HideSuperMenu(override val windowId: Int) : WindowCommand
     data class RequestClose(override val windowId: Int, val origin: CloseOrigin) : WindowCommand
     data class RequestFullscreen(override val windowId: Int, val origin: FullscreenOrigin) : WindowCommand
     data class RaiseWindow(override val windowId: Int) : WindowCommand
@@ -131,7 +122,6 @@ sealed interface WindowCommand {
 data class ShellSnapshot(
     val windowId: Int,
     val mode: ShellMode,
-    val superMenuVisible: Boolean,
     val dragging: Boolean,
     val resizing: Boolean
 )
