@@ -8,6 +8,7 @@ import com.github.kyuubiran.ezxhelper.utils.findMethod
 import com.github.kyuubiran.ezxhelper.utils.hookAfter
 import com.github.kyuubiran.ezxhelper.utils.hookBefore
 import com.buildsession.betterYAMF.BuildConfig
+import com.buildsession.betterYAMF.common.ipc.Protocol
 import com.buildsession.betterYAMF.xposed.hook.freeform.FreeformBackend
 import com.buildsession.betterYAMF.xposed.services.UserService
 import com.buildsession.betterYAMF.xposed.services.YAMFManager
@@ -78,7 +79,7 @@ class HookSystem : IXposedHookZygoteInit, IXposedHookLoadPackage {
                 name == "checkBroadcastFromSystem"
             }.hookBefore {
                 val intent = it.args[0] as Intent
-                if (intent.action == HookLauncher.ACTION_RECEIVE_LAUNCHER_CONFIG)
+                if (intent.action == Protocol.ACTION_RECEIVE_LAUNCHER_CONFIG)
                     it.result = Unit
             }
         }.onFailure {
@@ -90,7 +91,7 @@ class HookSystem : IXposedHookZygoteInit, IXposedHookLoadPackage {
                 name == "checkBroadcastFromSystem"
             }.hookBefore {
                 val intent = it.args[0] as Intent
-                if (intent.action == HookLauncher.ACTION_RECEIVE_LAUNCHER_CONFIG)
+                if (intent.action == Protocol.ACTION_RECEIVE_LAUNCHER_CONFIG)
                     it.result = Unit
             }
         }.onFailure {

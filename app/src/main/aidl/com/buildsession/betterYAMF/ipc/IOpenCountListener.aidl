@@ -1,5 +1,5 @@
 // IOpenCountListener.aidl
-package com.buildsession.betterYAMF.xposed;
+package com.buildsession.betterYAMF.ipc;
 
 // Declare any non-default types here with import statements
 

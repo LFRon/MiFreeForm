@@ -8,9 +8,8 @@ import androidx.core.view.WindowInsetsCompat
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.slider.Slider
 import com.buildsession.betterYAMF.R
-import com.buildsession.betterYAMF.common.gson
 import com.buildsession.betterYAMF.databinding.ActivitySettingBinding
-import com.buildsession.betterYAMF.manager.services.YAMFManagerProxy
+import com.buildsession.betterYAMF.manager.core.settings.SettingsRepository
 import com.buildsession.betterYAMF.common.model.Config as YAMFConfig
 
 class SettingActivity : AppCompatActivity() {
@@ -36,7 +35,7 @@ class SettingActivity : AppCompatActivity() {
 
     private fun initData() {
         binding?.apply {
-            config = gson.fromJson(YAMFManagerProxy.configJson, YAMFConfig::class.java)
+            config = SettingsRepository.load()
             applyConfigToViews()
 
             btnResetConfig.setOnClickListener {
@@ -45,9 +44,9 @@ class SettingActivity : AppCompatActivity() {
                     .setMessage(R.string.reset_config_message)
                     .setNegativeButton(R.string.cancel, null)
                     .setPositiveButton(R.string.reset) { _, _ ->
-                        config = YAMFConfig()
+                        SettingsRepository.resetToDefaults()
+                        config = SettingsRepository.current()
                         applyConfigToViews()
-                        YAMFManagerProxy.updateConfig(gson.toJson(config))
                     }
                     .show()
             }
@@ -58,7 +57,7 @@ class SettingActivity : AppCompatActivity() {
                 override fun onStopTrackingTouch(slider: Slider) {
                     tvRoundedValue.text = "${slider.value.toInt()}"
                     config.windowRoundedCorner = slider.value.toInt()
-                    YAMFManagerProxy.updateConfig(gson.toJson(config))
+                    SettingsRepository.setWindowRoundedCorner(slider.value.toInt())
                 }
             })
 
@@ -72,7 +71,7 @@ class SettingActivity : AppCompatActivity() {
                         "${slider.value.toInt()}"
                     }
                     config.animationSpeed = slider.value
-                    YAMFManagerProxy.updateConfig(gson.toJson(config))
+                    SettingsRepository.setAnimationSpeed(slider.value)
                 }
             })
         }
@@ -97,9 +96,13 @@ class SettingActivity : AppCompatActivity() {
     override fun onDestroy() {
         super.onDestroy()
         binding?.apply {
-            config.defaultWindowHeight = etSizeH.text.toString().toIntOrNull() ?: 0
-            config.defaultWindowWidth = etSizeW.text.toString().toIntOrNull() ?: config.defaultWindowWidth
-            YAMFManagerProxy.updateConfig(gson.toJson(config))
+            val height = etSizeH.text.toString().toIntOrNull() ?: 0
+            val width = etSizeW.text.toString().toIntOrNull()
+            // 读-改-写：其他字段取模块最新值（单写者语义）
+            SettingsRepository.update { cfg ->
+                cfg.defaultWindowHeight = height
+                if (width != null) cfg.defaultWindowWidth = width
+            }
         }
     }
 }

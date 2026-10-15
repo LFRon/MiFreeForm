@@ -52,7 +52,7 @@ import com.github.kyuubiran.ezxhelper.utils.paramCount
 import com.buildsession.betterYAMF.R
 import com.buildsession.betterYAMF.xposed.hook.launcher.LauncherInputAnchors
 import com.buildsession.betterYAMF.xposed.hook.launcher.ManagedTaskFilter
-import com.buildsession.betterYAMF.xposed.services.YAMFManager
+import com.buildsession.betterYAMF.common.ipc.Protocol
 import com.buildsession.betterYAMF.xposed.utils.log
 import com.buildsession.betterYAMF.xposed.utils.registerReceiver
 import de.robv.android.xposed.IXposedHookLoadPackage
@@ -68,11 +68,6 @@ import java.lang.reflect.Proxy
 class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
     companion object {
         const val TAG = "BetterYAMF_HookLauncher"
-        const val ACTION_RECEIVE_LAUNCHER_CONFIG =
-            "com.buildsession.betterYAMF.ACTION_RECEIVE_LAUNCHER_CONFIG"
-
-        const val EXTRA_HOOK_RECENT = "hookRecent"
-        const val EXTRA_HOOK_TASKBAR = "hookTaskbar"
     }
 
     private var isRegistered = false
@@ -343,11 +338,11 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                                 }
                                 log(TAG, "ACTION_UP at ($correctedX, $correctedY), isInZone=$isInZone, isShowing=$mIsShowingZone, taskId=$mCurrentTaskId")
                                 if (mIsShowingZone && isInZone && mCurrentTaskId != -1) {
-                                    val intent = Intent(YAMFManager.ACTION_OPEN_IN_YAMF).apply {
+                                    val intent = Intent(Protocol.ACTION_OPEN_IN_YAMF).apply {
                                         setPackage("android")
-                                        putExtra(YAMFManager.EXTRA_TASK_ID, mCurrentTaskId)
-                                        putExtra(YAMFManager.EXTRA_SOURCE, YAMFManager.SOURCE_RECENT)
-                                        putExtra(YAMFManager.EXTRA_FROM_DROP_ZONE, true)
+                                        putExtra(Protocol.EXTRA_TASK_ID, mCurrentTaskId)
+                                        putExtra(Protocol.EXTRA_SOURCE, Protocol.SOURCE_RECENT)
+                                        putExtra(Protocol.EXTRA_FROM_DROP_ZONE, true)
                                     }
                                     AndroidAppHelper.currentApplication().sendBroadcast(intent)
                                     log(TAG, "Sent broadcast to open task $mCurrentTaskId in YAMF")
@@ -411,16 +406,16 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
             if (!isRegistered) {
                 val activity = it.thisObject as Activity
                 val application = activity.application
-                application.registerReceiver(ACTION_RECEIVE_LAUNCHER_CONFIG) { _, intent ->
-                    val hookRecent = intent.getBooleanExtra(EXTRA_HOOK_RECENT, false)
-                    val hookTaskbar = intent.getBooleanExtra(EXTRA_HOOK_TASKBAR, false)
+                application.registerReceiver(Protocol.ACTION_RECEIVE_LAUNCHER_CONFIG) { _, intent ->
+                    val hookRecent = intent.getBooleanExtra(Protocol.EXTRA_HOOK_RECENT, false)
+                    val hookTaskbar = intent.getBooleanExtra(Protocol.EXTRA_HOOK_TASKBAR, false)
                     if (hookRecent) runCatching { hookRecent(lpparam) }.onFailure { e ->
                         log(TAG, "hook recent failed", e) }
                     if (hookTaskbar) runCatching { hookTaskbar(lpparam) }.onFailure { e ->
                         log(TAG, "hook taskbar failed", e) }
                     application.unregisterReceiver(this)
                 }
-                application.sendBroadcast(Intent(YAMFManager.ACTION_GET_LAUNCHER_CONFIG).apply {
+                application.sendBroadcast(Intent(Protocol.ACTION_GET_LAUNCHER_CONFIG).apply {
                     `package` = "android"
                     putExtra("sender", application.packageName)
                 })
@@ -464,7 +459,7 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                         lpparam.classLoader
                     )
 
-                    val intent = Intent(YAMFManager.ACTION_OPEN_IN_YAMF).apply {
+                    val intent = Intent(Protocol.ACTION_OPEN_IN_YAMF).apply {
                         setPackage("android")
                     }
 
@@ -472,14 +467,14 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                         val itemInfoTmp =
                             itemInfo.javaClass.newInstance(args(itemInfo), argTypes(itemInfo.javaClass))
                         val topComponent = XposedHelpers.callMethod(itemInfoTmp, "getTargetComponent") as ComponentName
-                        intent.putExtra(YAMFManager.EXTRA_COMPONENT_NAME, topComponent)
+                        intent.putExtra(Protocol.EXTRA_COMPONENT_NAME, topComponent)
                     }.onFailure {
                         val topComponent = extractComponentInfo(itemInfo.toString()).toString()
-                        intent.putExtra(YAMFManager.EXTRA_COMPONENT_NAME, topComponent)
+                        intent.putExtra(Protocol.EXTRA_COMPONENT_NAME, topComponent)
                     }
-                    intent.putExtra(YAMFManager.EXTRA_TASK_ID, taskId)
-                    intent.putExtra(YAMFManager.EXTRA_USER_ID, userId)
-                    intent.putExtra(YAMFManager.EXTRA_SOURCE, YAMFManager.SOURCE_RECENT)
+                    intent.putExtra(Protocol.EXTRA_TASK_ID, taskId)
+                    intent.putExtra(Protocol.EXTRA_USER_ID, userId)
+                    intent.putExtra(Protocol.EXTRA_SOURCE, Protocol.SOURCE_RECENT)
 
                     val action = RemoteAction(
                         Icon.createWithBitmap(
@@ -521,10 +516,10 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
             findMethodOrNull { name == "startItemInfoActivity" }
                 ?.hookReplace {
                     val infoIntent = it.args[0].invokeMethodAutoAs<Intent>("getIntent")!!
-                    val intent = Intent(YAMFManager.ACTION_OPEN_IN_YAMF).apply {
+                    val intent = Intent(Protocol.ACTION_OPEN_IN_YAMF).apply {
                         setPackage("android")
-                        putExtra(YAMFManager.EXTRA_COMPONENT_NAME, infoIntent.component)
-                        putExtra(YAMFManager.EXTRA_SOURCE, YAMFManager.SOURCE_TASKBAR)
+                        putExtra(Protocol.EXTRA_COMPONENT_NAME, infoIntent.component)
+                        putExtra(Protocol.EXTRA_SOURCE, Protocol.SOURCE_TASKBAR)
                     }
                     AndroidAppHelper.currentApplication().sendBroadcast(intent)
                 }
@@ -535,10 +530,10 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                     val tag = it.args[0].invokeMethodAuto("getTag")!!
                     if (classWorkspaceiteminfo.isInstance(tag)) {
                         val infoIntent = tag.invokeMethodAutoAs<Intent>("getIntent")!!
-                        val intent = Intent(YAMFManager.ACTION_OPEN_IN_YAMF).apply {
+                        val intent = Intent(Protocol.ACTION_OPEN_IN_YAMF).apply {
                             setPackage("android")
-                            putExtra(YAMFManager.EXTRA_COMPONENT_NAME, infoIntent.component)
-                            putExtra(YAMFManager.EXTRA_SOURCE, YAMFManager.SOURCE_TASKBAR)
+                            putExtra(Protocol.EXTRA_COMPONENT_NAME, infoIntent.component)
+                            putExtra(Protocol.EXTRA_SOURCE, Protocol.SOURCE_TASKBAR)
                         }
                         AndroidAppHelper.currentApplication().sendBroadcast(intent)
                         it.result = Unit
@@ -550,9 +545,9 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
 
     private fun suppressRecentsGesture(durationMs: Long) {
         runCatching {
-            val intent = Intent(YAMFManager.ACTION_RECENTS_GESTURE).apply {
+            val intent = Intent(Protocol.ACTION_RECENTS_GESTURE).apply {
                 setPackage("android")
-                putExtra(YAMFManager.EXTRA_SUPPRESS_MS, durationMs)
+                putExtra(Protocol.EXTRA_SUPPRESS_MS, durationMs)
             }
             AndroidAppHelper.currentApplication().sendBroadcast(intent)
         }.onFailure {

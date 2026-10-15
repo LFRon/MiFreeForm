@@ -1,10 +1,10 @@
 // IYAMFManager.aidl
-package com.buildsession.betterYAMF.xposed;
+package com.buildsession.betterYAMF.ipc;
 
-import com.buildsession.betterYAMF.xposed.IOpenCountListener;
+import com.buildsession.betterYAMF.ipc.IOpenCountListener;
 import com.buildsession.betterYAMF.common.model.AppInfo;
-import com.buildsession.betterYAMF.xposed.IAppListCallback;
-import com.buildsession.betterYAMF.xposed.IAppIconCallback;
+import com.buildsession.betterYAMF.ipc.IAppListCallback;
+import com.buildsession.betterYAMF.ipc.IAppIconCallback;
 // Declare any non-default types here with import statements
 
 interface IYAMFManager {

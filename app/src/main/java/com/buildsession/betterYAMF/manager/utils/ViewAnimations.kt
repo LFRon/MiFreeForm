@@ -10,23 +10,18 @@ import android.view.View
 import android.view.animation.AccelerateDecelerateInterpolator
 import android.view.animation.Animation
 import android.view.animation.ScaleAnimation
-import com.buildsession.betterYAMF.common.gson
-import com.buildsession.betterYAMF.manager.services.YAMFManagerProxy
+import com.buildsession.betterYAMF.manager.core.settings.SettingsRepository
 import com.buildsession.betterYAMF.common.model.Config as YAMFConfig
 
 /**
  * app（UI）侧动画工具。
  *
- * 分层边界：只依赖 UI↔模块的 RPC 代理（[YAMFManagerProxy]）读取动画速度，
- * 读取失败回退默认配置——不触碰模块进程单例（Xposed 侧对象在 App 进程不可用）。
+ * 分层边界：动画速度经设置仓库（逻辑层）读取，不直接触碰协议/模块单例。
  */
 
 private const val DEFAULT_ANIMATION_SPEED = 5100f
 
-private fun resolveAnimationConfig(): YAMFConfig =
-    runCatching {
-        gson.fromJson(YAMFManagerProxy.configJson, YAMFConfig::class.java)
-    }.getOrNull() ?: YAMFConfig()
+private fun resolveAnimationConfig(): YAMFConfig = SettingsRepository.current()
 
 fun animateResize(
     view: View,

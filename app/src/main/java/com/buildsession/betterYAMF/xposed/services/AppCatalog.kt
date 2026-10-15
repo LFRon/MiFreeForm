@@ -15,8 +15,8 @@ import com.github.kyuubiran.ezxhelper.utils.args
 import com.github.kyuubiran.ezxhelper.utils.invokeMethodAs
 import com.buildsession.betterYAMF.common.model.AppInfo
 import com.buildsession.betterYAMF.common.runMain
-import com.buildsession.betterYAMF.xposed.IAppIconCallback
-import com.buildsession.betterYAMF.xposed.IAppListCallback
+import com.buildsession.betterYAMF.ipc.IAppIconCallback
+import com.buildsession.betterYAMF.ipc.IAppListCallback
 import com.buildsession.betterYAMF.xposed.utils.Instances
 import com.buildsession.betterYAMF.xposed.utils.getActivityInfoCompat
 import java.io.ByteArrayOutputStream

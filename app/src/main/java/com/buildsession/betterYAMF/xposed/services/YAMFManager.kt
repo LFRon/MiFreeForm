@@ -1,7 +1,6 @@
 package com.buildsession.betterYAMF.xposed.services
 
 import android.annotation.SuppressLint
-import android.app.AndroidAppHelper
 import android.content.BroadcastReceiver
 import android.content.ComponentName
 import android.content.Context
@@ -11,14 +10,15 @@ import android.os.SystemClock
 import com.buildsession.betterYAMF.BuildConfig
 import com.buildsession.betterYAMF.common.gson
 import com.buildsession.betterYAMF.common.model.AppInfo
+import com.buildsession.betterYAMF.common.ipc.Protocol
 import com.buildsession.betterYAMF.common.model.Config
 import com.buildsession.betterYAMF.common.model.StartCmd
 import com.buildsession.betterYAMF.common.runMain
 import com.buildsession.betterYAMF.common.ui.componentName
-import com.buildsession.betterYAMF.xposed.IAppIconCallback
-import com.buildsession.betterYAMF.xposed.IAppListCallback
-import com.buildsession.betterYAMF.xposed.IOpenCountListener
-import com.buildsession.betterYAMF.xposed.IYAMFManager
+import com.buildsession.betterYAMF.ipc.IAppIconCallback
+import com.buildsession.betterYAMF.ipc.IAppListCallback
+import com.buildsession.betterYAMF.ipc.IOpenCountListener
+import com.buildsession.betterYAMF.ipc.IYAMFManager
 import com.buildsession.betterYAMF.xposed.hook.HookLauncher
 import com.buildsession.betterYAMF.window.backend.WindowBackend
 import com.buildsession.betterYAMF.window.backend.WindowBackendCallbacks
@@ -42,31 +42,6 @@ import java.io.File
 
 object YAMFManager : IYAMFManager.Stub() {
     private const val TAG = "BetterYAMFManager"
-
-    const val ACTION_GET_LAUNCHER_CONFIG = "com.buildsession.betterYAMF.ACTION_GET_LAUNCHER_CONFIG"
-    const val ACTION_OPEN_APP = "com.buildsession.betterYAMF.action.OPEN_APP"
-    private const val ACTION_CURRENT_TO_WINDOW = "com.buildsession.betterYAMF.action.CURRENT_TO_WINDOW"
-    private const val ACTION_OPEN_APP_LIST = "com.buildsession.betterYAMF.action.OPEN_APP_LIST"
-    const val ACTION_OPEN_IN_YAMF = "com.buildsession.betterYAMF.ACTION_OPEN_IN_YAMF"
-    const val ACTION_RECENTS_GESTURE = "com.buildsession.betterYAMF.action.RECENTS_GESTURE"
-    const val ACTION_MANAGED_TASKS = "com.buildsession.betterYAMF.action.MANAGED_TASKS"
-    const val ACTION_QUERY_MANAGED_TASKS = "com.buildsession.betterYAMF.action.QUERY_MANAGED_TASKS"
-    const val ACTION_DUMP_GEOMETRY = "com.buildsession.betterYAMF.action.DUMP_GEOMETRY"
-
-    const val EXTRA_COMPONENT_NAME = "componentName"
-    const val EXTRA_USER_ID = "userId"
-    const val EXTRA_TASK_ID = "taskId"
-    const val EXTRA_SOURCE = "source"
-    const val EXTRA_SUPPRESS_MS = "suppressMs"
-    const val EXTRA_FROM_DROP_ZONE = "fromDropZone"
-    const val EXTRA_MANAGED_TASK_IDS = "managedTaskIds"
-
-    private const val SOURCE_UNSPECIFIED = 0
-    const val SOURCE_RECENT = 1
-    const val SOURCE_TASKBAR = 2
-    const val SOURCE_POPUP = 3
-
-    const val CHROME_WINDOW_TITLE = "reYAMF_chrome"
 
     private const val LEGACY_DEFAULT_WINDOW_HEIGHT = 380
 
@@ -230,41 +205,36 @@ object YAMFManager : IYAMFManager.Stub() {
                 }
             })
         }.onFailure { log("reYAMF_debug", "window backend init failed", it) }
-        systemContext.registerReceiver(ACTION_OPEN_IN_YAMF, OpenInYAMFBroadcastReceiver)
-        systemContext.registerReceiver(ACTION_RECENTS_GESTURE) { _, intent ->
-            val suppressMs = intent.getLongExtra(EXTRA_SUPPRESS_MS, 0L)
+        systemContext.registerReceiver(Protocol.ACTION_OPEN_IN_YAMF, OpenInYAMFBroadcastReceiver)
+        systemContext.registerReceiver(Protocol.ACTION_RECENTS_GESTURE) { _, intent ->
+            val suppressMs = intent.getLongExtra(Protocol.EXTRA_SUPPRESS_MS, 0L)
             windowBackend.suppressRecentsGestureFor(suppressMs)
             if (BuildConfig.DEBUG) {
                 log("reYAMF_debug", "recents gesture suppress ${suppressMs}ms")
             }
         }
-        systemContext.registerReceiver(ACTION_QUERY_MANAGED_TASKS) { _, _ ->
+        systemContext.registerReceiver(Protocol.ACTION_QUERY_MANAGED_TASKS) { _, _ ->
             broadcastManagedTaskIds()
         }
-        systemContext.registerReceiver(ACTION_DUMP_GEOMETRY) { _, _ ->
+        systemContext.registerReceiver(Protocol.ACTION_DUMP_GEOMETRY) { _, _ ->
             activeWindows.values.toList().forEach { w ->
                 runCatching { w.dumpGeometry() }
             }
         }
-        systemContext.registerReceiver(ACTION_CURRENT_TO_WINDOW) { _, _ ->
+        systemContext.registerReceiver(Protocol.ACTION_CURRENT_TO_WINDOW) { _, _ ->
             currentToWindow()
         }
-        systemContext.registerReceiver(ACTION_OPEN_APP_LIST) { _, _ ->
-            val componentName = ComponentName("com.buildsession.betterYAMF", "com.buildsession.betterYAMF.manager.applist.AppListWindow")
-            val intent = Intent().setComponent(componentName)
-            AndroidAppHelper.currentApplication().startService(intent)
-        }
-        systemContext.registerReceiver(ACTION_OPEN_APP) { _, intent ->
-            val componentName = intent.getParcelableExtra<ComponentName>(EXTRA_COMPONENT_NAME)
+        systemContext.registerReceiver(Protocol.ACTION_OPEN_APP) { _, intent ->
+            val componentName = intent.getParcelableExtra<ComponentName>(Protocol.EXTRA_COMPONENT_NAME)
                 ?: return@registerReceiver
-            val userId = intent.getIntExtra(EXTRA_USER_ID, 0)
+            val userId = intent.getIntExtra(Protocol.EXTRA_USER_ID, 0)
             createWindow(StartCmd(componentName = componentName, userId = userId))
         }
-        systemContext.registerReceiver(ACTION_GET_LAUNCHER_CONFIG) { _, intent ->
-            ActivityManagerApis.broadcastIntent(Intent(HookLauncher.ACTION_RECEIVE_LAUNCHER_CONFIG).apply {
+        systemContext.registerReceiver(Protocol.ACTION_GET_LAUNCHER_CONFIG) { _, intent ->
+            ActivityManagerApis.broadcastIntent(Intent(Protocol.ACTION_RECEIVE_LAUNCHER_CONFIG).apply {
                 // log(TAG, "send config: ${config.hookLauncher}")
-                putExtra(HookLauncher.EXTRA_HOOK_RECENT, config.hookLauncher.hookRecents)
-                putExtra(HookLauncher.EXTRA_HOOK_TASKBAR, config.hookLauncher.hookTaskbar)
+                putExtra(Protocol.EXTRA_HOOK_RECENT, config.hookLauncher.hookRecents)
+                putExtra(Protocol.EXTRA_HOOK_TASKBAR, config.hookLauncher.hookTaskbar)
                 `package` = intent.getStringExtra("sender")
             }, 0)
         }
@@ -423,9 +393,9 @@ object YAMFManager : IYAMFManager.Stub() {
     fun broadcastManagedTaskIds() {
         runCatching {
             val ids = windowBackend.managedTaskIds()
-            val intent = Intent(ACTION_MANAGED_TASKS)
+            val intent = Intent(Protocol.ACTION_MANAGED_TASKS)
                 .setPackage("com.android.launcher3")
-                .putExtra(EXTRA_MANAGED_TASK_IDS, ids)
+                .putExtra(Protocol.EXTRA_MANAGED_TASK_IDS, ids)
             systemContext.sendBroadcast(intent)
             if (BuildConfig.DEBUG) {
                 log("reYAMF_debug", "managed tasks -> launcher: [${ids.joinToString()}]")
@@ -532,7 +502,7 @@ object YAMFManager : IYAMFManager.Stub() {
     override fun resetAllWindow() {
         runMain {
             Instances.iStatusBarService.collapsePanels()
-            systemContext.sendBroadcast(Intent(AppWindow.ACTION_RESET_ALL_WINDOW))
+            systemContext.sendBroadcast(Intent(Protocol.ACTION_RESET_ALL_WINDOW))
         }
     }
 
@@ -561,17 +531,17 @@ object YAMFManager : IYAMFManager.Stub() {
 
     private val OpenInYAMFBroadcastReceiver: BroadcastReceiver.(Context, Intent) -> Unit =
         { _: Context, intent: Intent ->
-            val taskId = intent.getIntExtra(EXTRA_TASK_ID, 0)
+            val taskId = intent.getIntExtra(Protocol.EXTRA_TASK_ID, 0)
             val componentName =
-                intent.getParcelableExtra(EXTRA_COMPONENT_NAME, ComponentName::class.java)
-            val userId = intent.getIntExtra(EXTRA_USER_ID, 0)
-            val source = intent.getIntExtra(EXTRA_SOURCE, SOURCE_UNSPECIFIED)
-            val fromDropZone = intent.getBooleanExtra(EXTRA_FROM_DROP_ZONE, false)
+                intent.getParcelableExtra(Protocol.EXTRA_COMPONENT_NAME, ComponentName::class.java)
+            val userId = intent.getIntExtra(Protocol.EXTRA_USER_ID, 0)
+            val source = intent.getIntExtra(Protocol.EXTRA_SOURCE, Protocol.SOURCE_UNSPECIFIED)
+            val fromDropZone = intent.getBooleanExtra(Protocol.EXTRA_FROM_DROP_ZONE, false)
             log("reYAMF_debug", "openInYAMF task=$taskId source=$source fromZone=$fromDropZone component=$componentName")
             createWindow(StartCmd(componentName, userId, taskId, openAsMini = fromDropZone))
 
             // TODO: better way to close recents
-            if (source == SOURCE_RECENT) {
+            if (source == Protocol.SOURCE_RECENT) {
                 android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
                     runCatching { windowBackend.injectHomeKey() }
                 }, HOME_INJECT_DELAY_MS)

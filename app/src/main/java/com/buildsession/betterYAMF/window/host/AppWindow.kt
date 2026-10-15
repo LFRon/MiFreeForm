@@ -41,6 +41,7 @@ import androidx.wear.widget.RoundedDrawable
 import com.google.android.material.color.MaterialColors
 import com.buildsession.betterYAMF.common.getAttr
 import com.buildsession.betterYAMF.common.onException
+import com.buildsession.betterYAMF.common.ipc.Protocol
 import com.buildsession.betterYAMF.common.runMain
 import com.buildsession.betterYAMF.common.ui.animateAlpha
 import com.buildsession.betterYAMF.common.ui.dpToPx
@@ -77,7 +78,6 @@ class AppWindow(
 ) : WindowHost {
     companion object {
         const val TAG = "reYAMF_AppWindow"
-        const val ACTION_RESET_ALL_WINDOW = "com.buildsession.betterYAMF.ui.window.action.ACTION_RESET_ALL_WINDOW"
         private const val HOME_REFRONT_DELAY_MS = 0L
         private const val MINI_START_DELAY_MS = 500L
         private val shellRegistry = WindowShellRegistry()
@@ -135,7 +135,7 @@ class AppWindow(
 
     private val broadcastReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
-            if (intent.action == ACTION_RESET_ALL_WINDOW) {
+            if (intent.action == Protocol.ACTION_RESET_ALL_WINDOW) {
                 val lp = binding.root.layoutParams as WindowManager.LayoutParams
                 val dm = context.resources.displayMetrics
                 val width = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, 200F, context.resources.displayMetrics).toInt()
@@ -178,7 +178,7 @@ class AppWindow(
                     WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM,
             PixelFormat.TRANSLUCENT
         )
-        params.setTitle(YAMFManager.CHROME_WINDOW_TITLE)
+        params.setTitle(Protocol.CHROME_WINDOW_TITLE)
 
         val displayManager = context.getSystemService(DISPLAY_SERVICE) as DisplayManager
         val display = displayManager.getDisplay(Display.DEFAULT_DISPLAY)
@@ -277,7 +277,7 @@ class AppWindow(
         )
         updateShellScreenMetrics()
         
-        context.registerReceiver(broadcastReceiver, IntentFilter(ACTION_RESET_ALL_WINDOW), Context.RECEIVER_EXPORTED)
+        context.registerReceiver(broadcastReceiver, IntentFilter(Protocol.ACTION_RESET_ALL_WINDOW), Context.RECEIVER_EXPORTED)
         binding.vSizePreviewer.updateLayoutParams {
             this.width = windowWidth
             this.height = windowHeight
