@@ -68,7 +68,9 @@ class HookSystem : IXposedHookZygoteInit, IXposedHookLoadPackage {
             activityManagerServiceSystemReadyHook?.unhook()
             YAMFManager.activityManagerService = it.thisObject
             YAMFManager.systemReady()
-            XposedBridge.log("$TAG: System ready, reYAMF services initialized.")
+            if (BuildConfig.DEBUG) {
+                XposedBridge.log("$TAG: System ready, reYAMF services initialized.")
+            }
             // log(TAG, "system ready")
         }
         runCatching {

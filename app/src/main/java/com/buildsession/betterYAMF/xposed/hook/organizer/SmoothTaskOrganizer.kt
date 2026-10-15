@@ -7,6 +7,7 @@ import android.view.SurfaceControl
 import android.window.ITaskOrganizer
 import com.buildsession.betterYAMF.xposed.hook.freeform.FreeformBackend
 import com.buildsession.betterYAMF.xposed.services.YAMFManager
+import com.buildsession.betterYAMF.xposed.services.YAMFManager.config
 import com.buildsession.betterYAMF.xposed.utils.Instances
 import com.buildsession.betterYAMF.xposed.utils.log
 import com.github.kyuubiran.ezxhelper.utils.findMethod
@@ -181,6 +182,9 @@ object SmoothTaskOrganizer {
             // 2) 先装选择性路由钩子——注册引发的全量认领必须按我们的规则路由
             hookTaskOrganizerRouting()
 
+            // 2.5) 圆角 opt 源头闸——禁止系统转场收尾恢复我方任务的客户端自绘
+            hookRoundedCornerOptCleanup()
+
             // 3) 注册
             val appeared = XposedHelpers.callMethod(
                 taskOrganizerController, "registerTaskOrganizer", organizer
@@ -223,6 +227,37 @@ object SmoothTaskOrganizer {
             log(TAG, "task organizer routing hook installed")
         }.onFailure {
             log(TAG, "routing hook install failed", it)
+        }
+    }
+
+    /**
+     * 圆角 opt 源头闸：系统转场收尾会遍历 `mRoundedCornerOptTasks` 把 opt 恢复为 true
+     * （TransitionController#cleanupRoundedCornerDisableOptTasks → task.getSyncTransaction()，
+     * 延迟冲刷、可能晚于我们的即时写入）。我方名下会话任务的 opt 必须恒为 false
+     * （否则应用自绘圆角复活 → 旧"镜像残留"类 bug），因此在登记点拦截：
+     * 已 adopted 的任务不进系统的"待恢复 true"集合——系统转场开始时的 false
+     * （Transition.java:2163）照常保留，等于把系统语义收敛成"只关不开"。
+     */
+    private fun hookRoundedCornerOptCleanup() {
+        runCatching {
+            val controllerClass = Instances.systemContext.classLoader
+                .loadClass("com.android.server.wm.TransitionController")
+            findMethod(controllerClass) {
+                name == "onRoundedCornerOptDisabled" && paramCount == 1
+            }.hookBefore { param ->
+                runCatching {
+                    val task = param.args[0] ?: return@runCatching
+                    val taskId = runCatching { XposedHelpers.getIntField(task, "mTaskId") }
+                        .getOrDefault(-1)
+                    if (taskId >= 0 && adoptedTasks.contains(taskId)) {
+                        // 跳过原方法 = 不登记 → 收尾不会对我们恢复 true
+                        param.result = null
+                    }
+                }
+            }
+            log(TAG, "rounded-corner opt gate hook installed")
+        }.onFailure {
+            log(TAG, "rounded-corner opt gate hook install failed", it)
         }
     }
 
@@ -522,11 +557,12 @@ object SmoothTaskOrganizer {
                 }
 
                 val wct = newWct()
-                // 注意：不设置 FREEFORM 模式。真机实证（2026-10-15）：
-                // 任务一旦进入 FREEFORM，应用会收到 onMultiWindowModeChanged(true) 并切到
-                // 自带的"小窗圆角皮肤"（像素级绘制）；释放回全屏后应用不保证自行复原，
-                // 残留巨大圆角+黑边（旋转屏幕/重启才消失）。M7 几何完全由 leash 承载，
-                // 任务保持原窗口模式即可；菜单直启的任务本来就是 freeform，不受影响。
+                // 会话期间任务切为 FREEFORM：让 WM 知道"承载任务不是全屏遮挡窗口"，
+                // 从而保持 后方 Home/壁纸 可见（否则从小窗打开时背景被 WM 隐藏成黑虚空，
+                // 真机实证）。圆角病根（A15+ 客户端自绘圆角 + 状态滞留）由
+                // toggleClientDrawnRoundedCornersOpt(false) 关掉自绘、交给 SF 裁剪根治，
+                // 见下方启用块与 writeLeashTransform 注释。
+                XposedHelpers.callMethod(wct, "setWindowingMode", token, WINDOWING_MODE_FREEFORM)
                 XposedHelpers.callMethod(wct, "setBounds", token, bounds)
                 // LineageOS 24.0：reparent 为三参 (child, parent, onTop)
                 XposedHelpers.callMethod(wct, "reparent", token, rootToken, true)
@@ -536,6 +572,30 @@ object SmoothTaskOrganizer {
                     logicalBounds.remove(taskId)
                     throw it
                 }
+
+                // ——— 关闭"客户端自绘圆角"优化（A17 原生开关，源码核实）———
+                // SurfaceControl.Transaction#toggleClientDrawnRoundedCornersOpt(sc, enable)：
+                // enable=false → 圆角裁剪由 SurfaceFlinger 完成、应用不再自绘（系统转场期
+                // 同款用法，见 Transition.java:2163；转场收尾由 TransitionController
+                // #cleanupRoundedCornerDisableOptTasks 恢复 true）。由此 leash 上的圆角
+                // 写入 = SF 真裁剪（透明圆角、壁纸透出），应用侧零圆角状态 → 会话结束零残留。
+                runCatching {
+                    val surface = resolveTaskByToken(token)?.let {
+                        runCatching {
+                            XposedHelpers.callMethod(it, "getSurfaceControl") as? SurfaceControl
+                        }.getOrNull()
+                    } ?: leashes[taskId]
+                    if (surface != null) {
+                        val tx = SurfaceControl.Transaction()
+                        XposedHelpers.callMethod(
+                            tx, "toggleClientDrawnRoundedCornersOpt", surface, false
+                        )
+                        tx.apply()
+                        log(TAG, "corner opt: client-drawn disabled (SF crop) task=$taskId")
+                    } else {
+                        log(TAG, "corner opt: no surface to disable client-drawn task=$taskId")
+                    }
+                }.onFailure { log(TAG, "corner opt disable failed task=$taskId", it) }
             } catch (t: Throwable) {
                 adoptedTasks.remove(taskId)
                 logicalBounds.remove(taskId)
@@ -590,6 +650,18 @@ object SmoothTaskOrganizer {
                         )
                     }
                     runCatching { XposedHelpers.callMethod(tx, "setCornerRadius", leash, 0f) }
+                    // 恢复系统默认：客户端自绘圆角开关复位（同 TransitionController
+                    // #cleanupRoundedCornerDisableOptTasks 的转场收尾语义）
+                    runCatching {
+                        val surface = resolveTaskByToken(token)?.let {
+                            runCatching {
+                                XposedHelpers.callMethod(it, "getSurfaceControl") as? SurfaceControl
+                            }.getOrNull()
+                        } ?: leash
+                        XposedHelpers.callMethod(
+                            tx, "toggleClientDrawnRoundedCornersOpt", surface, true
+                        )
+                    }
                     // toFront=false（关闭小窗→沉后台）：复位期间保持隐藏，
                     // 避免"复位→reparent"之间以原始变换闪现一帧；true（下拉全屏）保持可见。
                     if (toFront) {
@@ -659,6 +731,8 @@ object SmoothTaskOrganizer {
             }
             runCatching { XposedHelpers.callMethod(tx, "setCornerRadius", sc, 0f) }
             runCatching { XposedHelpers.callMethod(tx, "setShadowRadius", sc, 0f) }
+            // 恢复系统默认的客户端自绘圆角开关（表面重建后仍兜底复位）
+            runCatching { XposedHelpers.callMethod(tx, "toggleClientDrawnRoundedCornersOpt", sc, true) }
             tx.apply()
             log(TAG, "surface reset task=$taskId sc=$scName")
             true
@@ -684,14 +758,28 @@ object SmoothTaskOrganizer {
         val scaledH = logical.height() * scale
         val posX = physical.left + (physical.width() - scaledW) / 2f
         val posY = physical.top + (physical.height() - scaledH) / 2f
-        val radius = YAMFManager.smoothCornerRadiusPx[taskId] ?: 0
 
         XposedHelpers.callMethod(tx, "setMatrix", leash, scale, 0f, 0f, scale)
         XposedHelpers.callMethod(tx, "setPosition", leash, posX, posY)
         XposedHelpers.callMethod(tx, "setWindowCrop", leash, logical)
-        if (radius > 0) {
-            XposedHelpers.callMethod(tx, "setCornerRadius", leash, radius / scale)
-        }
+        // 圆角由 SurfaceFlinger 裁剪：写入值随 leash 矩阵缩放，视觉半径 = 写入值 × scale，
+        // 故写入值 = 视觉半径 / scale。应用侧自绘圆角已在 adoptTask 用
+        // toggleClientDrawnRoundedCornersOpt(false) 关掉 → 无镜像、会话结束无残留
+        // （旧 bug 病根 = 客户端自绘 + 状态滞留；源码：ThreadedRenderer#setCornerRadius /
+        // ViewRootImpl#prepareCornerRadiiForDraw / Transition.java:2163）。
+        // ⚠ 铁律（历史教训，勿删）：会话期间"客户端自绘圆角"必须保持关闭，否则应用会把
+        // 圆角镜像为自身像素级裁剪且清不掉（残角值跟随写入值、活体证据 630→212px），
+        // 只能旋转/重启应用消除。开关不放这里逐帧写（性能）：系统语义 = 转场作用域状态机
+        // （转场开始 false、空闲收尾 true），且已用 TransitionController 源头闸拦掉对我方
+        // 任务的"恢复 true"，再配合 adopt / reapplyLeash / release 三个状态点写入即可。
+        // 局部容错：圆角写入失败不得阻断 matrix/crop 的几何落地。
+        runCatching {
+            val density = Instances.systemContext.resources.displayMetrics.density
+            val cornerVisual = (config.windowRoundedCorner + 2) * density
+            val cornerLocal = (cornerVisual / scale)
+                .coerceAtMost(minOf(logical.width(), logical.height()) / 2f)
+            XposedHelpers.callMethod(tx, "setCornerRadius", leash, cornerLocal)
+        }.onFailure { log(TAG, "leash corner write failed task=$taskId", it) }
         return true
     }
 
@@ -724,6 +812,21 @@ object SmoothTaskOrganizer {
     fun reapplyLeash(taskId: Int) {
         val physical = YAMFManager.smoothFreeformBounds[taskId] ?: return
         applyLeash(taskId, physical)
+        // 转场收尾重施加（系统语义：cleanupRoundedCornerDisableOptTasks 会在转场空闲后把
+        // opt 恢复 true；认领前被登记、或源头闸尚未生效的残余路径仍可能翻回）。目标表面
+        // 与系统保持一致 = 任务当前表面（task.getSurfaceControl()），解析失败退回 leash。
+        runCatching {
+            val surface = runCatching {
+                FreeformBackend.taskById(taskId)?.let {
+                    XposedHelpers.callMethod(it, "getSurfaceControl") as? SurfaceControl
+                }
+            }.getOrNull() ?: leashes[taskId]
+            if (surface != null) {
+                val tx = SurfaceControl.Transaction()
+                XposedHelpers.callMethod(tx, "toggleClientDrawnRoundedCornersOpt", surface, false)
+                tx.apply()
+            }
+        }
     }
 
     /** 把当前 leash 变换写入给定事务（供过渡 start/finish 事务合并使用）。 */

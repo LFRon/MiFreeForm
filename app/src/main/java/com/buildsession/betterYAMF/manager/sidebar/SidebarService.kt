@@ -2,6 +2,7 @@ package com.buildsession.betterYAMF.manager.sidebar
 
 import android.app.Notification
 import android.app.NotificationChannel
+import com.buildsession.betterYAMF.BuildConfig
 import android.app.NotificationManager
 import android.app.Service
 import android.content.Intent
@@ -281,7 +282,7 @@ class SidebarService : Service() {
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
         } catch (e: Exception) {
-            Log.d("reYAMF", "Sidebar killed")
+            if (BuildConfig.DEBUG) Log.d("reYAMF", "Sidebar killed")
         }
         setServiceState(this, ServiceState.STOPPED)
     }

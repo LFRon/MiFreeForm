@@ -297,6 +297,9 @@ class AppWindow(
 
 
             binding.cvParent.radius = (config.windowRoundedCorner+2).dpToPx()
+            // 圆角裁剪在系统侧完成：会话期 SmoothTaskOrganizer 关闭"客户端自绘圆角"优化
+            // （toggleClientDrawnRoundedCornersOpt(false)），SF 直接对 leash 做圆角裁剪，
+            // 应用侧零圆角状态 → 无镜像、无残留；宿主侧不再需要遮罩视图。
             originalWidth = binding.cvParent.width
             originalHeight = binding.cvParent.height
             binding.cvParent.visibility = View.VISIBLE
@@ -344,7 +347,6 @@ class AppWindow(
         }
         YAMFManager.smoothFreeformTasks.remove(currentTaskId)
         YAMFManager.smoothFreeformBounds.remove(currentTaskId)
-        YAMFManager.smoothCornerRadiusPx.remove(currentTaskId)
         YAMFManager.smoothTaskActivities.remove(currentTaskId)
         
         runMain {
@@ -729,7 +731,6 @@ class AppWindow(
         } else {
             YAMFManager.chromeTouchHoles.remove(windowId)
         }
-        YAMFManager.smoothCornerRadiusPx[currentTaskId] = (config.windowRoundedCorner + 2).dpToPx().toInt()
 
         if (YAMFManager.smoothFreeformBounds[currentTaskId] != rect) {
             // 系统窗口后端：几何落地（leash 变换或兼容路径由实现决定，宿主不感知）
