@@ -140,6 +140,8 @@ object FreeformBackend {
     private fun applyTaskCornerRadius(task: Any) {
         val taskId = runCatching { XposedHelpers.getIntField(task, "mTaskId") }.getOrDefault(-1)
         if (!YAMFManager.smoothFreeformTasks.contains(taskId)) return
+        // leash 受管任务的圆角由 leash 链独占（含 /scale 补偿）；此处再写原始值会互相打架。
+        if (com.buildsession.betterYAMF.xposed.hook.organizer.SmoothTaskOrganizer.isLeashManaged(taskId)) return
         val cornerRadiusPx = YAMFManager.smoothCornerRadiusPx[taskId] ?: return
         if (cornerRadiusPx <= 0) return
         val surfaceControl = runCatching {

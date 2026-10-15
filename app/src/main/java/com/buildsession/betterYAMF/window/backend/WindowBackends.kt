@@ -23,7 +23,7 @@ object WindowBackends {
 private object NoopWindowBackend : WindowBackend {
     override fun initialize(callbacks: WindowBackendCallbacks) {}
     override fun openTask(taskId: Int): Boolean = false
-    override fun releaseTask(taskId: Int): Boolean = false
+    override fun releaseTask(taskId: Int, toFront: Boolean): Boolean = false
     override fun applyGeometry(taskId: Int, physicalBounds: Rect) {}
     override fun reapplyGeometry(taskId: Int) {}
     override fun ensureTaskVisible(taskId: Int) {}

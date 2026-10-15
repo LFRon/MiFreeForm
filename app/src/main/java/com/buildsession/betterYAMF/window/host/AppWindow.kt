@@ -323,13 +323,14 @@ class AppWindow(
         pendingReveal = false
         runMain { runCatching { binding.root.removeCallbacks(revealRunnable) } }
 
-        // 关闭小窗时任务回到全屏（否则任务会残留为没有外壳的 freeform 小窗）；
-        // 任务移交新壳（同任务重复开窗）时静默销毁，不做释放。
+        // 关闭小窗：任务复位为全屏并下沉到原父级栈底（后台、留在最近任务，不抢前台，
+        // 表面重建黑帧被上层遮挡）——"关闭"≠"最大化"。下拉全屏路径此前已显式置顶释放，
+        // 此处二次调用为 no-op；任务移交新壳（releaseTask=false）时静默销毁。
         if (releaseTask) {
             runCatching {
-                if (currentTaskId > 0) YAMFManager.switchTaskToFullscreen(currentTaskId)
+                if (currentTaskId > 0) YAMFManager.switchTaskToFullscreen(currentTaskId, toFront = false)
             }.onFailure {
-                log(TAG, "release task to fullscreen failed", it)
+                log(TAG, "release task to background failed", it)
             }
         }
         
@@ -347,6 +348,8 @@ class AppWindow(
         YAMFManager.smoothTaskActivities.remove(currentTaskId)
         
         runMain {
+            // 移除前先隐身：任何延迟都不留残影（白点回归的兜底）
+            runCatching { binding.root.visibility = View.INVISIBLE }
             if (binding.root.isAttachedToWindow) {
                 runCatching { Instances.windowManager.removeView(binding.root) }
             }
@@ -558,6 +561,11 @@ class AppWindow(
     }
 
     private fun execRequestClose(origin: CloseOrigin) {
+        // 关闭前刷新最近任务快照（应用此刻仍完整可见）：
+        // 否则系统在任务后台化时刻抓到的快照是收缩/隐藏后的空帧 → 最近任务卡片白屏。
+        if (currentTaskId > 0) {
+            runCatching { YAMFManager.refreshTaskSnapshot(currentTaskId) }
+        }
         when (origin) {
             CloseOrigin.DRAG_UP_BAR -> {
                 animateWindowShrinkAndClose()
@@ -596,10 +604,26 @@ class AppWindow(
             onDestroy()
             return
         }
+        // 关停收尾：控制条/缩放手柄立即撤出——它们不属于收缩动画，
+        // 且会被 wrap 根挤压变形留下"白色胶囊"残影（真机实证）。
+        binding.rlBarControllerBottom.visibility = View.GONE
+        binding.rlBarControllerSide.visibility = View.GONE
+        binding.ibRightResize.visibility = View.GONE
+        // 上滑预览（VerticalDragPreview）遗留的缩放/透明度复位：
+        // 关闭分支不会收到 ClearVerticalDragPreview，不复位则收缩动画自带 0.7×/半透明
+        binding.cvParent.scaleX = 1f
+        binding.cvParent.scaleY = 1f
+        binding.cvParent.alpha = 1f
+        binding.viewFullScreenMask.visibility = View.GONE
+        binding.tvFullScreenPrompt.visibility = View.GONE
         val cx = (from.left + from.right) / 2
         val cy = (from.top + from.bottom) / 2
         val to = android.graphics.Rect(cx - 2, cy - 2, cx + 2, cy + 2)
-        animateContentRect(from, to, geometryAnimDuration(220L)) { onDestroy() }
+        animateContentRect(from, to, geometryAnimDuration(220L)) {
+            // 动画结束先整壳隐身，再做释放/移除：即使移除被延迟也不留"白点"
+            binding.root.visibility = View.INVISIBLE
+            onDestroy()
+        }
     }
 
     private fun execRequestFullscreen(origin: FullscreenOrigin) {

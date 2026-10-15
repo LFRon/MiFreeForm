@@ -522,7 +522,11 @@ object SmoothTaskOrganizer {
                 }
 
                 val wct = newWct()
-                XposedHelpers.callMethod(wct, "setWindowingMode", token, WINDOWING_MODE_FREEFORM)
+                // 注意：不设置 FREEFORM 模式。真机实证（2026-10-15）：
+                // 任务一旦进入 FREEFORM，应用会收到 onMultiWindowModeChanged(true) 并切到
+                // 自带的"小窗圆角皮肤"（像素级绘制）；释放回全屏后应用不保证自行复原，
+                // 残留巨大圆角+黑边（旋转屏幕/重启才消失）。M7 几何完全由 leash 承载，
+                // 任务保持原窗口模式即可；菜单直启的任务本来就是 freeform，不受影响。
                 XposedHelpers.callMethod(wct, "setBounds", token, bounds)
                 // LineageOS 24.0：reparent 为三参 (child, parent, onTop)
                 XposedHelpers.callMethod(wct, "reparent", token, rootToken, true)
@@ -546,8 +550,12 @@ object SmoothTaskOrganizer {
         }.getOrDefault(false)
     }
 
-    /** 释放：复位 leash 变换（句柄仍有效时）→ reparent 回原父级 + 回全屏 → 交还系统 organizer。 */
-    fun releaseTask(taskId: Int): Boolean {
+    /**
+     * 释放：复位 leash 变换（句柄仍有效时）→ reparent 回原父级 + 回全屏 → 交还系统 organizer。
+     * [toFront]：reparent 落栈位置——true 置顶（下拉全屏）；false 沉到原父级栈底
+     * （关闭小窗：任务转后台、留在最近任务，不抢前台；表面重建帧被上层任务遮挡）。
+     */
+    fun releaseTask(taskId: Int, toFront: Boolean = true): Boolean {
         if (!adoptedTasks.contains(taskId)) return false
         // 释放期间抑制 onTaskVanished 回灌：organizer 切换产生的 vanish 不是"任务被移除"，
         // 若据此回调宿主销毁窗口会与释放流程重入（曾把宿主拖入 legacy 兜底并清掉任务缓存）。
@@ -558,25 +566,38 @@ object SmoothTaskOrganizer {
                 val runningTasks = XposedHelpers.callMethod(
                     Instances.activityTaskManager, "getTasks", Int.MAX_VALUE, false, false, -1
                 ) as? List<*> ?: return false
-                val info = runningTasks.find { XposedHelpers.getIntField(it, "taskId") == taskId } ?: return false
+                val info = runningTasks.find { XposedHelpers.getIntField(it, "taskId") == taskId } ?: run {
+                    // 任务已不存在（被划掉/进程死）：本地登记必须一并清掉，
+                    // 否则 adopted/leash 永久悬挂 → 后续路由与点按全部异常。
+                    forgetTask(taskId)
+                    updateRootVisibility()
+                    return false
+                }
                 val token = XposedHelpers.getObjectField(info, "token")
 
                 // 复位必须在 reparent 之前做：organizer 从我们切回系统侧时
                 // WindowContainer#migrateToNewSurfaceControl 会重建任务表面（新表面无变换），
                 // 但若路由判定组织者未变（极端时序）旧表面会保留，先把变换清干净保证回全屏干净。
+                // 逐步容错：任一步骤异常不得阻断 tx.apply（否则复位整体丢失，圆角/裁剪残留——真机实证）。
                 leashes[taskId]?.let { leash ->
+                    val tx = SurfaceControl.Transaction()
+                    runCatching { XposedHelpers.callMethod(tx, "setMatrix", leash, 1f, 0f, 0f, 1f) }
+                    runCatching { XposedHelpers.callMethod(tx, "setPosition", leash, 0f, 0f) }
                     runCatching {
-                        val tx = SurfaceControl.Transaction()
-                        XposedHelpers.callMethod(tx, "setMatrix", leash, 1f, 0f, 0f, 1f)
-                        XposedHelpers.callMethod(tx, "setPosition", leash, 0f, 0f)
                         XposedHelpers.callMethod(
                             tx, "setWindowCrop",
                             arrayOf<Class<*>>(SurfaceControl::class.java, Rect::class.java), leash, null
                         )
-                        XposedHelpers.callMethod(tx, "setCornerRadius", leash, 0f)
-                        XposedHelpers.callMethod(tx, "show", leash)
-                        tx.apply()
-                    }.onFailure { log(TAG, "reset leash failed task=$taskId", it) }
+                    }
+                    runCatching { XposedHelpers.callMethod(tx, "setCornerRadius", leash, 0f) }
+                    // toFront=false（关闭小窗→沉后台）：复位期间保持隐藏，
+                    // 避免"复位→reparent"之间以原始变换闪现一帧；true（下拉全屏）保持可见。
+                    if (toFront) {
+                        runCatching { XposedHelpers.callMethod(tx, "show", leash) }
+                    } else {
+                        runCatching { XposedHelpers.callMethod(tx, "hide", leash) }
+                    }
+                    runCatching { tx.apply() }.onFailure { log(TAG, "reset leash apply failed task=$taskId", it) }
                 }
 
                 val wct = newWct()
@@ -589,9 +610,13 @@ object SmoothTaskOrganizer {
                 XposedHelpers.callMethod(
                     wct, "reparent",
                     arrayOf(tokenClass, tokenClass, java.lang.Boolean.TYPE),
-                    token, origToken, true
+                    token, origToken, toFront
                 )
                 applyWct(wct)
+
+                // reparent 之后：对任务"当前表面"再显式复位一次——organizer 交接未重建表面
+                // （或极端时序下旧表面保留）时，保证回全屏的窗口不带我们的变换/圆角残留。
+                resetTaskSurfaceNow(taskId, token)
 
                 // 任务已离开我们的组织（organizer 变更时表面已迁移到新 SurfaceControl），释放自持句柄
                 leashes.remove(taskId)?.let { releaseQuietly(it) }
@@ -607,6 +632,37 @@ object SmoothTaskOrganizer {
         } finally {
             releasingTasks.remove(taskId)
         }
+    }
+
+    /** 对任务"当前表面"做一次显式复位（matrix/position/crop/cornerRadius/shadowRadius），幂等。 */
+    private fun resetTaskSurfaceNow(taskId: Int, tokenOverride: Any? = null): Boolean {
+        return runCatching {
+            val token = tokenOverride ?: run {
+                val runningTasks = XposedHelpers.callMethod(
+                    Instances.activityTaskManager, "getTasks", Int.MAX_VALUE, false, false, -1
+                ) as? List<*> ?: return false
+                val info = runningTasks.find { XposedHelpers.getIntField(it, "taskId") == taskId } ?: return false
+                XposedHelpers.getObjectField(info, "token")
+            }
+            val taskObj = resolveTaskByToken(token) ?: return false
+            val sc = XposedHelpers.callMethod(taskObj, "getSurfaceControl") as? SurfaceControl ?: return false
+            val scName = runCatching { sc.toString() }.getOrNull() ?: "?"
+            val tx = SurfaceControl.Transaction()
+            // 逐步容错：任一步骤异常不得阻断 tx.apply（否则复位整体丢失）。
+            runCatching { XposedHelpers.callMethod(tx, "setMatrix", sc, 1f, 0f, 0f, 1f) }
+            runCatching { XposedHelpers.callMethod(tx, "setPosition", sc, 0f, 0f) }
+            runCatching {
+                XposedHelpers.callMethod(
+                    tx, "setWindowCrop",
+                    arrayOf<Class<*>>(SurfaceControl::class.java, Rect::class.java), sc, null
+                )
+            }
+            runCatching { XposedHelpers.callMethod(tx, "setCornerRadius", sc, 0f) }
+            runCatching { XposedHelpers.callMethod(tx, "setShadowRadius", sc, 0f) }
+            tx.apply()
+            log(TAG, "surface reset task=$taskId sc=$scName")
+            true
+        }.onFailure { log(TAG, "surface reset failed task=$taskId", it) }.getOrDefault(false)
     }
 
     /** 计算并写入 leash 变换（等比缩放 + 居中 + crop=逻辑 bounds + 圆角），不 apply。 */

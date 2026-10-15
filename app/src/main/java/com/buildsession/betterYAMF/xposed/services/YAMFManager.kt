@@ -147,10 +147,17 @@ object YAMFManager : IYAMFManager.Stub() {
                                 }
                             }
                         } else if (windowingMode == WINDOWING_MODE_FULLSCREEN) {
-                            smoothFreeformTasks.remove(taskInfo.taskId)
-                            smoothFreeformBounds.remove(taskInfo.taskId)
-                            smoothCornerRadiusPx.remove(taskInfo.taskId)
-                            smoothTaskActivities.remove(taskInfo.taskId)
+                            // M7 起任务不再被切成 freeform：FULLSCREEN 任务也可能正被我们的
+                            // 窗口承载——只有"未被任何窗口承载"时才清登记（否则会话直接被拆散）。
+                            val hostedByWindow = activeWindows.values.any {
+                                it.currentTaskId == taskInfo.taskId
+                            }
+                            if (!hostedByWindow) {
+                                smoothFreeformTasks.remove(taskInfo.taskId)
+                                smoothFreeformBounds.remove(taskInfo.taskId)
+                                smoothCornerRadiusPx.remove(taskInfo.taskId)
+                                smoothTaskActivities.remove(taskInfo.taskId)
+                            }
                         }
                     }
                     "onTaskInfoChanged" -> {
@@ -492,17 +499,56 @@ object YAMFManager : IYAMFManager.Stub() {
         }
     }
 
-    fun switchTaskToFullscreen(taskId: Int): Boolean {
+    /**
+     * 释放平滑任务回全屏。
+     * [toFront]：true=置顶回前（下拉全屏路径）；false=沉到原父级栈底（关闭小窗：
+     * 任务转后台、留在最近任务，不抢当前前台）。
+     */
+    fun switchTaskToFullscreen(taskId: Int, toFront: Boolean = true): Boolean {
         smoothFreeformTasks.remove(taskId)
         smoothFreeformBounds.remove(taskId)
         smoothCornerRadiusPx.remove(taskId)
         smoothTaskActivities.remove(taskId)
 
         // 系统窗口后端：释放（organizer 优先，未接管任务走旧 WCT 回全屏兜底）
-        val released = windowBackend.releaseTask(taskId)
+        val released = windowBackend.releaseTask(taskId, toFront)
         // 流程层负责把最新受管集合同步给 Launcher（手势目标豁免；M6 批次2）
         broadcastManagedTaskIds()
         return released
+    }
+
+    /**
+     * 关闭前主动刷新任务快照（必须在应用仍完整可见时调用）。
+     * 背景：关闭流程会先把任务表面收缩/隐藏，再沉入后台；系统在"后台化"时刻自动抓的
+     * 快照恰好是空帧 → 最近任务卡片"白屏"。提前用当前完整画面刷新快照即可避免。
+     */
+    fun refreshTaskSnapshot(taskId: Int) {
+        runCatching {
+            val atm = Instances.activityTaskManager
+            val wm = XposedHelpers.getObjectField(atm, "mWindowManager") ?: return
+            val controller = runCatching {
+                val sc = XposedHelpers.getObjectField(wm, "mSnapshotController")
+                XposedHelpers.getObjectField(sc, "mTaskSnapshotController")
+            }.getOrNull()
+                ?: runCatching { XposedHelpers.getObjectField(wm, "mTaskSnapshotController") }.getOrNull()
+                ?: return
+            val runningTasks = XposedHelpers.callMethod(
+                atm, "getTasks", Int.MAX_VALUE, false, false, -1
+            ) as? List<*> ?: return
+            val info = runningTasks.find { XposedHelpers.getIntField(it, "taskId") == taskId } ?: return
+            val token = XposedHelpers.getObjectField(info, "token")
+            val binder = XposedHelpers.callMethod(token, "asBinder") as? android.os.IBinder ?: return
+            val wcClass = Instances.systemContext.classLoader
+                .loadClass("com.android.server.wm.WindowContainer")
+            val wc = XposedHelpers.callStaticMethod(wcClass, "fromBinder", binder) ?: return
+            val task = XposedHelpers.callMethod(wc, "asTask") ?: return
+            val set = android.util.ArraySet<Any>()
+            set.add(task)
+            XposedHelpers.callMethod(controller, "snapshotTasks", set)
+            log("reYAMF_debug", "refreshTaskSnapshot task=$taskId ok")
+        }.onFailure {
+            log("reYAMF_debug", "refreshTaskSnapshot failed task=$taskId", it)
+        }
     }
 
     init {
