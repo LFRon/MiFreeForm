@@ -47,7 +47,10 @@ import com.buildsession.betterYAMF.common.ui.animateAlpha
 import com.buildsession.betterYAMF.common.ui.dpToPx
 import com.buildsession.betterYAMF.databinding.WindowAppBinding
 import com.buildsession.betterYAMF.window.core.CloseOrigin
+import com.buildsession.betterYAMF.window.core.DropKind
 import com.buildsession.betterYAMF.window.core.FullscreenOrigin
+import com.buildsession.betterYAMF.window.core.MiniPolicy
+import com.buildsession.betterYAMF.window.core.PositionMemory
 import com.buildsession.betterYAMF.window.core.RegionId
 import com.buildsession.betterYAMF.window.core.WindowCommand
 import com.buildsession.betterYAMF.window.core.WindowInputEvent
@@ -110,8 +113,8 @@ class AppWindow(
     @Volatile
     private var chromeRevealed = false
     private val revealRunnable = Runnable { revealChrome() }
-    /** M7：进 mini 前的内容矩形（位置记忆）；退出 mini 回到此位置（见视频规范 §2.2） */
-    private var preMiniRect: android.graphics.Rect? = null
+    /** M7：进 mini 前的内容矩形（位置记忆，经核心纯逻辑）；退出 mini 回到此位置（见视频规范 §2.2） */
+    private val miniMemory = PositionMemory()
     private var flingXAnimation: FlingAnimation? = null
     private var flingYAnimation: FlingAnimation? = null
     private var dragAnchorX = 0
@@ -1044,20 +1047,6 @@ class AppWindow(
         return android.graphics.Rect(left, top, left + binding.cvParent.width, top + binding.cvParent.height)
     }
 
-    /**
-     * 屏内夹取（安全边距）：任何"自动定位"都必须保证窗口四边可见——
-     * 贴屏会让圆角/边框/阴影被屏幕边界裁掉（"边缘消失"回归的根因）。
-     */
-    private fun clampContentRect(leftIn: Int, topIn: Int, w: Int, h: Int): android.graphics.Rect {
-        val dm = context.resources.displayMetrics
-        val margin = 8.dpToPx().toInt()
-        val maxLeft = (dm.widthPixels - w - margin).coerceAtLeast(margin)
-        val maxTop = (dm.heightPixels - h - margin).coerceAtLeast(margin)
-        val left = leftIn.coerceIn(margin, maxLeft)
-        val top = topIn.coerceIn(margin, maxTop)
-        return android.graphics.Rect(left, top, left + w, top + h)
-    }
-
     /** 逐帧应用内容矩形：窗口位置 + 卡片尺寸 + leash 一次到位（同一几何事实源）。 */
     private fun applyContentRectFrame(rect: android.graphics.Rect) {
         val params = binding.root.layoutParams as? WindowManager.LayoutParams ?: return
@@ -1192,7 +1181,7 @@ class AppWindow(
         }
     }
 
-    private fun execEnterMini(corner: com.buildsession.betterYAMF.window.core.DropKind) {
+    private fun execEnterMini(corner: DropKind) {
         if (originalWidth <= 0 || originalHeight <= 0) {
             log(TAG, "execEnterMini skipped: size not measured")
             return
@@ -1209,43 +1198,23 @@ class AppWindow(
         contentTouchThrough = false
         WindowSessions.chromeTouchHoles.remove(windowId)
 
-        // 侧边最小化比角落 mini 再小一档（1/3），角落为 1/2
-        val isSide = corner == com.buildsession.betterYAMF.window.core.DropKind.SIDE_LEFT ||
-                corner == com.buildsession.betterYAMF.window.core.DropKind.SIDE_RIGHT
-        val miniDivisor = if (isSide) 3 else 2
-        val w = originalWidth / miniDivisor
-        val h = originalHeight / miniDivisor
-
         val dm = context.resources.displayMetrics
-        val margin = 8.dpToPx().toInt()
-        val topInset = 140
-        val bottomInset = 120
         val from = currentContentRect()
         // 位置记忆：记住进 mini 前的位置（重复进入不覆盖；退出 mini 回此位置）
-        if (preMiniRect == null) {
-            preMiniRect = from
-        }
-        // M7：内容矩形动画（chrome 与 leash 同源）——收缩与贴角在一个动画里完成
-        val to = when (corner) {
-            com.buildsession.betterYAMF.window.core.DropKind.CORNER_TL ->
-                android.graphics.Rect(margin, topInset + margin, margin + w, topInset + margin + h)
-            com.buildsession.betterYAMF.window.core.DropKind.CORNER_BL ->
-                android.graphics.Rect(margin, dm.heightPixels - bottomInset - margin - h,
-                    margin + w, dm.heightPixels - bottomInset - margin)
-            com.buildsession.betterYAMF.window.core.DropKind.CORNER_BR ->
-                android.graphics.Rect(dm.widthPixels - margin - w, dm.heightPixels - bottomInset - margin - h,
-                    dm.widthPixels - margin, dm.heightPixels - bottomInset - margin)
-            com.buildsession.betterYAMF.window.core.DropKind.SIDE_LEFT -> {
-                val y = (from?.top ?: 0).coerceIn(margin, (dm.heightPixels - h - margin).coerceAtLeast(margin))
-                android.graphics.Rect(margin, y, margin + w, y + h)
-            }
-            com.buildsession.betterYAMF.window.core.DropKind.SIDE_RIGHT -> {
-                val y = (from?.top ?: 0).coerceIn(margin, (dm.heightPixels - h - margin).coerceAtLeast(margin))
-                android.graphics.Rect(dm.widthPixels - margin - w, y, dm.widthPixels - margin, y + h)
-            }
-            else -> android.graphics.Rect(dm.widthPixels - margin - w, topInset + margin,
-                dm.widthPixels - margin, topInset + margin + h)
-        }
+        miniMemory.rememberIfAbsent(from?.toWindowRect())
+        // M7：内容矩形动画（chrome 与 leash 同源）——收缩与贴角在一个动画里完成；
+        // 目标几何由核心策略（MiniPolicy）计算，宿主只传值并执行
+        val to = MiniPolicy.enterTarget(
+            corner = corner,
+            screenWidth = dm.widthPixels,
+            screenHeight = dm.heightPixels,
+            originalWidth = originalWidth,
+            originalHeight = originalHeight,
+            marginPx = 8.dpToPx().toInt(),
+            topInsetPx = 140,
+            bottomInsetPx = 120,
+            currentTop = from?.top
+        ).toAndroidRect()
         animateContentRect(from ?: to, to, geometryAnimDuration())
     }
 
@@ -1262,16 +1231,18 @@ class AppWindow(
 
         val from = currentContentRect() ?: return
         // M7：位置记忆——回到进 mini 前的矩形；无记忆则围绕当前中心展开。
-        // 两者都经安全边距夹取（贴屏会让圆角/边框/阴影出屏 = "边缘消失"缺陷）。
-        val remembered = preMiniRect
-        preMiniRect = null
-        val to = if (remembered != null) {
-            clampContentRect(remembered.left, remembered.top, originalWidth, originalHeight)
-        } else {
-            val cx = (from.left + from.right) / 2
-            val cy = (from.top + from.bottom) / 2
-            clampContentRect(cx - originalWidth / 2, cy - originalHeight / 2, originalWidth, originalHeight)
-        }
+        // 两者都经安全边距夹取（贴屏会让圆角/边框/阴影出屏 = "边缘消失"缺陷）；
+        // 目标几何由核心策略（MiniPolicy）计算。
+        val dm = context.resources.displayMetrics
+        val to = MiniPolicy.exitTarget(
+            remembered = miniMemory.take(),
+            current = from.toWindowRect(),
+            originalWidth = originalWidth,
+            originalHeight = originalHeight,
+            screenWidth = dm.widthPixels,
+            screenHeight = dm.heightPixels,
+            marginPx = 8.dpToPx().toInt()
+        ).toAndroidRect()
         animateContentRect(from, to, geometryAnimDuration()) {
             // 终态恢复 wrap-content（保持既有布局约定，后续测量与吸附基于自然尺寸）
             setBackgroundWrapContent()
