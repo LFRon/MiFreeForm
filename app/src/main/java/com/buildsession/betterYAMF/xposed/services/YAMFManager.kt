@@ -311,8 +311,6 @@ object YAMFManager : IYAMFManager.Stub() {
                 // log(TAG, "send config: ${config.hookLauncher}")
                 putExtra(HookLauncher.EXTRA_HOOK_RECENT, config.hookLauncher.hookRecents)
                 putExtra(HookLauncher.EXTRA_HOOK_TASKBAR, config.hookLauncher.hookTaskbar)
-                putExtra(HookLauncher.EXTRA_HOOK_POPUP, config.hookLauncher.hookPopup)
-                putExtra(HookLauncher.EXTRA_HOOK_TRANSIENT_TASKBAR, config.hookLauncher.hookTransientTaskbar)
                 `package` = intent.getStringExtra("sender")
             }, 0)
         }

@@ -24,7 +24,6 @@ import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
-import android.view.ViewGroup
 import android.widget.ImageView
 import android.widget.TextView
 import android.widget.Toast
@@ -75,8 +74,6 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
 
         const val EXTRA_HOOK_RECENT = "hookRecent"
         const val EXTRA_HOOK_TASKBAR = "hookTaskbar"
-        const val EXTRA_HOOK_POPUP = "hookPopup"
-        const val EXTRA_HOOK_TRANSIENT_TASKBAR = "hookTransientTaskbar"
     }
 
     private var isRegistered = false
@@ -418,21 +415,10 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                 application.registerReceiver(ACTION_RECEIVE_LAUNCHER_CONFIG) { _, intent ->
                     val hookRecent = intent.getBooleanExtra(EXTRA_HOOK_RECENT, false)
                     val hookTaskbar = intent.getBooleanExtra(EXTRA_HOOK_TASKBAR, false)
-                    val hookPopup = intent.getBooleanExtra(EXTRA_HOOK_POPUP, false)
-                    val hookTransientTaskbar =
-                        intent.getBooleanExtra(EXTRA_HOOK_TRANSIENT_TASKBAR, false)
-                    /* log(
-                        TAG,
-                        "receive config hookRecent=$hookRecent hookTaskbar=$hookTaskbar hookPopup=$hookPopup hookTranslucentTaskbar=$hookTransientTaskbar"
-                    ) */
                     if (hookRecent) runCatching { hookRecent(lpparam) }.onFailure { e ->
                         log(TAG, "hook recent failed", e) }
                     if (hookTaskbar) runCatching { hookTaskbar(lpparam) }.onFailure { e ->
                         log(TAG, "hook taskbar failed", e) }
-                    if (hookPopup) runCatching { hookPopup(lpparam) }.onFailure { e ->
-                        log(TAG, "hook popup failed", e) }
-                    if (hookTransientTaskbar) runCatching { hookTransientTaskbar(lpparam) }.onFailure { e ->
-                        log(TAG, "hook transient failed", e) }
                     application.unregisterReceiver(this)
                 }
                 application.sendBroadcast(Intent(YAMFManager.ACTION_GET_LAUNCHER_CONFIG).apply {
@@ -561,30 +547,6 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                 }
         }
 
-    }
-
-    private var proxyClass: Any? = null
-
-    private fun hookPopup(lpparam: XC_LoadPackage.LoadPackageParam) {
-        // log(TAG, "hooking popup ${lpparam.packageName}")
-        loadClass("com.android.launcher3.popup.ArrowPopup").apply {
-            findMethod { name == "onVisibilityAggregated" }.hookAfter {
-                if (it.args[0] as Boolean) {
-                    val popup = it.thisObject as View
-                    val container = popup.parent as ViewGroup
-                    for (i in 0 until container.childCount) {
-                        val child = container.getChildAt(i)
-                        if (child::class.java.name.contains("SystemShortcut")) {
-                            // TODO
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    private fun hookTransientTaskbar(lpparam: XC_LoadPackage.LoadPackageParam) {
-        // log(TAG, "hooking transient taskbar ${lpparam.packageName}")
     }
 
     private fun suppressRecentsGesture(durationMs: Long) {
