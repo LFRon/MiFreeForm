@@ -1,6 +1,7 @@
 package com.buildsession.betterYAMF.window.backend
 
 import android.app.ActivityManager
+import android.content.ComponentName
 import android.graphics.Rect
 
 /**
@@ -23,9 +24,10 @@ object WindowBackends {
 
 private object NoopWindowBackend : WindowBackend {
     override fun initialize(callbacks: WindowBackendCallbacks) {}
-    override fun openTask(taskId: Int): Boolean = false
+    override fun openTask(taskId: Int, densityDpi: Int): Boolean = false
     override fun releaseTask(taskId: Int, toFront: Boolean): Boolean = false
     override fun applyGeometry(taskId: Int, physicalBounds: Rect) {}
+    override fun applyRealBounds(taskId: Int, bounds: Rect) {}
     override fun reapplyGeometry(taskId: Int) {}
     override fun ensureTaskVisible(taskId: Int) {}
     override fun setTaskFocusable(taskId: Int, focusable: Boolean) {}
@@ -42,4 +44,10 @@ private object NoopWindowBackend : WindowBackend {
     override fun suppressRecentsGestureFor(durationMs: Long) {}
     override fun recentsGestureSuppressUntilMs(): Long = 0L
     override fun injectHomeKey(): Boolean = false
+
+    override fun launchAppForSession(component: ComponentName, userId: Int, densityDpi: Int): Boolean = false
+
+    override fun discardTask(taskId: Int): Boolean = false
+
+    override fun isTaskInSessionRoot(taskInfo: ActivityManager.RunningTaskInfo): Boolean = false
 }

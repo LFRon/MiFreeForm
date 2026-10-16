@@ -6,7 +6,6 @@ import android.os.Binder
 import android.view.SurfaceControl
 import android.window.ITaskOrganizer
 import com.buildsession.betterYAMF.xposed.hook.freeform.FreeformBackend
-import com.buildsession.betterYAMF.xposed.services.YAMFManager.config
 import com.buildsession.betterYAMF.xposed.utils.Instances
 import com.buildsession.betterYAMF.xposed.utils.log
 import com.github.kyuubiran.ezxhelper.utils.findMethod
@@ -93,6 +92,51 @@ object SmoothTaskOrganizer {
 
     /** 承载根是否已具备 always-on-top 置顶身份（生效后宿主应让路，不再抢层）。 */
     fun isRootAlwaysOnTop(): Boolean = rootAlwaysOnTop
+
+    /**
+     * 承载根的 WindowContainerToken：启动时注入 `ActivityOptions#setLaunchRootTask`，
+     * 让应用任务**出生即在根下**（首帧起就处于根级密度覆盖，杜绝中途密度的重建/缓存残影）。
+     * 根未就绪时返回 null，调用方退回默认启动路径（认领兜底）。
+     */
+    fun launchRootToken(): Any? = floatingRootToken
+
+    /** 当前已落地的会话密度（0 = 尚未声明；幂等缓存，避免重复事务）。 */
+    @Volatile
+    private var sessionDensityDpi = 0
+
+    /**
+     * 会话密度落地（容器级覆盖，本方案唯一密度入口）：**逻辑层声明目标值，本实现负责贯彻执行**。
+     *
+     * `WindowContainerTransaction#setDensityDpi`（WindowContainerTransaction.java:197）写根容器
+     * 密度 override；`ConfigurationContainer#onConfigurationChanged`（ConfigurationContainer.java:151-159）
+     * "子全量配置=父全量配置+自身 override"——根下所有会话任务从出生/首帧即按目标密度构建；
+     * 任务退出根（回全屏）自动恢复显示器密度，无需逐任务设置与复位。
+     *
+     * 幂等：目标值未变不重发事务；根未就绪返回 false（调用方降级，下次会话入口重试）。
+     */
+    fun ensureSessionDensity(densityDpi: Int): Boolean {
+        if (densityDpi <= 0) return false
+        if (sessionDensityDpi == densityDpi) return true
+        val token = floatingRootToken ?: return false
+        return runCatching {
+            val wct = newWct()
+            XposedHelpers.callMethod(wct, "setDensityDpi", token, densityDpi)
+            applyWct(wct)
+            sessionDensityDpi = densityDpi
+            log(TAG, "session density=$densityDpi applied to floating root task=$floatingRootTaskId")
+            true
+        }.onFailure {
+            log(TAG, "ensureSessionDensity failed dpi=$densityDpi", it)
+        }.getOrDefault(false)
+    }
+
+    /** 该任务是否已处于承载根子树（出生即入根或已认领）；供"重启进入会话"判定。 */
+    fun isTaskInFloatingRoot(taskInfo: ActivityManager.RunningTaskInfo): Boolean = runCatching {
+        // token 为隐藏字段（SDK 存根不含），统一走反射（与本模块既有风格一致）
+        val token = XposedHelpers.getObjectField(taskInfo, "token") ?: return false
+        val task = resolveTaskByToken(token) ?: return false
+        isInOurSubtree(task)
+    }.getOrDefault(false)
 
     /** 受管任务 id（承载根 + 已认领子任务）：供 Launcher 手势目标过滤同步（M6 批次2）。 */
     fun managedTaskIds(): IntArray {
@@ -332,9 +376,26 @@ object SmoothTaskOrganizer {
                         wct, "setAlwaysOnTop",
                         arrayOf(tokenClass, java.lang.Boolean.TYPE), token, true
                     )
+                    // "重新启动即摘出会话根"（平台官方语义，TaskDisplayArea#getOrCreateRootTask:821-848
+                    // 消费该身份：reparentToTda 判定 → candidateTask.reparent(默认TDA)）：
+                    // - mReparentLeafTaskIfRelaunch：任意来源 relaunch 根内任务 → 自动摘回默认 TDA
+                    //   （= 退出小窗回全屏）；
+                    // - ...FromHome：桌面（最近任务点击/图标点击等）发起的 relaunch 同样生效。
+                    // 随后由 onTaskVanished → 宿主 onDestroy → releaseTask 收尾（含回全屏进程回收），
+                    // 实现"最近任务点一下 = 结束小窗、切回应用本体且密度正确"。
+                    XposedHelpers.callMethod(
+                        wct, "setReparentLeafTaskIfRelaunch",
+                        arrayOf(tokenClass, java.lang.Boolean.TYPE), token, true
+                    )
+                    XposedHelpers.callMethod(
+                        wct, "setReparentLeafTaskIfRelaunchFromHome",
+                        arrayOf(tokenClass, java.lang.Boolean.TYPE), token, true
+                    )
+                    // 会话密度不在此处落地：逻辑层在会话入口声明目标 dpi，
+                    // 由 ensureSessionDensity 在任务入根/启动前贯彻执行（见下）。
                     applyWct(wct)
                     rootAlwaysOnTop = true
-                    log(TAG, "floating root always-on-top applied task=$floatingRootTaskId")
+                    log(TAG, "floating root always-on-top + reparentIfRelaunch applied task=$floatingRootTaskId")
                 }
             }.onFailure {
                 log(TAG, "floating root always-on-top failed", it)
@@ -378,7 +439,8 @@ object SmoothTaskOrganizer {
         val leash = floatingRootLeash ?: return
         if (rootTaskId < 0) return
         runCatching {
-            val visible = adoptedTasks.isNotEmpty()
+            // 认领前的子任务（启动即入根）也在根内，需要根可见（否则启动画面被吞）。
+            val visible = adoptedTasks.isNotEmpty() || rootHasChildren()
             val tx = SurfaceControl.Transaction()
             if (visible) {
                 XposedHelpers.callMethod(tx, "show", leash)
@@ -391,6 +453,12 @@ object SmoothTaskOrganizer {
             log(TAG, "updateRootVisibility failed", it)
         }
     }
+
+    /** 承载根下是否已有子任务（认领前的启动任务也计入；根可见性判定用）。 */
+    private fun rootHasChildren(): Boolean = runCatching {
+        val task = resolveTaskByToken(floatingRootToken) ?: return false
+        (XposedHelpers.callMethod(task, "getChildCount") as? Int ?: 0) > 0
+    }.getOrDefault(false)
 
     /**
      * 解析注册表里"另一个" organizer（通常是系统壳 ShellTaskOrganizer）。
@@ -448,15 +516,15 @@ object SmoothTaskOrganizer {
                         SmoothWindowBackend.notifyTaskAdopted(taskId)
                     }
                     else -> {
-                        // 路由之后不应出现；防御：保持可见+单位变换
-                        runCatching {
-                            val tx = SurfaceControl.Transaction()
-                            XposedHelpers.callMethod(tx, "setMatrix", leash, 1f, 0f, 0f, 1f)
-                            XposedHelpers.callMethod(tx, "setPosition", leash, 0f, 0f)
-                            XposedHelpers.callMethod(tx, "show", leash)
-                            tx.apply()
+                        // 启动即入根（ActivityOptions#setLaunchRootTask）后，任务出生即在承载根内，
+                        // onTaskAppeared 会**早于认领**到达（这是常态路径）：先收编 leash（WM 在
+                        // 回调返回后立即 release 传入对象，见 ownLeash 注释），并让根可见——启动
+                        // 闪屏/首帧都在根内，根隐藏会吞掉启动画面。认领后的摆位回灌见 adoptTask 末尾。
+                        if (owned != null) {
+                            leashes.put(taskId, owned)?.let { old -> if (old !== owned) releaseQuietly(old) }
                         }
-                        log(TAG, "onTaskAppeared task=$taskId (passthrough)")
+                        updateRootVisibility()
+                        log(TAG, "onTaskAppeared task=$taskId (pre-adopt, leash cached)")
                     }
                 }
             }
@@ -512,7 +580,9 @@ object SmoothTaskOrganizer {
             val info = runningTasks.find { XposedHelpers.getIntField(it, "taskId") == taskId } ?: return false
             val token = XposedHelpers.getObjectField(info, "token")
             val parentTaskId = runCatching { XposedHelpers.getIntField(info, "parentTaskId") }.getOrDefault(-1)
-            if (parentTaskId != -1) {
+            // 启动即入根（ActivityOptions#setLaunchRootTask）时父级就是承载根本身：不能把它记为
+            // "原父级"，否则释放（回全屏）会把任务又塞回我们根里。回落默认 TaskDisplayArea（null）。
+            if (parentTaskId != -1 && parentTaskId != floatingRootTaskId) {
                 runningTasks.find { XposedHelpers.getIntField(it, "taskId") == parentTaskId }?.let {
                     originalParentTokens[taskId] = XposedHelpers.getObjectField(it, "token")
                 }
@@ -603,6 +673,10 @@ object SmoothTaskOrganizer {
 
             updateRootVisibility()
             log(TAG, "adoptTask task=$taskId bounds=$bounds root=$rootToken")
+            // 认领完成回灌：leash 已就绪，通知宿主按当前几何摆位并淡入。
+            // 启动即入根流程下 onTaskAppeared 早于认领（不会随认领再触发 adopted 分支），统一在此
+            // 点火；重复点火幂等（AppWindow#onOrganizerLeash 的重摆位/淡入均幂等）。
+            SmoothWindowBackend.notifyTaskAdopted(taskId)
             true
         }.onFailure {
             log(TAG, "adoptTask failed task=$taskId", it)
@@ -634,6 +708,14 @@ object SmoothTaskOrganizer {
                 }
                 val token = XposedHelpers.getObjectField(info, "token")
 
+                // 平台"重新启动即摘根"通路（TaskDisplayArea 摘根，如最近任务/图标点击）下，
+                // 任务在进入本方法前已离开我方根：此时若仍按 toFront=false 沉底，会把
+                // "用户点击/通知打开"的意图压到 home 之下（表现为"应用退出"）。
+                // 已摘根的场景一律保持在前（onTop=true）语义。
+                val taskObj = resolveTaskByToken(token)
+                val alreadyOutOfRoot = taskObj != null && !isInOurSubtree(taskObj)
+                val effectiveToFront = toFront || alreadyOutOfRoot
+
                 // 复位必须在 reparent 之前做：organizer 从我们切回系统侧时
                 // WindowContainer#migrateToNewSurfaceControl 会重建任务表面（新表面无变换），
                 // 但若路由判定组织者未变（极端时序）旧表面会保留，先把变换清干净保证回全屏干净。
@@ -661,9 +743,9 @@ object SmoothTaskOrganizer {
                             tx, "toggleClientDrawnRoundedCornersOpt", surface, true
                         )
                     }
-                    // toFront=false（关闭小窗→沉后台）：复位期间保持隐藏，
-                    // 避免"复位→reparent"之间以原始变换闪现一帧；true（下拉全屏）保持可见。
-                    if (toFront) {
+                    // 沉后台场景（effectiveToFront=false）：复位期间保持隐藏，
+                    // 避免"复位→reparent"之间以原始变换闪现一帧；回前场景保持可见。
+                    if (effectiveToFront) {
                         runCatching { XposedHelpers.callMethod(tx, "show", leash) }
                     } else {
                         runCatching { XposedHelpers.callMethod(tx, "hide", leash) }
@@ -681,7 +763,7 @@ object SmoothTaskOrganizer {
                 XposedHelpers.callMethod(
                     wct, "reparent",
                     arrayOf(tokenClass, tokenClass, java.lang.Boolean.TYPE),
-                    token, origToken, toFront
+                    token, origToken, effectiveToFront
                 )
                 applyWct(wct)
 
@@ -738,7 +820,7 @@ object SmoothTaskOrganizer {
         }.onFailure { log(TAG, "surface reset failed task=$taskId", it) }.getOrDefault(false)
     }
 
-    /** 计算并写入 leash 变换（等比缩放 + 居中 + crop=逻辑 bounds + 圆角），不 apply。 */
+    /** 计算并写入 leash 变换（非等比拉伸铺满 + crop=逻辑 bounds + 圆角复位 0），不 apply。 */
     private fun writeLeashTransform(
         tx: SurfaceControl.Transaction,
         taskId: Int,
@@ -748,38 +830,115 @@ object SmoothTaskOrganizer {
     ): Boolean {
         if (logical.width() <= 0 || logical.height() <= 0) return false
         if (physical.width() <= 0 || physical.height() <= 0) return false
-        val scale = min(
-            physical.width().toFloat() / logical.width(),
-            physical.height().toFloat() / logical.height()
-        )
-        if (scale <= 0f) return false
-        val scaledW = logical.width() * scale
-        val scaledH = logical.height() * scale
+        // 非等比缩放：应用按窗口比例拉伸铺满（用户裁定“不需要保持宽高比”）。
+        // 旧实现为等比 contain（min 比例）——窗口比例≠应用比例时会产生黑边，已废弃。
+        val scaleX = physical.width().toFloat() / logical.width()
+        val scaleY = physical.height().toFloat() / logical.height()
+        if (scaleX <= 0f || scaleY <= 0f) return false
+        val scaledW = logical.width() * scaleX
+        val scaledH = logical.height() * scaleY
         val posX = physical.left + (physical.width() - scaledW) / 2f
         val posY = physical.top + (physical.height() - scaledH) / 2f
 
-        XposedHelpers.callMethod(tx, "setMatrix", leash, scale, 0f, 0f, scale)
+        XposedHelpers.callMethod(tx, "setMatrix", leash, scaleX, 0f, 0f, scaleY)
         XposedHelpers.callMethod(tx, "setPosition", leash, posX, posY)
         XposedHelpers.callMethod(tx, "setWindowCrop", leash, logical)
-        // 圆角由 SurfaceFlinger 裁剪：写入值随 leash 矩阵缩放，视觉半径 = 写入值 × scale，
-        // 故写入值 = 视觉半径 / scale。应用侧自绘圆角已在 adoptTask 用
-        // toggleClientDrawnRoundedCornersOpt(false) 关掉 → 无镜像、会话结束无残留
-        // （旧 bug 病根 = 客户端自绘 + 状态滞留；源码：ThreadedRenderer#setCornerRadius /
-        // ViewRootImpl#prepareCornerRadiiForDraw / Transition.java:2163）。
+        // 圆角 = 0（应用本体方角，永不自绘、不裁剪）：可见圆角一律由宿主外壳装饰提供 ——
+        // 点击态=方角内容 + 顶/底栏手势（"可点击时不需要圆角"）；mini=贴边边框环盖住应用
+        // 方角、内沿圆角即视觉圆角（对齐澎湃OS"应用内没有圆角、圆角是装饰加的"模型）。
+        // 应用侧自绘圆角仍由 adoptTask 的 toggleClientDrawnRoundedCornersOpt(false) 关闭。
         // ⚠ 铁律（历史教训，勿删）：会话期间"客户端自绘圆角"必须保持关闭，否则应用会把
         // 圆角镜像为自身像素级裁剪且清不掉（残角值跟随写入值、活体证据 630→212px），
         // 只能旋转/重启应用消除。开关不放这里逐帧写（性能）：系统语义 = 转场作用域状态机
         // （转场开始 false、空闲收尾 true），且已用 TransitionController 源头闸拦掉对我方
         // 任务的"恢复 true"，再配合 adopt / reapplyLeash / release 三个状态点写入即可。
-        // 局部容错：圆角写入失败不得阻断 matrix/crop 的几何落地。
-        runCatching {
-            val density = Instances.systemContext.resources.displayMetrics.density
-            val cornerVisual = (config.windowRoundedCorner + 2) * density
-            val cornerLocal = (cornerVisual / scale)
-                .coerceAtMost(minOf(logical.width(), logical.height()) / 2f)
-            XposedHelpers.callMethod(tx, "setCornerRadius", leash, cornerLocal)
-        }.onFailure { log(TAG, "leash corner write failed task=$taskId", it) }
+        // 局部容错：圆角复位失败不得阻断 matrix/crop 的几何落地。
+        runCatching { XposedHelpers.callMethod(tx, "setCornerRadius", leash, 0f) }
+            .onFailure { log(TAG, "leash corner reset failed task=$taskId", it) }
         return true
+    }
+
+    /**
+     * 静止态：任务真实 bounds = 窗口矩形 —— WCT setBounds（应用按窗口尺寸自适应重排，
+     * 不拉伸快照），并把 leash 复位为"表面 = bounds"（矩阵单位/位置=原点/裁切清除/圆角 0）。
+     * 之后 applyLeash 的缩放以新 logical（本 bounds 尺寸）为基准；两者互斥使用。
+     */
+    fun applyRealBounds(taskId: Int, physical: Rect): Boolean {
+        val task = FreeformBackend.taskById(taskId) ?: run {
+            log(TAG, "applyRealBounds: task not found task=$taskId")
+            return false
+        }
+        return runCatching {
+            // ⚠ WindowContainerToken 必须取自 RunningTaskInfo.token：
+            // 服务端 Task#getToken() 恒为 null（仅远端镜像持有 mRemoteToken）——
+            // 曾致本方法全程静默 return false、真实重排从未生效（真机 logcat 实证）。
+            val info = taskInfoById(taskId) ?: run {
+                log(TAG, "applyRealBounds: no taskInfo task=$taskId")
+                return false
+            }
+            val token = XposedHelpers.getObjectField(info, "token") ?: run {
+                log(TAG, "applyRealBounds: no token task=$taskId")
+                return false
+            }
+            val current = runCatching { XposedHelpers.callMethod(task, "getBounds") as? Rect }.getOrNull()
+            logicalBounds[taskId] = Rect(0, 0, physical.width(), physical.height())
+
+            if (current == physical) {
+                // 任务 bounds 已就位：只需普通事务把 leash 从缩放态复位（幂等，无中间帧）
+                resetLeashToBounds(taskId, physical)
+                return true
+            }
+
+            val leash = leashes[taskId]
+            val wct = newWct()
+            if (leash != null) {
+                // ⚠ 关键（LoS 24.0 源码对齐）：复位必须与 bounds 变更**原子同步**应用。
+                // WindowContainerTransaction#setBoundsChangeTransaction 语义："the server will
+                // apply [the transaction] in sync with the next bounds change"（见 WOC
+                // applyChanges → tr.setMainWindowSizeChangeTransaction）。
+                // 旧实现（WCT 异步落 bounds + 立即普通事务复位）会产生中间帧：
+                // "全屏表面 + 已复位变换" = 全屏闪帧，随后跳回窗口 —— 真机"拉伸↔全屏横跳"根因。
+                val reset = SurfaceControl.Transaction()
+                XposedHelpers.callMethod(reset, "setMatrix", leash, 1f, 0f, 0f, 1f)
+                XposedHelpers.callMethod(reset, "setPosition", leash, physical.left.toFloat(), physical.top.toFloat())
+                XposedHelpers.callMethod(
+                    reset, "setWindowCrop",
+                    arrayOf<Class<*>>(SurfaceControl::class.java, Rect::class.java), leash, null
+                )
+                XposedHelpers.callMethod(reset, "setCornerRadius", leash, 0f)
+                XposedHelpers.callMethod(wct, "setBoundsChangeTransaction", token, reset)
+            }
+            XposedHelpers.callMethod(wct, "setBounds", token, physical)
+            applyWct(wct)
+            // 密度覆盖已上收承载根（容器作用域，见 createFloatingRoot），此处只落 bounds。
+            log(TAG, "real bounds task=$taskId rect=$physical (atomic reset, density=root-scoped)")
+            true
+        }.onFailure { log(TAG, "applyRealBounds failed task=$taskId rect=$physical", it) }
+            .getOrDefault(false)
+    }
+
+    /** 取任务 RunningTaskInfo（token 的唯一可靠来源；与 release 路径同一取法）。 */
+    private fun taskInfoById(taskId: Int): Any? = runCatching {
+        val runningTasks = XposedHelpers.callMethod(
+            Instances.activityTaskManager, "getTasks", Int.MAX_VALUE, false, false, -1
+        ) as? List<*> ?: return null
+        runningTasks.find { XposedHelpers.getIntField(it, "taskId") == taskId }
+    }.getOrNull()
+
+    /** leash 复位到静止态：表面即 bounds（幂等；过渡收尾亦可重申）。 */
+    fun resetLeashToBounds(taskId: Int, physical: Rect) {
+        val leash = leashes[taskId] ?: return
+        runCatching {
+            val tx = SurfaceControl.Transaction()
+            XposedHelpers.callMethod(tx, "setMatrix", leash, 1f, 0f, 0f, 1f)
+            XposedHelpers.callMethod(tx, "setPosition", leash, physical.left.toFloat(), physical.top.toFloat())
+            XposedHelpers.callMethod(
+                tx, "setWindowCrop",
+                arrayOf<Class<*>>(SurfaceControl::class.java, Rect::class.java), leash, null
+            )
+            XposedHelpers.callMethod(tx, "setCornerRadius", leash, 0f)
+            tx.apply()
+        }.onFailure { log(TAG, "resetLeashToBounds failed task=$taskId", it) }
     }
 
     /** 对窗口任务 leash 摆位：等比缩放（整屏→卡片）+ 居中 + crop=整屏 + 圆角。 */

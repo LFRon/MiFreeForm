@@ -1,6 +1,7 @@
 package com.buildsession.betterYAMF.window.backend
 
 import android.app.ActivityManager
+import android.content.ComponentName
 import android.graphics.Rect
 
 /**
@@ -25,8 +26,10 @@ interface WindowBackend {
     /**
      * 打开：把任务认领为平滑窗口（freeform + 承载根 + 变换接管），
      * 置前并恢复可聚焦。返回是否成功认领。
+     * [densityDpi]：会话目标密度——**逻辑层声明**；执行层负责落地（承载根容器级覆盖，
+     * 保证任务归入会话后即处于该密度之下），调用方不感知任何落地细节。
      */
-    fun openTask(taskId: Int): Boolean
+    fun openTask(taskId: Int, densityDpi: Int): Boolean
 
     /**
      * 关闭/释放：任务回到全屏并交还系统管理（含表面变换复位与焦点恢复）。
@@ -42,6 +45,12 @@ interface WindowBackend {
      * 实现自行选择承载方式（leash 变换 / 兼容路径），调用方不感知。
      */
     fun applyGeometry(taskId: Int, physicalBounds: Rect)
+
+    /**
+     * 静止态几何 = 真实窗口 bounds：应用按窗口尺寸自行重排（不缩放快照、不拉伸）。
+     * 与 [applyGeometry]（动画/mini 的缩放态）成对使用：静止用本方法、过渡用前者。
+     */
+    fun applyRealBounds(taskId: Int, bounds: Rect)
 
     /** 稳态重施加（过渡结束后防系统重置冲掉变换；几何未就绪时 no-op）。 */
     fun reapplyGeometry(taskId: Int)
@@ -70,6 +79,30 @@ interface WindowBackend {
      * 供流程层做跨进程同步（如 Launcher 手势目标豁免）；未接管的实现返回空数组。
      */
     fun managedTaskIds(): IntArray
+
+    /**
+     * 以"小窗会话"语义启动应用（**意图级**：freeform 目标、会话承载细节——如 organizer
+     * 承载根绑定——全部由实现负责，根未就绪等降级也在实现内兜底）。
+     * [densityDpi]：会话目标密度（逻辑层声明）——实现须保证应用**出生即处于该密度之下**
+     * （先落地会话密度再绑定启动），避免"先按显示器密度渲染、再中途改密度"的重建与缓存残影。
+     * 返回是否已发出启动请求；流程层不感知任何系统侧标识与执行细节。
+     */
+    fun launchAppForSession(component: ComponentName, userId: Int, densityDpi: Int): Boolean
+
+    /**
+     * 结束一个既有任务（实现层：从最近任务移除并结束**承载该任务的 UI 进程**）。
+     * 用途 = "重启进入会话"：既有任务的应用已在显示器密度下渲染过（视图已按旧密度构建、
+     * 进程级资源缓存已污染），就地认领 + 中途改密度得不到正确首帧——必须先结束它，
+     * 再经 [launchAppForSession] 全新启动（出生即入根 → 首帧即会话密度、缓存干净）。
+     * 实现应尽量缩小杀伤面（仅 UI 进程；推送/下载等子进程保留）。
+     */
+    fun discardTask(taskId: Int): Boolean
+
+    /**
+     * 该任务是否已处于会话承载根之下（出生即入根 / 已认领）。
+     * 供流程层区分"我方启动/认领的任务"（可就地认领）与"外部启动的任务"（需重启进入会话）。
+     */
+    fun isTaskInSessionRoot(taskInfo: ActivityManager.RunningTaskInfo): Boolean
 
     /** 最近一次落地的任务物理矩形（会话内）；未落地/已释放返回 null。 */
     fun currentGeometry(taskId: Int): Rect?
