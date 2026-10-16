@@ -352,16 +352,37 @@ object FreeformBackend {
         }.getOrNull()
     }
 
+    /**
+     * 是否强制禁止该 Activity 因配置变更而重启。
+     *
+     * ⚠ 铁律（2026-10 真机实锤 + 源码对证）：宿主小窗任务（hostedTasks）**不可**抑制重启。
+     * 旧实现对宿主任务一律返回 true，导致密度覆盖"只上报、不重绘"：
+     * `WindowContainerTransaction.setDensityDpi`（WindowContainerTransaction.java:197）的配置
+     * 能完整到达应用进程（dumpsys 里 ActivityRecord.mLastReportedConfigurations /
+     * ProcessRecord.mLastReportedConfiguration 均已是目标 dpi），但
+     * `ActivityRecord.ensureActivityConfiguration`（ActivityRecord.java:8550）第 8672 行
+     * `shouldRelaunchLocked` 被钩子强制为 false、第 8695 行 `relaunchActivityLocked` 又被整体跳过
+     * ——应用永远按旧密度的像素渲染（"dpi 不生效"表象的根因）。
+     *
+     * 平滑小窗（真实重排架构）下 leash 持有的是 Task 表面，Activity 重建不影响会话稳定性，
+     * 因此宿主任务必须放行系统标准语义：声明了 screenSize/smallestScreenSize 的应用
+     * 纯尺寸变化自然不重建（顺滑重排）；未声明 density 的应用在密度变化时正常重建重绘
+     * （这正是密度覆盖生效的必要条件）。
+     *
+     * 旧 freeform 兼容路径（非宿主任务）仍保留用户可选的全局抑制开关。
+     */
     private fun shouldForcePreventRelaunch(activityRecord: Any): Boolean {
         return runCatching {
             val task = XposedHelpers.callMethod(activityRecord, "getTask") ?: return false
             val taskId = XposedHelpers.getIntField(task, "mTaskId")
 
-            val isSmoothTask = WindowSessions.hostedTasks.contains(taskId)
+            // 宿主小窗任务：一律放行系统标准重启语义（见上方铁律说明）。
+            if (WindowSessions.hostedTasks.contains(taskId)) return false
+            // 释放/重排途中（leash 句柄仍在）同样不得抑制：密度/尺寸变更必须让平台按标准语义
+            // 重建 Activity，否则出现"回全屏不重绘、仍是小密度"（真机实证）。
+            if (com.buildsession.betterYAMF.xposed.hook.organizer.SmoothTaskOrganizer.isLeashManaged(taskId)) return false
+
             val isForcePrevent = runCatching { YAMFManager.config.forcePreventRelaunch }.getOrDefault(false)
-            
-            if (isSmoothTask) return true
-            
             if (isForcePrevent) {
                 val windowingMode = XposedHelpers.callMethod(task, "getWindowingMode") as Int
 

@@ -45,8 +45,20 @@ object YAMFManager : IYAMFManager.Stub() {
 
     private const val LEGACY_DEFAULT_WINDOW_HEIGHT = 380
 
+    /**
+     * 会话应用密度（dpi）——**逻辑层策略声明**：小窗会话中的应用按此密度渲染
+     * （观感对齐参考图的等效密度测量值）。
+     *
+     * 逻辑层只声明"应用多少 dpi"；怎么落地（承载根容器级密度覆盖、WCT、
+     * 启动即入根等全部系统细节）是执行抽象层/实现层的职责（见 `WindowBackend` 端口）。
+     */
+    private const val SESSION_DENSITY_DPI = 280
+
     private val activeWindows = mutableMapOf<Int, WindowHost>()
     val pendingSmoothFreeformApps = mutableMapOf<ComponentName, WindowHost>()
+
+    /** "重启进入会话"防重入：组件 → 上次重启时间（uptimeMillis）；5s 节流防启动失败循环。 */
+    private val sessionRestartAtMs = java.util.concurrent.ConcurrentHashMap<ComponentName, Long>()
     lateinit var config: Config
     val configFile = File("/data/system/BetterYAMF.json")
 
@@ -89,13 +101,34 @@ object YAMFManager : IYAMFManager.Stub() {
                             if (topActivity != null) {
                                 val pendingWindow = pendingSmoothFreeformApps[topActivity]
                                 if (pendingWindow != null) {
-                                    log("reYAMF_debug", "claim task=${taskInfo.taskId} activity=$topActivity")
-                                    WindowSessions.hostedTasks.add(taskInfo.taskId)
-                                    pendingSmoothFreeformApps.remove(topActivity)
-                                    // Trigger a config change to apply spoofing/scaling immediately
-                                    switchToSmoothFreeform(taskInfo.taskId)
-                                    pendingWindow.currentTaskId = taskInfo.taskId
-                                    pendingWindow.onTaskMovedToFront(taskInfo)
+                                    val inSessionRoot = windowBackend.isTaskInSessionRoot(taskInfo)
+                                    val restartThrottleOk =
+                                        SystemClock.uptimeMillis() - (sessionRestartAtMs[topActivity] ?: 0L) > 5000L
+                                    if (!inSessionRoot && restartThrottleOk) {
+                                        // 陈旧待认领命中了外部（桌面等）启动的任务：应用已按显示器
+                                        // 密度渲染过（视图+进程缓存均为旧密度），不能就地认领（中途改
+                                        // 密度=首帧污染）。逻辑层链条 = 结束既有任务（旧密度进程缓存）
+                                        // → 以 SESSION_DENSITY_DPI 全新启动进入会话（出生即入根，
+                                        // 首帧即会话密度）；新任务到前台后会再次到达本分支被正常认领。
+                                        // 5s 节流防启动失败循环。
+                                        log("reYAMF_debug", "claim restart task=${taskInfo.taskId} activity=$topActivity (not in session root)")
+                                        sessionRestartAtMs[topActivity] = SystemClock.uptimeMillis()
+                                        windowBackend.discardTask(taskInfo.taskId)
+                                        val userId = XposedHelpers.getIntField(taskInfo, "userId")
+                                        windowBackend.launchAppForSession(topActivity, userId, SESSION_DENSITY_DPI)
+                                    } else {
+                                        if (!inSessionRoot) {
+                                            log("reYAMF_debug", "claim fallback-adopt task=${taskInfo.taskId} (restart throttled)")
+                                        }
+                                        log("reYAMF_debug", "claim task=${taskInfo.taskId} activity=$topActivity")
+                                        WindowSessions.hostedTasks.add(taskInfo.taskId)
+                                        pendingSmoothFreeformApps.remove(topActivity)
+                                        sessionRestartAtMs.remove(topActivity)
+                                        // Trigger a config change to apply spoofing/scaling immediately
+                                        switchToSmoothFreeform(taskInfo.taskId)
+                                        pendingWindow.currentTaskId = taskInfo.taskId
+                                        pendingWindow.onTaskMovedToFront(taskInfo)
+                                    }
                                 }
                             }
                         } else if (windowingMode == WINDOWING_MODE_FULLSCREEN) {
@@ -329,37 +362,42 @@ object YAMFManager : IYAMFManager.Stub() {
             }
 
             if (taskId != -1) {
-                switchToSmoothFreeform(taskId)
-                window.currentTaskId = taskId
+                // 用户从最近任务/回收区开小窗：既有任务的应用已在显示器密度下渲染过
+                // （视图按旧密度构建、进程级资源缓存已污染），就地认领 + 中途改密度得不到
+                // 正确首帧（实锤：全大 / 部分超大混排）。逻辑层链条 = **重启进入会话**：
+                // 结束既有任务（连旧密度的进程缓存一并清掉）→ 以 SESSION_DENSITY_DPI 全新
+                // 启动（出生即入根，首帧即会话密度）；具体怎么杀、怎么落地密度是执行层的职责。
+                // 已在会话根内的任务（重复开窗）或信息解析失败时，退回就地认领（旧路径）。
+                val info = taskInfoById(taskId)
+                val component = info?.topActivity ?: info?.baseActivity
+                if (info != null && component != null && !windowBackend.isTaskInSessionRoot(info)) {
+                    log("reYAMF_debug", "reopen-as-session task=$taskId component=$component (restart, dpi=$SESSION_DENSITY_DPI)")
+                    windowBackend.discardTask(taskId)
+                    pendingSmoothFreeformApps[component] = window
+                    windowBackend.launchAppForSession(component, XposedHelpers.getIntField(info, "userId"), SESSION_DENSITY_DPI)
+                } else {
+                    WindowSessions.hostedTasks.add(taskId)
+                    switchToSmoothFreeform(taskId)
+                    window.currentTaskId = taskId
+                }
             } else if (startCmd?.componentName != null) {
                 pendingSmoothFreeformApps[startCmd.componentName] = window
-                // Start new activity in freeform
-                val options = android.app.ActivityOptions.makeBasic()
-                XposedHelpers.callMethod(options, "setLaunchWindowingMode", WINDOWING_MODE_FREEFORM)
-                
-                val intent = Intent().apply {
-                    component = startCmd.componentName
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_DOCUMENT)
-                    addFlags(Intent.FLAG_ACTIVITY_MULTIPLE_TASK)
-                }
-                
-                val userHandle = XposedHelpers.callStaticMethod(
-                    android.os.UserHandle::class.java,
-                    "of",
-                    startCmd.userId ?: 0
-                )
-                
-                XposedHelpers.callMethod(
-                    Instances.systemContext,
-                    "startActivityAsUser",
-                    intent,
-                    options.toBundle(),
-                    userHandle
-                )
+                // 意图级调用：以"小窗会话 + SESSION_DENSITY_DPI 密度"语义启动该应用——
+                // freeform 目标、密度落地（承载根容器级覆盖）、启动即入根等执行细节全部由
+                // 实现层负责（出生即处于会话密度之下，避免中途密度变更引发的重建/缓存残影）。
+                windowBackend.launchAppForSession(startCmd.componentName, startCmd.userId ?: 0, SESSION_DENSITY_DPI)
             }
         }
     }
+
+    /** 按 taskId 查询 RunningTaskInfo（流程书用的任务快照；失败返回 null）。 */
+    private fun taskInfoById(taskId: Int): android.app.ActivityManager.RunningTaskInfo? = runCatching {
+        val runningTasks = XposedHelpers.callMethod(
+            Instances.activityTaskManager, "getTasks", Int.MAX_VALUE, false, false, -1
+        ) as? List<*> ?: return null
+        runningTasks.filterIsInstance<android.app.ActivityManager.RunningTaskInfo>()
+            .find { it.taskId == taskId }
+    }.getOrNull()
 
     /** organizer 路径：任务的 leash 已就绪，让宿主按当前物理矩形摆放 */
     fun onOrganizerTaskAppeared(taskId: Int) {
@@ -421,8 +459,9 @@ object YAMFManager : IYAMFManager.Stub() {
         }.getOrNull()?.let { WindowSessions.taskActivities[taskId] = it }
 
         // 系统窗口后端：认领（organizer/leash）+ 置前 + 恢复可聚焦；
+        // 会话密度由逻辑层声明（SESSION_DENSITY_DPI），落地方式（承载根容器级覆盖）由执行层负责；
         // 只走后端路径，失败大声报错，不再悄悄回退旧行为
-        if (!windowBackend.openTask(taskId)) {
+        if (!windowBackend.openTask(taskId, SESSION_DENSITY_DPI)) {
             log("reYAMF_debug", "ERROR organizer adopt failed task=$taskId (no fallback)")
         }
     }
