@@ -6,6 +6,9 @@ data class StartCmd(
     val componentName: ComponentName? = null,
     val userId: Int? = null,
     val taskId: Int? = null,
-    val openAsMini: Boolean = false
+    val openAsMini: Boolean = false,
+    /** 回收区投放时的松手点（屏坐标，-1 = 未知）。小窗登场动画从该点区域飞入磁吸槽位。 */
+    val dropX: Int = -1,
+    val dropY: Int = -1
 )
 

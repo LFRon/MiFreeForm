@@ -343,6 +343,9 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                                         putExtra(Protocol.EXTRA_TASK_ID, mCurrentTaskId)
                                         putExtra(Protocol.EXTRA_SOURCE, Protocol.SOURCE_RECENT)
                                         putExtra(Protocol.EXTRA_FROM_DROP_ZONE, true)
+                                        // 松手点（屏坐标）：小窗登场动画从该点区域收缩飞入磁吸槽位
+                                        putExtra(Protocol.EXTRA_DROP_X, correctedX.toInt())
+                                        putExtra(Protocol.EXTRA_DROP_Y, correctedY.toInt())
                                     }
                                     AndroidAppHelper.currentApplication().sendBroadcast(intent)
                                     log(TAG, "Sent broadcast to open task $mCurrentTaskId in YAMF")

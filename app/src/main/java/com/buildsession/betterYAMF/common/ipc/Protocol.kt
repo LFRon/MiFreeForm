@@ -29,6 +29,8 @@ object Protocol {
     const val EXTRA_SOURCE = "source"
     const val EXTRA_SUPPRESS_MS = "suppressMs"
     const val EXTRA_FROM_DROP_ZONE = "fromDropZone"
+    const val EXTRA_DROP_X = "dropX"
+    const val EXTRA_DROP_Y = "dropY"
     const val EXTRA_MANAGED_TASK_IDS = "managedTaskIds"
     const val EXTRA_HOOK_RECENT = "hookRecent"
     const val EXTRA_HOOK_TASKBAR = "hookTaskbar"
