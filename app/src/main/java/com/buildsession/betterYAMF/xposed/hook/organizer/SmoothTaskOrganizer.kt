@@ -95,40 +95,10 @@ object SmoothTaskOrganizer {
 
     /**
      * 承载根的 WindowContainerToken：启动时注入 `ActivityOptions#setLaunchRootTask`，
-     * 让应用任务**出生即在根下**（首帧起就处于根级密度覆盖，杜绝中途密度的重建/缓存残影）。
+     * 让应用任务**出生即在根下**（容器兜底路径的任务归属语义；小窗不改应用 DPI）。
      * 根未就绪时返回 null，调用方退回默认启动路径（认领兜底）。
      */
     fun launchRootToken(): Any? = floatingRootToken
-
-    /** 当前已落地的会话密度（0 = 尚未声明；幂等缓存，避免重复事务）。 */
-    @Volatile
-    private var sessionDensityDpi = 0
-
-    /**
-     * 会话密度落地（容器级覆盖，本方案唯一密度入口）：**逻辑层声明目标值，本实现负责贯彻执行**。
-     *
-     * `WindowContainerTransaction#setDensityDpi`（WindowContainerTransaction.java:197）写根容器
-     * 密度 override；`ConfigurationContainer#onConfigurationChanged`（ConfigurationContainer.java:151-159）
-     * "子全量配置=父全量配置+自身 override"——根下所有会话任务从出生/首帧即按目标密度构建；
-     * 任务退出根（回全屏）自动恢复显示器密度，无需逐任务设置与复位。
-     *
-     * 幂等：目标值未变不重发事务；根未就绪返回 false（调用方降级，下次会话入口重试）。
-     */
-    fun ensureSessionDensity(densityDpi: Int): Boolean {
-        if (densityDpi <= 0) return false
-        if (sessionDensityDpi == densityDpi) return true
-        val token = floatingRootToken ?: return false
-        return runCatching {
-            val wct = newWct()
-            XposedHelpers.callMethod(wct, "setDensityDpi", token, densityDpi)
-            applyWct(wct)
-            sessionDensityDpi = densityDpi
-            log(TAG, "session density=$densityDpi applied to floating root task=$floatingRootTaskId")
-            true
-        }.onFailure {
-            log(TAG, "ensureSessionDensity failed dpi=$densityDpi", it)
-        }.getOrDefault(false)
-    }
 
     /** 该任务是否已处于承载根子树（出生即入根或已认领）；供"重启进入会话"判定。 */
     fun isTaskInFloatingRoot(taskInfo: ActivityManager.RunningTaskInfo): Boolean = runCatching {
@@ -381,8 +351,8 @@ object SmoothTaskOrganizer {
                     // - mReparentLeafTaskIfRelaunch：任意来源 relaunch 根内任务 → 自动摘回默认 TDA
                     //   （= 退出小窗回全屏）；
                     // - ...FromHome：桌面（最近任务点击/图标点击等）发起的 relaunch 同样生效。
-                    // 随后由 onTaskVanished → 宿主 onDestroy → releaseTask 收尾（含回全屏进程回收），
-                    // 实现"最近任务点一下 = 结束小窗、切回应用本体且密度正确"。
+                    // 随后由 onTaskVanished → 宿主 onDestroy → releaseTask 收尾（回全屏迁移），
+                    // 实现"最近任务点一下 = 结束小窗、切回应用本体"。
                     XposedHelpers.callMethod(
                         wct, "setReparentLeafTaskIfRelaunch",
                         arrayOf(tokenClass, java.lang.Boolean.TYPE), token, true
@@ -391,8 +361,6 @@ object SmoothTaskOrganizer {
                         wct, "setReparentLeafTaskIfRelaunchFromHome",
                         arrayOf(tokenClass, java.lang.Boolean.TYPE), token, true
                     )
-                    // 会话密度不在此处落地：逻辑层在会话入口声明目标 dpi，
-                    // 由 ensureSessionDensity 在任务入根/启动前贯彻执行（见下）。
                     applyWct(wct)
                     rootAlwaysOnTop = true
                     log(TAG, "floating root always-on-top + reparentIfRelaunch applied task=$floatingRootTaskId")
@@ -910,8 +878,8 @@ object SmoothTaskOrganizer {
             }
             XposedHelpers.callMethod(wct, "setBounds", token, physical)
             applyWct(wct)
-            // 密度覆盖已上收承载根（容器作用域，见 createFloatingRoot），此处只落 bounds。
-            log(TAG, "real bounds task=$taskId rect=$physical (atomic reset, density=root-scoped)")
+            // bounds 落点：无任何密度覆盖——应用密度恒为默认显示器值（小窗不改应用 DPI）。
+            log(TAG, "real bounds task=$taskId rect=$physical (no density override)")
             true
         }.onFailure { log(TAG, "applyRealBounds failed task=$taskId rect=$physical", it) }
             .getOrDefault(false)

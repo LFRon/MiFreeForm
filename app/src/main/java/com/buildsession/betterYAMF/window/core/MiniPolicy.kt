@@ -3,9 +3,11 @@ package com.buildsession.betterYAMF.window.core
 /**
  * mini/贴边几何策略（纯逻辑，零平台依赖；宿主只负责传值与执行）。
  *
- * 模型（参考澎湃OS 5.jpg）：mini 目标 = **屏幕比例尺寸**——窗宽 ≈ 屏宽 28.5%、
- * 窗高 ≈ 屏高 20%；与角落/侧边无关（只影响贴靠位置）。应用在框内拉伸铺满
- * （不保比例，见 writeLeashTransform），故 mini 尺寸不再随应用内容区/分除变化。
+ * 模型（参考澎湃OS 帧_02/帧_05）：**mini 与展开态是同一 UI 的纯缩放——宽高比完全一致**。
+ * mini 尺寸 = 当前窗口内容区等比缩放到磁吸槽位（屏宽 28.5% × 屏高 20%，按"填满槽位"的
+ * 较小比例缩放，比例恒等）。比例一致带来两个结构性好处：
+ * 1) 过渡 = 纯几何缩放（视口降采样），内容无拉伸、**应用零重排**（显示器尺寸全程不变）；
+ * 2) mini 观感 = 展开态的缩略图，缩略图与磁吸位置无关（角落/侧边只影响贴靠位置）。
  *
  * 公式约定（整数除法、coerce 次序、insets 为原始像素值）：
  * - 角落 TL/BL/BR 贴对应角，TR 与未知 kind 走"右上角"兜底；
@@ -36,11 +38,22 @@ object MiniPolicy {
         marginPx: Int,
         topInsetPx: Int,
         bottomInsetPx: Int,
-        currentTop: Int?
+        currentTop: Int?,
+        contentWidth: Int,
+        contentHeight: Int,
+        insets: ShellInsets
     ): WindowRect {
-        // 屏幕比例尺寸（整数除法，与参考图逐项对齐）
-        val w = screenWidth * 285 / 1000
-        val h = screenHeight * 200 / 1000
+        // 磁吸槽位（屏比例，与参考图逐项对齐）；内容区等比缩放到"槽位减去目标外壳"的区域，
+        // 卡片 = 缩放后内容 + 目标外壳（insets）⇒ 卡片恒不超出槽位，且内容比例与展开态一致。
+        val slotW = screenWidth * 285 / 1000
+        val slotH = screenHeight * 200 / 1000
+        val availW = (slotW - insets.width).coerceAtLeast(1)
+        val availH = (slotH - insets.height).coerceAtLeast(1)
+        val cw = if (contentWidth > 0) contentWidth else availW
+        val ch = if (contentHeight > 0) contentHeight else availH
+        val k = minOf(availW.toDouble() / cw, availH.toDouble() / ch)
+        val w = (cw * k).toInt().coerceAtLeast(1) + insets.width
+        val h = (ch * k).toInt().coerceAtLeast(1) + insets.height
         val margin = marginPx
         return when (corner) {
             DropKind.CORNER_TL -> WindowRect(

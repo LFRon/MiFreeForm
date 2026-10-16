@@ -3,6 +3,8 @@ package com.buildsession.betterYAMF.window.backend
 import android.app.ActivityManager
 import android.content.ComponentName
 import android.graphics.Rect
+import android.view.MotionEvent
+import android.view.Surface
 
 /**
  * 系统窗口后端端口：宿主/流程 ↔ 系统侧"任务级窗口语义"的唯一入口。
@@ -26,19 +28,23 @@ interface WindowBackend {
     /**
      * 打开：把任务认领为平滑窗口（freeform + 承载根 + 变换接管），
      * 置前并恢复可聚焦。返回是否成功认领。
-     * [densityDpi]：会话目标密度——**逻辑层声明**；执行层负责落地（承载根容器级覆盖，
-     * 保证任务归入会话后即处于该密度之下），调用方不感知任何落地细节。
      */
-    fun openTask(taskId: Int, densityDpi: Int): Boolean
+    fun openTask(taskId: Int): Boolean
 
     /**
      * 关闭/释放：任务回到全屏并交还系统管理（含表面变换复位与焦点恢复）。
+     * 会话显示器承载时 = **无杀进程迁移**：任务整体迁移回默认显示器——框架以同进程活动
+     * 重建完成回退密度（515）适配；应用进程/服务/最近任务条目全部保留。
      * [toFront]：置顶回前（下拉全屏路径）为 true；关闭小窗为 false——
-     * 任务复位为全屏后沉到原父级栈底（后台、留在最近任务），不抢当前前台，
+     * 任务迁移回默认显示器后沉到显示区栈底（后台、留在最近任务），不抢当前前台，
      * 既满足"关闭小窗"语义，也避免表面重建黑帧上屏。
-     * 返回是否处理成功。
+     * [sessionWindowId]：>=0 表示调用方（窗口宿主）显式声明"这是会话窗口的释放"，
+     * 并携带窗口 id 供实现层在任务 id 失配时按"该会话显示器上的顶层任务"兜底解析
+     * （真机实锤：应用自建新任务后，宿主绑定的旧 taskId 已不存在，迁移被跳过 →
+     * 会话显示器释放把应用带走）。
+     * 返回是否处理成功（任务已不在会话屏的重复调用按 no-op 成功处理）。
      */
-    fun releaseTask(taskId: Int, toFront: Boolean = true): Boolean
+    fun releaseTask(taskId: Int, toFront: Boolean = true, sessionWindowId: Int = -1): Boolean
 
     /**
      * 几何：按物理矩形（屏幕坐标）更新任务表面的缩放/位置/裁剪/圆角。
@@ -83,20 +89,26 @@ interface WindowBackend {
     /**
      * 以"小窗会话"语义启动应用（**意图级**：freeform 目标、会话承载细节——如 organizer
      * 承载根绑定——全部由实现负责，根未就绪等降级也在实现内兜底）。
-     * [densityDpi]：会话目标密度（逻辑层声明）——实现须保证应用**出生即处于该密度之下**
-     * （先落地会话密度再绑定启动），避免"先按显示器密度渲染、再中途改密度"的重建与缓存残影。
-     * 返回是否已发出启动请求；流程层不感知任何系统侧标识与执行细节。
+     * **小窗不改应用 DPI**：会话显示器密度跟随默认显示器，跨屏迁移不产生密度差异，
+     * 不触发任何密度适配（应用按原 DPI 与目标窗口尺寸自行布局）。
+     * **无杀进程优先**：若该应用已有可迁移任务（未运行在任何会话屏上），实现应先就地迁移
+     * 该任务进入会话显示器（见 [moveTaskToSession]，应用进程存活、任务身份保留），
+     * 迁移失败才退回冷启动——保证"一应用一任务"、不制造重复实例。
+     * [windowId]：发起本次启动的宿主窗口标识（实现路由提示——如"显示器承载"实现据此把应用
+     * 启动到该窗口的会话显示器上；逻辑层不解释其语义，仅透传）。
+     * 返回是否已发出启动/迁移请求；流程层不感知任何系统侧标识与执行细节。
      */
-    fun launchAppForSession(component: ComponentName, userId: Int, densityDpi: Int): Boolean
+    fun launchAppForSession(component: ComponentName, userId: Int, windowId: Int = -1): Boolean
 
     /**
-     * 结束一个既有任务（实现层：从最近任务移除并结束**承载该任务的 UI 进程**）。
-     * 用途 = "重启进入会话"：既有任务的应用已在显示器密度下渲染过（视图已按旧密度构建、
-     * 进程级资源缓存已污染），就地认领 + 中途改密度得不到正确首帧——必须先结束它，
-     * 再经 [launchAppForSession] 全新启动（出生即入根 → 首帧即会话密度、缓存干净）。
-     * 实现应尽量缩小杀伤面（仅 UI 进程；推送/下载等子进程保留）。
+     * 把既有任务就地**迁移进入会话显示器**（"重启进入会话"的无杀进程替代）：
+     * 应用进程存活、任务身份保留（最近任务条目不消失、应用状态不重置），任务交由框架在
+     * 目标显示器重新配置。**小窗不改应用 DPI**：会话显示器密度跟随默认显示器，
+     * 迁移只产生窗口尺寸变化（标准 Android 窗口行为），不产生密度差异。
+     * [windowId]：发起迁移的宿主窗口标识（实现据此解析会话显示器；语义同 [launchAppForSession]）。
+     * 返回是否迁移成功；失败调用方可退回 [launchAppForSession] 冷启动。
      */
-    fun discardTask(taskId: Int): Boolean
+    fun moveTaskToSession(taskId: Int, windowId: Int): Boolean
 
     /**
      * 该任务是否已处于会话承载根之下（出生即入根 / 已认领）。
@@ -134,6 +146,39 @@ interface WindowBackend {
 
     /** 注入 HOME 键（"从最近任务打开即小窗"后关闭最近任务界面）。 */
     fun injectHomeKey(): Boolean
+
+    // ==== 会话显示器能力（"虚拟屏承载"实现的实现层契约；逻辑层不调用） ====
+
+    /**
+     * 当前实现是否以"会话显示器"承载小窗内容：
+     * true = 应用全屏运行在专属虚拟屏上，宿主以视口表面（SurfaceView）呈现内容；
+     * false = 传统任务容器承载（承载根 + leash）。
+     */
+    fun usesDisplaySession(): Boolean
+
+    /** 为宿主窗口创建会话显示器（幂等）；返回 displayId，失败 -1。surface 由宿主稍后交接。 */
+    fun attachSessionDisplay(windowId: Int, width: Int, height: Int): Int
+
+    /** 交接/撤销显示器内容表面（SurfaceView 生命周期；null = 表面销毁）。 */
+    fun updateSessionDisplaySurface(windowId: Int, surface: Surface?)
+
+    /** 视口尺寸变化：显示器像素跟随内容区（1:1 映射，密度恒定）。 */
+    fun resizeSessionDisplay(windowId: Int, width: Int, height: Int)
+
+    /** 释放宿主窗口的会话显示器（内容随显示器移除销毁）。 */
+    fun releaseSessionDisplay(windowId: Int)
+
+    /** 宿主窗口的会话显示器 id（无则 -1）。 */
+    fun sessionDisplayId(windowId: Int): Int
+
+    /** 任务是否运行在任一会话显示器上（流程分拣用；无会话时恒 false）。 */
+    fun isTaskInSessionDisplay(taskInfo: ActivityManager.RunningTaskInfo): Boolean
+
+    /** 壳内视口指针事件 → 会话屏注入（实现负责坐标换算与 displayId 承载）。 */
+    fun injectSessionPointer(windowId: Int, event: MotionEvent, viewWidth: Int, viewHeight: Int): Boolean
+
+    /** 导航键注入（返回键等路由进会话屏）。 */
+    fun injectSessionKey(windowId: Int, keyCode: Int): Boolean
 }
 
 /** 后端 → 宿主的回灌事件。 */

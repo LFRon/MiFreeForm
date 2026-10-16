@@ -24,8 +24,8 @@ object WindowBackends {
 
 private object NoopWindowBackend : WindowBackend {
     override fun initialize(callbacks: WindowBackendCallbacks) {}
-    override fun openTask(taskId: Int, densityDpi: Int): Boolean = false
-    override fun releaseTask(taskId: Int, toFront: Boolean): Boolean = false
+    override fun openTask(taskId: Int): Boolean = false
+    override fun releaseTask(taskId: Int, toFront: Boolean, sessionWindowId: Int): Boolean = false
     override fun applyGeometry(taskId: Int, physicalBounds: Rect) {}
     override fun applyRealBounds(taskId: Int, bounds: Rect) {}
     override fun reapplyGeometry(taskId: Int) {}
@@ -45,9 +45,27 @@ private object NoopWindowBackend : WindowBackend {
     override fun recentsGestureSuppressUntilMs(): Long = 0L
     override fun injectHomeKey(): Boolean = false
 
-    override fun launchAppForSession(component: ComponentName, userId: Int, densityDpi: Int): Boolean = false
+    override fun launchAppForSession(component: ComponentName, userId: Int, windowId: Int): Boolean = false
 
-    override fun discardTask(taskId: Int): Boolean = false
+    override fun moveTaskToSession(taskId: Int, windowId: Int): Boolean = false
 
     override fun isTaskInSessionRoot(taskInfo: ActivityManager.RunningTaskInfo): Boolean = false
+
+    override fun usesDisplaySession(): Boolean = false
+
+    override fun attachSessionDisplay(windowId: Int, width: Int, height: Int): Int = -1
+
+    override fun updateSessionDisplaySurface(windowId: Int, surface: android.view.Surface?) {}
+
+    override fun resizeSessionDisplay(windowId: Int, width: Int, height: Int) {}
+
+    override fun releaseSessionDisplay(windowId: Int) {}
+
+    override fun sessionDisplayId(windowId: Int): Int = -1
+
+    override fun isTaskInSessionDisplay(taskInfo: ActivityManager.RunningTaskInfo): Boolean = false
+
+    override fun injectSessionPointer(windowId: Int, event: android.view.MotionEvent, viewWidth: Int, viewHeight: Int): Boolean = false
+
+    override fun injectSessionKey(windowId: Int, keyCode: Int): Boolean = false
 }
