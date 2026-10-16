@@ -106,6 +106,8 @@ class AppWindow(
     override var currentTaskId = -1
     private var isDestroyed = false
     private var openAsMiniPending = false
+
+    override val isSessionHosted: Boolean get() = displaySession
     private var miniRequested = false
 
     private var originalWidth: Int = 0

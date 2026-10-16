@@ -6,6 +6,7 @@ import android.content.Intent
 import android.graphics.Rect
 import android.view.MotionEvent
 import android.view.Surface
+import com.buildsession.betterYAMF.common.runMain
 import com.buildsession.betterYAMF.window.backend.WindowBackend
 import com.buildsession.betterYAMF.window.backend.WindowBackendCallbacks
 import com.buildsession.betterYAMF.xposed.hook.freeform.FreeformBackend
@@ -15,6 +16,7 @@ import com.buildsession.betterYAMF.xposed.services.YAMFManager
 import com.buildsession.betterYAMF.xposed.utils.Instances
 import com.buildsession.betterYAMF.xposed.utils.log
 import de.robv.android.xposed.XposedHelpers
+import kotlinx.coroutines.delay
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -254,6 +256,49 @@ object SmoothWindowBackend : WindowBackend {
     override fun isTaskInSessionDisplay(taskInfo: ActivityManager.RunningTaskInfo): Boolean =
         SessionDisplays.containsDisplay(XposedHelpers.getIntField(taskInfo, "displayId"))
 
+    // ---- 在途过渡保护（迁移前置闸门）------------------------------------------------
+    // 真机实证（两次复现 + `dumpsys SurfaceFlinger --list` 图层树 + 过渡日志）：
+    // 直连 `moveRootTaskToDisplayOnTopOrBottom` 若在"有过渡在飞"时执行，迁移的表面重挂会被
+    // 在途过渡（recents/launcher 的收尾事务）还原：WM 状态 = 会话屏（任务/窗口 displayId=会话屏），
+    // 而 SurfaceFlinger 图层仍挂在默认显示器 TDA 下（Task#N parentId=DefaultTaskDisplayArea#9）
+    // ——应用实体渲染在物理屏（真机截图）、会话屏空白。
+    // 保护：迁移前等待 `TransitionController.isPlaying()==false`（TransitionController.java:587；
+    // 取用路径 ATMS.getTransitionController() :1165——`Instances.activityTaskManager` 进程内直取
+    // ATMS；兜底 mWindowOrganizerController.mTransitionController）。等待用协程 delay 挂起轮询，
+    // 不阻塞系统主线程（过渡推进依赖系统主线程，阻塞等待必然死锁）。
+    private const val TRANSITION_IDLE_STEP_MS = 24L
+    private const val TRANSITION_IDLE_TIMEOUT_MS = 2000L
+
+    /** 是否有 WM/Shell 过渡在飞（反射失败按"无过渡"处理——闸门不允许卡死迁移）。 */
+    private fun transitionsPlaying(): Boolean = runCatching {
+        val atm = Instances.activityTaskManager
+        val controller = runCatching { XposedHelpers.callMethod(atm, "getTransitionController") }.getOrNull()
+            ?: runCatching {
+                XposedHelpers.getObjectField(
+                    XposedHelpers.getObjectField(atm, "mWindowOrganizerController"),
+                    "mTransitionController"
+                )
+            }.getOrNull()
+            ?: return false
+        XposedHelpers.callMethod(controller, "isPlaying") as Boolean
+    }.getOrDefault(false)
+
+    /** 等所有在途过渡收尾后再执行 [action]（有界；超时按现状执行并告警）。 */
+    private fun whenTransitionsIdle(what: String, action: () -> Unit) = runMain {
+        if (transitionsPlaying()) {
+            log(TAG, "$what waiting for transitions to settle")
+        }
+        var waited = 0L
+        while (transitionsPlaying() && waited < TRANSITION_IDLE_TIMEOUT_MS) {
+            delay(TRANSITION_IDLE_STEP_MS)
+            waited += TRANSITION_IDLE_STEP_MS
+        }
+        if (transitionsPlaying()) {
+            log(TAG, "$what transition-idle wait timed out (${waited}ms); proceeding")
+        }
+        action()
+    }
+
     /**
      * 既有任务迁移进入会话显示器（"重启进入会话"的无杀进程替代）。
      *
@@ -271,6 +316,29 @@ object SmoothWindowBackend : WindowBackend {
      * 失败兜底：任务不是顶层根任务等罕见情形走启动事务迁移（[moveTaskByLaunch]）。
      */
     override fun moveTaskToSession(taskId: Int, windowId: Int): Boolean {
+        if (transitionsPlaying()) {
+            // 在途过渡期间直连迁移会被其收尾事务还原（见闸门注释）：推迟到过渡收尾后执行；
+            // 此处返回 true="已受理"（调用方的冷启动兜底链移入延迟执行体，防重复启动）。
+            log(TAG, "moveTaskToSession task=$taskId deferred (transition in flight)")
+            whenTransitionsIdle("moveTaskToSession task=$taskId") {
+                if (!performMoveToSession(taskId, windowId)) {
+                    val info = taskInfoOf(taskId)
+                    val component = info?.topActivity ?: info?.baseActivity
+                    val userId = info?.let { XposedHelpers.getIntField(it, "userId") } ?: 0
+                    if (component != null) {
+                        log(TAG, "deferred moveTaskToSession failed; fallback cold launch task=$taskId")
+                        launchAppForSession(component, userId, windowId)
+                    } else {
+                        log(TAG, "deferred moveTaskToSession failed; task gone task=$taskId")
+                    }
+                }
+            }
+            return true
+        }
+        return performMoveToSession(taskId, windowId)
+    }
+
+    private fun performMoveToSession(taskId: Int, windowId: Int): Boolean {
         val sessionDisplayId = if (windowId >= 0) SessionDisplays.displayIdFor(windowId) else -1
         if (sessionDisplayId < 0) return false
 
@@ -309,6 +377,20 @@ object SmoothWindowBackend : WindowBackend {
 
     /** 回全屏/关闭收尾：把会话屏上的任务迁移回默认显示器（[toFront]=false 沉底=关闭转后台）。 */
     private fun moveTaskOffSession(taskId: Int, toFront: Boolean, sessionWindowId: Int): Boolean {
+        if (transitionsPlaying()) {
+            // 同 moveTaskToSession：在途过渡期间直连迁移会被其收尾事务还原（真机实证）。
+            log(TAG, "moveTaskOffSession task=$taskId deferred (transition in flight)")
+            whenTransitionsIdle("moveTaskOffSession task=$taskId") {
+                if (!performMoveOffSession(taskId, toFront, sessionWindowId)) {
+                    log(TAG, "deferred moveTaskOffSession failed task=$taskId")
+                }
+            }
+            return true
+        }
+        return performMoveOffSession(taskId, toFront, sessionWindowId)
+    }
+
+    private fun performMoveOffSession(taskId: Int, toFront: Boolean, sessionWindowId: Int): Boolean {
         val info = resolveSessionTask(taskId, sessionWindowId) ?: run {
             // 任务已不在会话屏（如下拉全屏路径的二次释放调用）：no-op 成功
             log(TAG, "moveTaskOffSession task=$taskId: no task on session display (no-op)")
