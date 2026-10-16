@@ -13,32 +13,75 @@ class MiniPolicyTest {
     private val topInset = 140
     private val bottomInset = 120
 
-    private val miniW = screenW * 285 / 1000
-    private val miniH = screenH * 200 / 1000
+    /** 目标外壳 = mini 内衬（真机 = 纯描边宽 19px；此处用合成值校验纯逻辑）。 */
+    private val insets = MiniPolicy.ShellInsets(13, 13, 13, 13)
+    private val slotW = screenW * 285 / 1000
+    private val slotH = screenH * 200 / 1000
 
-    private fun enter(corner: DropKind, currentTop: Int? = null) = MiniPolicy.enterTarget(
-        corner = corner,
-        screenWidth = screenW,
-        screenHeight = screenH,
-        marginPx = margin,
-        topInsetPx = topInset,
-        bottomInsetPx = bottomInset,
-        currentTop = currentTop
-    )
+    /** 内容 cx×cy 等比适配槽位后的卡片尺寸（与实现同一公式，供期望值推导）。 */
+    private fun fitted(cw: Int, ch: Int): Pair<Int, Int> {
+        val availW = (slotW - insets.width).coerceAtLeast(1)
+        val availH = (slotH - insets.height).coerceAtLeast(1)
+        val k = minOf(availW.toDouble() / cw, availH.toDouble() / ch)
+        return ((cw * k).toInt().coerceAtLeast(1) + insets.width) to
+                ((ch * k).toInt().coerceAtLeast(1) + insets.height)
+    }
+
+    private fun enter(corner: DropKind, currentTop: Int? = null, cw: Int = origW, ch: Int = origH) =
+        MiniPolicy.enterTarget(
+            corner = corner,
+            screenWidth = screenW,
+            screenHeight = screenH,
+            marginPx = margin,
+            topInsetPx = topInset,
+            bottomInsetPx = bottomInset,
+            currentTop = currentTop,
+            contentWidth = cw,
+            contentHeight = ch,
+            insets = insets
+        )
 
     @Test
-    fun cornerTargetsUseScreenProportionalSize() {
+    fun miniPreservesContentAspectRatio() {
+        // 核心不变量（参考图帧_02/帧_05）：mini 与展开态宽高比一致 = 同一 UI 纯缩放
+        val (w, h) = fitted(origW, origH)
+        val out = enter(DropKind.CORNER_TR)
+        assertEquals(w, out.width)
+        assertEquals(h, out.height)
+        val contentAspect = (out.width - insets.width).toDouble() / (out.height - insets.height)
+        assertEquals(origW.toDouble() / origH, contentAspect, 0.01)
+    }
+
+    @Test
+    fun wideContentIsWidthLimitedAndTallContentHeightLimited() {
+        // 超宽内容：受"槽位宽-外壳"约束
+        val (ww, wh) = fitted(3000, 1000)
+        val wide = enter(DropKind.CORNER_TL, cw = 3000, ch = 1000)
+        assertEquals(ww, wide.width)
+        assertEquals(wh, wide.height)
+        assertEquals(slotW, wide.width)
+        // 超高内容：受"槽位高-外壳"约束
+        val (tw, th) = fitted(600, 3000)
+        val tall = enter(DropKind.CORNER_TL, cw = 600, ch = 3000)
+        assertEquals(tw, tall.width)
+        assertEquals(th, tall.height)
+        assertEquals(slotH, tall.height)
+    }
+
+    @Test
+    fun cornerTargetsUseFittedSizeAndSnapToCorners() {
+        val (w, h) = fitted(origW, origH)
         assertEquals(
-            WindowRect(margin, topInset + margin, margin + miniW, topInset + margin + miniH),
+            WindowRect(margin, topInset + margin, margin + w, topInset + margin + h),
             enter(DropKind.CORNER_TL)
         )
         assertEquals(
-            WindowRect(margin, screenH - bottomInset - margin - miniH, margin + miniW, screenH - bottomInset - margin),
+            WindowRect(margin, screenH - bottomInset - margin - h, margin + w, screenH - bottomInset - margin),
             enter(DropKind.CORNER_BL)
         )
         assertEquals(
             WindowRect(
-                screenW - margin - miniW, screenH - bottomInset - margin - miniH,
+                screenW - margin - w, screenH - bottomInset - margin - h,
                 screenW - margin, screenH - bottomInset - margin
             ),
             enter(DropKind.CORNER_BR)
@@ -47,28 +90,31 @@ class MiniPolicyTest {
 
     @Test
     fun cornerTrAndUnknownFallBackToTopRight() {
+        val (w, h) = fitted(origW, origH)
         val expected = WindowRect(
-            screenW - margin - miniW, topInset + margin,
-            screenW - margin, topInset + margin + miniH
+            screenW - margin - w, topInset + margin,
+            screenW - margin, topInset + margin + h
         )
         assertEquals(expected, enter(DropKind.CORNER_TR))
     }
 
     @Test
     fun sideTargetsUseSameSizeAndKeepCurrentTopClamped() {
+        val (w, h) = fitted(origW, origH)
         assertEquals(
-            WindowRect(margin, 500, margin + miniW, 500 + miniH),
+            WindowRect(margin, 500, margin + w, 500 + h),
             enter(DropKind.SIDE_LEFT, currentTop = 500)
         )
         assertEquals(
-            WindowRect(screenW - margin - miniW, 500, screenW - margin, 500 + miniH),
+            WindowRect(screenW - margin - w, 500, screenW - margin, 500 + h),
             enter(DropKind.SIDE_RIGHT, currentTop = 500)
         )
     }
 
     @Test
     fun sideTopIsClampedToSafeBand() {
-        val maxY = screenH - miniH - margin
+        val (_, h) = fitted(origW, origH)
+        val maxY = screenH - h - margin
         assertEquals(margin, enter(DropKind.SIDE_LEFT, currentTop = 0).top)
         assertEquals(maxY, enter(DropKind.SIDE_LEFT, currentTop = 99999).top)
         assertEquals(margin, enter(DropKind.SIDE_LEFT, currentTop = null).top)
@@ -76,7 +122,6 @@ class MiniPolicyTest {
 
     @Test
     fun sideTopClampsIntoBandOnTinyScreen() {
-        // 小屏 100x100：mini (28x20) 可放下；有效值保持、越界值夹回安全带
         val top = { currentTop: Int? ->
             MiniPolicy.enterTarget(
                 corner = DropKind.SIDE_LEFT,
@@ -85,7 +130,10 @@ class MiniPolicyTest {
                 marginPx = margin,
                 topInsetPx = topInset,
                 bottomInsetPx = bottomInset,
-                currentTop = currentTop
+                currentTop = currentTop,
+                contentWidth = 20,
+                contentHeight = 40,
+                insets = insets
             ).top
         }
         assertEquals(50, top(50))
@@ -93,28 +141,30 @@ class MiniPolicyTest {
     }
 
     @Test
-    fun sizeUsesIntegerDivisionOnScreenProportion() {
+    fun missingContentSizeFallsBackToSlotSize() {
         val out = MiniPolicy.enterTarget(
             corner = DropKind.SIDE_LEFT,
-            screenWidth = 1001,
-            screenHeight = 2002,
+            screenWidth = screenW,
+            screenHeight = screenH,
             marginPx = margin,
             topInsetPx = topInset,
             bottomInsetPx = bottomInset,
-            currentTop = 0
+            currentTop = 0,
+            contentWidth = 0,
+            contentHeight = 0,
+            insets = insets
         )
-        assertEquals(1001 * 285 / 1000, out.width)
-        assertEquals(2002 * 200 / 1000, out.height)
+        assertEquals(slotW, out.width)
+        assertEquals(slotH, out.height)
     }
 
     @Test
     fun miniSizeMatchesReferenceProportions() {
-        // 参考澎湃OS 5.jpg：mini ≈ 屏宽 28.5% x 屏高 20%（真机 1264x2780 → 360x556）
-        val out = enter(DropKind.SIDE_RIGHT, currentTop = 500)
+        // 参考澎湃OS 帧_02/帧_05：真机 mini ≈ 360 宽（屏宽 28.5% 槽位内），比例与内容一致
+        val out = enter(DropKind.SIDE_RIGHT, currentTop = 500, cw = 885, ch = 1345)
         assertEquals(360, out.width)
-        assertEquals(556, out.height)
-        // 比例对齐参考图（≈0.65），与屏比/内容比无关
-        assertEquals(0.653, out.width.toDouble() / out.height, 0.01)
+        val contentAspect = (out.width - insets.width).toDouble() / (out.height - insets.height)
+        assertEquals(885.0 / 1345.0, contentAspect, 0.01)
     }
 
     @Test

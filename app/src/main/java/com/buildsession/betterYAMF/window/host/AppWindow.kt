@@ -27,13 +27,20 @@ import android.view.Gravity
 import android.view.InputDevice
 import android.view.KeyEvent
 import android.view.LayoutInflater
+import android.graphics.Outline
+import android.graphics.SurfaceTexture
 import android.view.MotionEvent
 import android.view.Surface
+import android.view.TextureView
 import android.view.View
 import android.view.ViewGroup
+import android.view.ViewOutlineProvider
 import android.view.WindowManager
+import android.view.animation.AccelerateInterpolator
 import android.view.animation.DecelerateInterpolator
+import android.widget.FrameLayout
 import android.widget.ImageButton
+import androidx.constraintlayout.widget.ConstraintLayout
 import androidx.core.graphics.ColorUtils
 import androidx.core.view.isVisible
 import androidx.core.view.updateLayoutParams
@@ -139,8 +146,33 @@ class AppWindow(
     private var frameOffsetKnown = false
     private var contentTouchThrough = true
 
+    // ==== 会话显示器承载（实现层形态；宿主只问后端，不判断具体条件） ====
+    /** 是否以"显示器视口"承载内容（false = 传统任务容器承载；创建失败时本窗口回退）。 */
+    private var displaySession = YAMFManager.windowBackend.usesDisplaySession()
+    /** 视口裁剪容器（圆角裁剪 + 可见区布局；内容视图恒为显示器尺寸、由 scale 缩放到本容器）。 */
+    private var sessionViewport: FrameLayout? = null
+    /** 内容视口（显示器内容本体；仅显示器承载时创建）。 */
+    private var sessionTextureView: TextureView? = null
+    /** 交给显示器的表面包装（随纹理生命周期创建/释放）。 */
+    private var sessionSurface: Surface? = null
+    /**
+     * 显示器像素（内容基准，本宿主唯一记账点；每次下发 resize 时更新）。
+     * 不能用 SurfaceTexture 回调的宽高作基准——那是 TextureView 自设的"视图侧默认缓冲尺寸"
+     * （实测恒为视图尺寸），与显示器生产者实际产出的像素无关。
+     */
+    private var sessionDisplayW = 0
+    private var sessionDisplayH = 0
+    /** 视口布局诊断去抖（仅尺寸变化时打一行，logcat 可见）。 */
+    private var loggedViewportW = -1
+    private var loggedViewportH = -1
+    private var loggedDisplayW = -1
+    private var loggedDisplayH = -1
+
     /** mini 化中（外壳装饰 / 内容区几何随模式切换，见 shellInsets 与 applyXCrome）。 */
     private var miniActive = false
+
+    /** 顶栏（ibSuper 白条）透明度动画（进出 mini 时平滑显隐；见 [animateSuperBarAlpha]）。 */
+    private var superBarAlphaAnimator: android.animation.ValueAnimator? = null
 
     /** 进出 mini 动画中外壳厚度的逐帧插值值（null=按当前模式取常量）。 */
     private var animInsets: MiniPolicy.ShellInsets? = null
@@ -304,6 +336,10 @@ class AppWindow(
             this.width = windowWidth
             this.height = windowHeight
         }
+        // 会话显示器承载：先建屏（早于 onWindowInit 中的启动调用——应用的启动目标就是它）。
+        if (displaySession) {
+            setupSessionDisplayView(windowWidth, windowHeight)
+        }
         onWindowInit(this, windowId)
 
         isResize = false
@@ -327,6 +363,7 @@ class AppWindow(
                 binding.root.alpha = 0f
                 runMain { binding.root.postDelayed(revealRunnable, 700) }
             }
+            if (displaySession) updateSessionViewportBounds()
         }
 
     }
@@ -346,10 +383,19 @@ class AppWindow(
         // 此处二次调用为 no-op；任务移交新壳（releaseTask=false）时静默销毁。
         if (releaseTask) {
             runCatching {
-                if (currentTaskId > 0) YAMFManager.switchTaskToFullscreen(currentTaskId, toFront = false)
+                if (currentTaskId > 0) YAMFManager.switchTaskToFullscreen(
+                    currentTaskId, toFront = false,
+                    sessionWindowId = if (displaySession) windowId else -1
+                )
             }.onFailure {
                 log(TAG, "release task to background failed", it)
             }
+        }
+
+        // 会话显示器承载：回收会话屏（私有屏移除即销毁其内容；释放语义已在 releaseTask 完成）。
+        if (displaySession) {
+            runCatching { YAMFManager.windowBackend.releaseSessionDisplay(windowId) }
+                .onFailure { log(TAG, "release session display failed", it) }
         }
         
         runCatching { context.unregisterReceiver(broadcastReceiver) }
@@ -647,9 +693,18 @@ class AppWindow(
         when (origin) {
             FullscreenOrigin.DRAG_DOWN_BAR -> {
                 runCatching {
-                    YAMFManager.switchTaskToFullscreen(currentTaskId)
-                    YAMFManager.windowBackend.bringTaskToFront(currentTaskId)
+                    // sessionWindowId：本窗口确知内容跑在会话显示器上——释放必走"回收 UI 进程 +
+                    // 移除任务 + 全屏冷启"配方；任务 id 失配时实现层按会话屏顶层任务兜底。
+                    YAMFManager.switchTaskToFullscreen(
+                        currentTaskId,
+                        sessionWindowId = if (displaySession) windowId else -1
+                    )
                 }.onSuccess {
+                    // 会话路径：旧任务已被移除，置前由冷启（startActivityAsUser）完成，
+                    // 再对已移除任务 bringTaskToFront 会抛错并把窗口留在原地。容器路径维持原语义。
+                    if (!displaySession) {
+                        runCatching { YAMFManager.windowBackend.bringTaskToFront(currentTaskId) }
+                    }
                     onDestroy(releaseTask = true)
                 }.onFailure {
                     execResetWindowScale()
@@ -741,6 +796,29 @@ class AppWindow(
         // rect 为窗口卡（外壳）矩形；内容盒 = 应用内容区 = 卡内沿去掉固定外壳。
         val contentBox = contentBoxOf(rect)
 
+        // 会话显示器承载：内容由壳内视口表面直呈（随布局自动重排），不存在任务级几何
+        // （无 leash/变换），触摸洞机制亦不适用（视口表面自持触摸）。
+        // 显示器像素只在"静止态"对齐（mini/手势/动画期间保持上一次尺寸——视口自动缩放呈现），
+        // 避免动画期间逐帧 relayout 风暴。
+        if (displaySession) {
+            WindowSessions.chromeTouchHoles.remove(windowId)
+            updateSessionViewportBounds()
+            val settling = !animated && !resizeGesture && !dragging &&
+                animInsets == null &&
+                boundsAnimator?.isRunning != true &&
+                flingXAnimation?.isRunning != true &&
+                flingYAnimation?.isRunning != true &&
+                keepInScreenAnimator?.isRunning != true
+            if (settling && !miniActive) {
+                // 显示器像素对齐**只在正常态静止点**下发（内容区 1:1，逐像素清晰）。
+                // mini 态不重设显示器：mini = 视口等比降采样（MiniPolicy 保宽高比，与展开态
+                // 同一 UI 纯缩放）⇒ 应用在模式切换全程零重排/零表面重建，动画天然平滑，
+                // 也根除了曾出现的 "mini DPI 漂移"。见 [MiniPolicy.enterTarget]。
+                resizeSessionDisplay(contentBox.width(), contentBox.height())
+            }
+            return
+        }
+
         // 触摸洞 = 应用内容区精确矩形（正常态：内容交互直通应用；外壳条/边距由 chrome 自持）
         if (contentTouchThrough) {
             WindowSessions.chromeTouchHoles[windowId] = android.graphics.Rect(contentBox)
@@ -759,6 +837,180 @@ class AppWindow(
             // 系统窗口后端：几何落地（leash 变换或兼容路径由实现决定，宿主不感知）
             YAMFManager.windowBackend.applyGeometry(currentTaskId, contentBox)
         }
+    }
+
+    /**
+     * 会话显示器承载：内容视口 = 裁剪容器（圆角）+ 恒定尺寸的 TextureView（视图 scale 做视觉缩放）。
+     * 显示器由系统侧（SessionDisplays）创建并持有；设计要点（AOSP 源码 + 真机双向实锤）：
+     *
+     * 1. **呈现链**：TextureView.draw() → applyUpdate() → mLayer.prepare(视图宽, 视图高)；
+     *    图层绘制 Layer::draw（Layer.cpp:99-145，textureMatrix=逆(scale(1/图层宽,1/图层高)·flipV·
+     *    scale(图像宽,图像高))）把**整幅缓冲图像**自动适配铺满"图层尺寸"，而**图层尺寸只在
+     *    "新帧到达"时才刷新**（DeferredLayerUpdater::apply 仅在 dequeue 到缓冲时 setSize）。
+     *    ⇒ 若让视图尺寸随 mini 动画逐帧变化，而生产者（静态页面）不再推新帧，适配会停在旧尺寸
+     *    —— 真机实锤：内容约 1:1 被裁到左上角。
+     *    **正确做法（本实现）**：内容视图布局尺寸恒等于显示器尺寸（缓冲≈视图 ⇒ 适配恒≈1:1、
+     *    与刷新时机无关），视觉缩放改为视图自身的 scaleX/scaleY（普通 View 变换，父节点合成，
+     *    不涉及纹理层适配）——动画期间零布局、零表面重建、零适配失效。
+     * 2. **圆角**：裁剪容器带圆角 outline + clipToOutline（clip 作用于整个子树），内容被裁进
+     *    可见圆角内（此前内容直角渗出卡片圆角）。
+     * 3. **触摸注入**：视图本地坐标=显示器像素（scale 由框架在派发前还原）⇒ 注入按
+     *    "显示器px/视图px"换算，因子≈1，与视觉严格一致；mini 时 [contentTouchThrough]=false，
+     *    触摸交还外壳拖动/复位热区。
+     * 4. **尺寸对齐**：显示器**只在正常态静止点**对齐到内容区 1:1（逐像素清晰）；
+     *    mini 态显示器保持不变——mini 只是视口等比降采样（MiniPolicy 保宽高比，
+     *    与展开态是同一 UI 纯缩放），模式切换全程应用零重排（动画平滑的最简单实现）。
+     */
+    private fun setupSessionDisplayView(windowWidth: Int, windowHeight: Int) {
+        runCatching {
+            // 裁剪容器：只负责"圆角 + 可见区尺寸/位置"（尺寸/边距由 updateSessionViewportBounds 维护；
+            // 不能依赖约束链——mini 下顶栏 GONE、父容器 wrap 高度被尺寸锚点撑到逻辑全高）。
+            val clip = FrameLayout(context)
+            clip.clipToOutline = true
+            clip.outlineProvider = object : ViewOutlineProvider() {
+                override fun getOutline(view: View, outline: Outline) {
+                    // 圆角与装饰内沿同心：mini = 边框内沿圆角（外沿圆角 − 边框宽）；
+                    // 点击态 = 方角（设计注释："点击态=方角"，圆角一律由装饰提供）。
+                    val r = if (miniActive) {
+                        (config.windowRoundedCorner.dpToPx() - MINI_BEZEL_DP.dpToPx()).coerceAtLeast(0f)
+                    } else 0f
+                    outline.setRoundRect(0, 0, view.width, view.height, r)
+                }
+            }
+            val lp = ConstraintLayout.LayoutParams(1, 1)
+            lp.startToStart = ConstraintLayout.LayoutParams.PARENT_ID
+            lp.topToTop = ConstraintLayout.LayoutParams.PARENT_ID
+            binding.background.addView(clip, 0, lp)
+            sessionViewport = clip
+
+            // 内容视图：布局尺寸恒等于显示器像素；视觉缩放交给 scale（见方法注释）。
+            val tv = TextureView(context)
+            tv.pivotX = 0f
+            tv.pivotY = 0f
+            clip.addView(tv, FrameLayout.LayoutParams(1, 1))
+            sessionTextureView = tv
+
+            val initialBox = contentBoxOf(android.graphics.Rect(0, 0, windowWidth, windowHeight))
+            val displayId = YAMFManager.windowBackend.attachSessionDisplay(
+                windowId, initialBox.width(), initialBox.height()
+            )
+            log(TAG, "session display attach window=$windowId display=$displayId size=${initialBox.width()}x${initialBox.height()}")
+            if (displayId < 0) {
+                // 会话屏创建失败：本窗口退回容器承载（后续流程按 displaySession=false 走原路径）
+                displaySession = false
+                log(TAG, "session display unavailable, fallback to container realization")
+                return@runCatching
+            }
+            sessionDisplayW = initialBox.width()
+            sessionDisplayH = initialBox.height()
+            tv.updateLayoutParams<FrameLayout.LayoutParams> {
+                width = sessionDisplayW
+                height = sessionDisplayH
+            }
+
+            fun attachSurface(st: SurfaceTexture) {
+                val surface = Surface(st)
+                sessionSurface = surface
+                YAMFManager.windowBackend.updateSessionDisplaySurface(windowId, surface)
+                // 回调尺寸是"视图侧默认缓冲尺寸"（=视图尺寸），与呈现无关：适配由图层自动完成，
+                // 显示器像素以本宿主记账为准（创建初始 + 静止态对齐）。
+            }
+
+            tv.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+                override fun onSurfaceTextureAvailable(st: SurfaceTexture, width: Int, height: Int) {
+                    attachSurface(st)
+                }
+
+                override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, width: Int, height: Int) {
+                    // 视图尺寸=显示器尺寸，仅显示器 resize（静止态对齐）时触发；适配随新帧自动刷新。
+                }
+
+                override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
+                    YAMFManager.windowBackend.updateSessionDisplaySurface(windowId, null)
+                    sessionSurface?.release()
+                    sessionSurface = null
+                    return true
+                }
+
+                override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
+            }
+            // 竞态兜底：监听注册前纹理可能已就绪（不会补发 available 回调）
+            runCatching {
+                val st = tv.surfaceTexture
+                if (tv.isAvailable && st != null && sessionSurface == null) {
+                    attachSurface(st)
+                }
+            }
+
+            tv.setOnTouchListener { _, event -> handleSessionTouch(event) }
+            tv.setOnGenericMotionListener { _, event -> handleSessionTouch(event) }
+        }.onFailure { log(TAG, "session display view setup failed", it) }
+    }
+
+    /** 视口触摸：仅内容交互态注入（mini/手势态返回 false 让外壳拖动/复位热区接管）。 */
+    private fun handleSessionTouch(event: MotionEvent): Boolean {
+        if (!displaySession || !contentTouchThrough) return false
+        val tv = sessionTextureView ?: return false
+        return YAMFManager.windowBackend.injectSessionPointer(windowId, event, tv.width, tv.height)
+    }
+
+    /**
+     * 视口几何：裁剪容器布局到"可见内容区"（卡片 cvBackground 减壳层内衬 shellInsets），
+     * 内容视图以自身 scale 缩放到该容器（布局尺寸恒=显示器尺寸，见 [setupSessionDisplayView]）。
+     * 每帧几何（applySmoothBounds）与装饰切换时同步；幂等、无布局风暴（scale 不触发布局）。
+     */
+    private fun updateSessionViewportBounds() {
+        val clip = sessionViewport ?: return
+        val tv = sessionTextureView ?: return
+        // 尺寸基准优先取"当前帧刚下发的布局参数"：动画逐帧只改 lp（布局要到下一趟才生效），
+        // 若读已测量尺寸会拿到上一帧结果 → 视口比边框晚一帧（真机逐帧实测：开启动画期间
+        // 内容右缘落后边框 7~21px 拖尾 = "内容跟边框错位"）。取 lp 则与边框同帧对齐。
+        val lp = binding.cvBackground.layoutParams
+        val cardW = lp?.width?.takeIf { it > 0 } ?: binding.cvBackground.width
+        val cardH = lp?.height?.takeIf { it > 0 } ?: binding.cvBackground.height
+        if (cardW <= 0 || cardH <= 0) return
+        val ins = shellInsets()
+        val w = (cardW - ins.left - ins.right).coerceAtLeast(1)
+        val h = (cardH - ins.top - ins.bottom).coerceAtLeast(1)
+        clip.updateLayoutParams<ConstraintLayout.LayoutParams> {
+            width = w
+            height = h
+            leftMargin = ins.left
+            topMargin = ins.top
+        }
+        if (sessionDisplayW > 0 && sessionDisplayH > 0) {
+            tv.scaleX = w.toFloat() / sessionDisplayW
+            tv.scaleY = h.toFloat() / sessionDisplayH
+        }
+        if (w != loggedViewportW || h != loggedViewportH ||
+            sessionDisplayW != loggedDisplayW || sessionDisplayH != loggedDisplayH
+        ) {
+            loggedViewportW = w
+            loggedViewportH = h
+            loggedDisplayW = sessionDisplayW
+            loggedDisplayH = sessionDisplayH
+            clip.invalidateOutline()
+            android.util.Log.i(
+                TAG,
+                "session viewport view=${w}x${h} card=${cardW}x${cardH} " +
+                        "display=${sessionDisplayW}x${sessionDisplayH} " +
+                        "scale=${"%.3f".format(tv.scaleX)},${"%.3f".format(tv.scaleY)} insets=$ins"
+            )
+        }
+    }
+
+    /** 会话屏像素对齐（唯一入口：记账 → 内容视图布局跟随 → 后端 resize → 缩放刷新）。 */
+    private fun resizeSessionDisplay(width: Int, height: Int) {
+        if (width <= 0 || height <= 0) return
+        if (width == sessionDisplayW && height == sessionDisplayH) return
+        sessionDisplayW = width
+        sessionDisplayH = height
+        sessionTextureView?.updateLayoutParams<FrameLayout.LayoutParams> {
+            this.width = width
+            this.height = height
+        }
+        YAMFManager.windowBackend.resizeSessionDisplay(windowId, width, height)
+        updateSessionViewportBounds()
     }
 
     /** 系统窗口后端把任务 leash 交给我们（onTaskAdopted 回灌）后，按当前几何立即摆放 */
@@ -841,6 +1093,12 @@ class AppWindow(
 
         if (taskInfo.taskId == currentTaskId) {
             updateTask(taskInfo)
+            if (displaySession) {
+                // 显示器承载：任务经流程分拣绑定到本壳即内容就绪（无 leash 回调可等）——
+                // 立即按当前几何对齐显示器像素并淡入（回收区投放则走"从松手点飞入"登场）。
+                updateSmoothBounds()
+                revealChrome()
+            }
             maybeRequestMini()
             return
         }
@@ -937,16 +1195,20 @@ class AppWindow(
 
     private fun keepAboveHome() {
         if (isDestroyed) return
+        // 会话显示器承载：小窗层序由普通窗口（overlay）恒定保证，不存在任务级层序需要抢。
+        if (displaySession) return
         // 置顶身份（承载根 always-on-top）生效后，层序由系统排序规则保证：
         // 此时任何"回置顶"（bringTaskToFront/reorder）都是多余的抢层动作，正是与
         // recents 手势/过渡互相打断的来源 → 直接让路。
         // 仅保留"浮窗不持有焦点"的既定语义（否则可能抢走 home/下方应用的焦点）。
         if (YAMFManager.windowBackend.isAlwaysOnTopActive()) {
             log(TAG, "keepAboveHome skip (always-on-top) task=$currentTaskId")
-            val managedTaskId = currentTaskId
-            if (managedTaskId > 0) {
-                runCatching { YAMFManager.windowBackend.setTaskFocusable(managedTaskId, false) }
-            }
+            // 焦点："浮窗不持焦"由外壳窗口自身的 FLAG_NOT_FOCUSABLE 在**窗口级**保证。
+            // 不得再对宿主任务 setFocusable(false)——源码实锤（WindowContainer.isFocusable
+            // 父链判定 / TaskFragment.canBeResumed 要求 isTopActivityFocusable /
+            // TaskDisplayArea.getFocusedRootTask 只取 isFocusableAndVisible 的根）：
+            // 任务级失焦会让活动/承载根失去焦点资格，活动被永久晾在 PAUSED
+            // （依赖 resume 的应用如微信会一直加载），并与 openTask 的置焦赛跑。
             return
         }
         val taskId = currentTaskId
@@ -978,8 +1240,8 @@ class AppWindow(
         reFrontScheduled = false
         val result = YAMFManager.windowBackend.bringTaskToFront(taskId)
         log(TAG, "keepAboveHome re-front task=$taskId result=$result attempts=$attempts")
-        // 浮窗保持在最上，但不持有焦点：返回/键盘等导航事件交给下方正在使用的应用
-        runCatching { YAMFManager.windowBackend.setTaskFocusable(taskId, false) }
+        // 焦点不在此处置 false："浮窗不持焦"由外壳窗口的 FLAG_NOT_FOCUSABLE（窗口级）保证；
+        // 任务级 setFocusable(false) 会经父链使活动失去焦点资格（无法 resume，源码实锤）。
         onTaskVisibilityChanged(true)
         // HOME/应用切换的入场过渡可能在本次重排之后才落定（实测：根被压到 home 之下、
         // 子任务 moveTaskToFront 抬不起根）→ 稍后重试，保证浮窗最终在系统壳之上（有界，最多 3 次）。
@@ -1097,14 +1359,15 @@ class AppWindow(
         return if (miniActive) miniInsets() else normalInsets()
     }
 
-    /** 点击态外壳：2dp 边距 + 顶部拖动栏。 */
+    /** 点击态外壳：应用内容与窗口边缘齐平（0 边距，顶栏/底栏与内容严丝合缝）+ 顶部拖动栏。 */
     private fun normalInsets(): MiniPolicy.ShellInsets {
-        val margin = 2.dpToPx().toInt()
         val strip = binding.ibSuper.height.takeIf { it > 0 } ?: 18.dpToPx().toInt()
-        return MiniPolicy.ShellInsets(margin, margin + strip, margin, margin)
+        return MiniPolicy.ShellInsets(0, strip, 0, 0)
     }
 
-    /** mini 外壳：贴边边框（均匀厚度）。 */
+    /** mini 外壳：贴边边框。内容顶到描边内缘——描边画在 cvParent 边界内（内缘=边界+描边宽），
+     *  卡片与 cvParent 同盒（XML 边距已归零）⇒ 内衬 = 描边宽。
+     *  真机实测（1264×2780@515dpi）：描边 19px。 */
     private fun miniInsets(): MiniPolicy.ShellInsets {
         val bezel = MINI_BEZEL_DP.dpToPx().toInt()
         return MiniPolicy.ShellInsets(bezel, bezel, bezel, bezel)
@@ -1126,13 +1389,18 @@ class AppWindow(
     /**
      * 点击态外壳装饰：应用方角（"可点击时不需要圆角"）+ 白顶栏 + 底栏手势。
      * 装饰只承担顶/底栏与边框（应用本体不做任何裁剪/圆角 —— 澎湃OS小窗模型）。
+     * 顶部无描边（strokeWidth=0）：窗口外沿不画任何方框（应用内容即窗口本体）；
+     * 应用与顶栏/底栏齐平（[normalInsets] 边距归零）——真机逐像素实锤过旧 6px 透缝与
+     * #20000000 方框的存在。
      */
     private fun applyNormalChrome() {
         binding.cvBackground.radius = 0f
         binding.cvParent.radius = 0f
-        binding.cvParent.strokeWidth = 2.dpToPx().toInt()
+        binding.cvParent.strokeWidth = 0
         binding.cvParent.setStrokeColor(ColorStateList.valueOf(context.getColor(R.color.transparentOutline)))
         binding.ibSuper.visibility = View.VISIBLE
+        binding.ibSuper.alpha = 1f
+        sessionViewport?.invalidateOutline()
     }
 
     /**
@@ -1168,7 +1436,48 @@ class AppWindow(
         binding.cvBackground.radius = (r - bezel).coerceAtLeast(0f)
         binding.cvParent.strokeWidth = bezel.toInt()
         binding.cvParent.setStrokeColor(ColorStateList.valueOf(context.getColor(R.color.window_bezel)))
-        binding.ibSuper.visibility = View.GONE
+        // 顶栏不在此处硬切：交由 [animateSuperBarAlpha] 随几何动画渐隐（动画期间条带靠它覆盖，
+        // 硬切会让"应被白条覆盖"的区域透出壁纸/时钟 = 内容与边框错位）。
+        sessionViewport?.invalidateOutline()
+    }
+
+    /**
+     * 顶栏（ibSuper 白条）透明度动画：顶栏是**覆盖在内容之上**的装饰条——
+     * 正常态顶部内衬 = 边距+条高，动画期间若顶栏缺失，这段条带会透明透出底下的壁纸/壁纸时钟
+     * （真机逐帧实锤：开启动画中内容顶部与边框内沿之间出现 16~数十 px 的壁纸蓝色条带）。
+     * 进 mini 渐隐（先亮后隐，最后 GONE）；出 mini 渐显（快速到 1，覆盖条带）。
+     */
+    private fun animateSuperBarAlpha(from: Float, to: Float, durationMs: Long, hideAtEnd: Boolean) {
+        superBarAlphaAnimator?.cancel()
+        superBarAlphaAnimator = null
+        if (durationMs <= 0L) {
+            if (hideAtEnd) {
+                binding.ibSuper.visibility = View.GONE
+                binding.ibSuper.alpha = 1f
+            } else {
+                binding.ibSuper.visibility = View.VISIBLE
+                binding.ibSuper.alpha = to
+            }
+            return
+        }
+        runCatching { binding.ibSuper.visibility = View.VISIBLE }
+        binding.ibSuper.alpha = from
+        superBarAlphaAnimator = android.animation.ValueAnimator.ofFloat(from, to).apply {
+            duration = durationMs
+            interpolator = if (to > from) DecelerateInterpolator() else AccelerateInterpolator()
+            addUpdateListener { binding.ibSuper.alpha = it.animatedValue as Float }
+            addListener(object : android.animation.AnimatorListenerAdapter() {
+                override fun onAnimationEnd(animation: android.animation.Animator) {
+                    if (superBarAlphaAnimator !== animation) return
+                    superBarAlphaAnimator = null
+                    if (hideAtEnd) {
+                        binding.ibSuper.visibility = View.GONE
+                        binding.ibSuper.alpha = 1f
+                    }
+                }
+            })
+            start()
+        }
     }
 
     /** 逐帧应用内容矩形：窗口位置 + 卡片尺寸 + leash 一次到位（同一几何事实源）。 */
@@ -1340,8 +1649,15 @@ class AppWindow(
         val fromInsets = shellInsets()
         miniActive = true
         applyMiniChrome()
+        // 顶栏渐隐：动画期间先保持可见（覆盖其条带），结束再 GONE（见 [animateSuperBarAlpha]）
+        animateSuperBarAlpha(1f, 0f, geometryAnimDuration(), hideAtEnd = true)
+        updateSessionViewportBounds()
         val toInsets = miniInsets()
-        // mini 目标 = 屏幕比例尺寸（核心策略内置比例；应用在框内拉伸铺满）
+        // mini 目标 = 当前内容区**等比缩放**到磁吸槽位（保持宽高比——参考图帧_02/帧_05 实锤：
+        // mini 与展开态是同一 UI 的纯缩放）。比例一致 ⇒ 过渡 = 纯几何缩放、无拉伸；
+        // 显示器尺寸全程不变（应用零重排/零表面重建）——这是最简单且最平滑的实现方式。
+        val fromContentW = ((from?.width() ?: 0) - fromInsets.width).coerceAtLeast(1)
+        val fromContentH = ((from?.height() ?: 0) - fromInsets.height).coerceAtLeast(1)
         val to = MiniPolicy.enterTarget(
             corner = corner,
             screenWidth = dm.widthPixels,
@@ -1349,9 +1665,15 @@ class AppWindow(
             marginPx = 8.dpToPx().toInt(),
             topInsetPx = 140,
             bottomInsetPx = 120,
-            currentTop = from?.top
+            currentTop = from?.top,
+            contentWidth = fromContentW,
+            contentHeight = fromContentH,
+            insets = toInsets
         ).toAndroidRect()
-        animateContentRect(from ?: to, to, geometryAnimDuration(), insetsFrom = fromInsets, insetsTo = toInsets)
+        animateContentRect(from ?: to, to, geometryAnimDuration(), insetsFrom = fromInsets, insetsTo = toInsets) {
+            // 终态：补一次结算（视口/缩放/轮廓落定；显示器像素在 mini 态保持不变）
+            binding.root.post(::updateSmoothBounds)
+        }
     }
 
     private fun execExitMini() {
@@ -1381,12 +1703,17 @@ class AppWindow(
             marginPx = 8.dpToPx().toInt()
         ).toAndroidRect()
         val toInsets = normalInsets()
+        // 顶栏渐显：快速点亮（覆盖"边距+条高"条带，避免动画期间透出壁纸/时钟 = 错位感）
+        animateSuperBarAlpha(0f, 1f, (geometryAnimDuration() * 0.45f).toLong().coerceAtLeast(1L), hideAtEnd = false)
+        // 显示器像素**全程不随模式变化**（mini 只是视口等比降采样，应用零重排）；
+        // 正常态的内容区对齐由静止结算下发（见 applySmoothBounds）。
         animateContentRect(from, to, geometryAnimDuration(), insetsFrom = fromInsets, insetsTo = toInsets) {
             // 终态：退出 mini——恢复点击态外壳装饰与 wrap-content（后续测量/吸附基于自然尺寸）
             miniActive = false
             applyNormalChrome()
             setBackgroundWrapContent()
             setParrentWrapContent()
+            if (displaySession) updateSessionViewportBounds()
             binding.root.post(::updateSmoothBounds)
         }
     }

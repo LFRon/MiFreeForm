@@ -36,6 +36,7 @@ import com.buildsession.betterYAMF.xposed.utils.log
 import com.buildsession.betterYAMF.xposed.utils.registerReceiver
 import com.qauxv.ui.CommonContextWrapper
 import de.robv.android.xposed.XposedHelpers
+import kotlinx.coroutines.delay
 import rikka.hidden.compat.ActivityManagerApis
 import java.io.File
 
@@ -44,15 +45,6 @@ object YAMFManager : IYAMFManager.Stub() {
     private const val TAG = "BetterYAMFManager"
 
     private const val LEGACY_DEFAULT_WINDOW_HEIGHT = 380
-
-    /**
-     * 会话应用密度（dpi）——**逻辑层策略声明**：小窗会话中的应用按此密度渲染
-     * （观感对齐参考图的等效密度测量值）。
-     *
-     * 逻辑层只声明"应用多少 dpi"；怎么落地（承载根容器级密度覆盖、WCT、
-     * 启动即入根等全部系统细节）是执行抽象层/实现层的职责（见 `WindowBackend` 端口）。
-     */
-    private const val SESSION_DENSITY_DPI = 280
 
     private val activeWindows = mutableMapOf<Int, WindowHost>()
     val pendingSmoothFreeformApps = mutableMapOf<ComponentName, WindowHost>()
@@ -94,35 +86,43 @@ object YAMFManager : IYAMFManager.Stub() {
                         }
 
                         // 若首帧时任务已是 FREEFORM 的任务尚未登记（例如从菜单直启），补登记并立即套用缩放链路；
-                        // 切回 FULLSCREEN 的任务则移出登记。
+                        // 切回 FULLSCREEN 的任务则移出登记。会话显示器承载的任务（普通全屏）
+                        // 与容器承载共用同一"补登记"语义（isTaskInSessionDisplay 对无会话实现恒 false，
+                        // 不影响容器路径）。
                         val windowingMode = windowBackend.windowingModeOf(taskInfo)
-                        if (windowingMode == WINDOWING_MODE_FREEFORM) {
+                        if (windowingMode == WINDOWING_MODE_FREEFORM || windowBackend.isTaskInSessionDisplay(taskInfo)) {
                             val topActivity = taskInfo.topActivity
                             if (topActivity != null) {
-                                val pendingWindow = pendingSmoothFreeformApps[topActivity]
+                                // 认领匹配：组件精确匹配优先；未命中按包名兜底——无杀迁移后任务顶层不变，
+                                // 与待认领登记的应用入口组件可能不同（应用已导航至内部页面等）。
+                                val pendingEntry = pendingSmoothFreeformApps.entries.firstOrNull {
+                                    it.key == topActivity
+                                } ?: pendingSmoothFreeformApps.entries.firstOrNull {
+                                    it.key.packageName == topActivity.packageName
+                                }
+                                val pendingWindow = pendingEntry?.value
                                 if (pendingWindow != null) {
                                     val inSessionRoot = windowBackend.isTaskInSessionRoot(taskInfo)
                                     val restartThrottleOk =
                                         SystemClock.uptimeMillis() - (sessionRestartAtMs[topActivity] ?: 0L) > 5000L
                                     if (!inSessionRoot && restartThrottleOk) {
-                                        // 陈旧待认领命中了外部（桌面等）启动的任务：应用已按显示器
-                                        // 密度渲染过（视图+进程缓存均为旧密度），不能就地认领（中途改
-                                        // 密度=首帧污染）。逻辑层链条 = 结束既有任务（旧密度进程缓存）
-                                        // → 以 SESSION_DENSITY_DPI 全新启动进入会话（出生即入根，
-                                        // 首帧即会话密度）；新任务到前台后会再次到达本分支被正常认领。
-                                        // 5s 节流防启动失败循环。
-                                        log("reYAMF_debug", "claim restart task=${taskInfo.taskId} activity=$topActivity (not in session root)")
+                                        // 陈旧待认领命中了外部（桌面等）启动的任务：就地迁移进会话屏
+                                        // （**无杀进程、不改 DPI**）：任务身份保留、进程存活；
+                                        // 失败才退回冷启动。5s 节流防启动失败循环。
+                                        log("reYAMF_debug", "claim move-into-session task=${taskInfo.taskId} activity=$topActivity (not in session root)")
                                         sessionRestartAtMs[topActivity] = SystemClock.uptimeMillis()
-                                        windowBackend.discardTask(taskInfo.taskId)
-                                        val userId = XposedHelpers.getIntField(taskInfo, "userId")
-                                        windowBackend.launchAppForSession(topActivity, userId, SESSION_DENSITY_DPI)
+                                        val moved = windowBackend.moveTaskToSession(taskInfo.taskId, pendingWindow.windowId)
+                                        if (!moved) {
+                                            val userId = XposedHelpers.getIntField(taskInfo, "userId")
+                                            windowBackend.launchAppForSession(topActivity, userId, pendingWindow.windowId)
+                                        }
                                     } else {
                                         if (!inSessionRoot) {
                                             log("reYAMF_debug", "claim fallback-adopt task=${taskInfo.taskId} (restart throttled)")
                                         }
                                         log("reYAMF_debug", "claim task=${taskInfo.taskId} activity=$topActivity")
                                         WindowSessions.hostedTasks.add(taskInfo.taskId)
-                                        pendingSmoothFreeformApps.remove(topActivity)
+                                        pendingSmoothFreeformApps.remove(pendingEntry.key)
                                         sessionRestartAtMs.remove(topActivity)
                                         // Trigger a config change to apply spoofing/scaling immediately
                                         switchToSmoothFreeform(taskInfo.taskId)
@@ -362,19 +362,19 @@ object YAMFManager : IYAMFManager.Stub() {
             }
 
             if (taskId != -1) {
-                // 用户从最近任务/回收区开小窗：既有任务的应用已在显示器密度下渲染过
-                // （视图按旧密度构建、进程级资源缓存已污染），就地认领 + 中途改密度得不到
-                // 正确首帧（实锤：全大 / 部分超大混排）。逻辑层链条 = **重启进入会话**：
-                // 结束既有任务（连旧密度的进程缓存一并清掉）→ 以 SESSION_DENSITY_DPI 全新
-                // 启动（出生即入根，首帧即会话密度）；具体怎么杀、怎么落地密度是执行层的职责。
-                // 已在会话根内的任务（重复开窗）或信息解析失败时，退回就地认领（旧路径）。
+                // 用户从最近任务/回收区开小窗：既有任务**就地迁移进入会话屏**（无杀进程）——
+                // 应用进程存活、任务身份保留（最近任务不消失、状态不重置）；小窗不改应用 DPI。
+                // 迁移失败（任务不可迁移等）才退回冷启动。
                 val info = taskInfoById(taskId)
                 val component = info?.topActivity ?: info?.baseActivity
                 if (info != null && component != null && !windowBackend.isTaskInSessionRoot(info)) {
-                    log("reYAMF_debug", "reopen-as-session task=$taskId component=$component (restart, dpi=$SESSION_DENSITY_DPI)")
-                    windowBackend.discardTask(taskId)
+                    log("reYAMF_debug", "reopen-as-session task=$taskId component=$component (in-place move)")
                     pendingSmoothFreeformApps[component] = window
-                    windowBackend.launchAppForSession(component, XposedHelpers.getIntField(info, "userId"), SESSION_DENSITY_DPI)
+                    val moved = windowBackend.moveTaskToSession(taskId, window.windowId)
+                    if (!moved) {
+                        log("reYAMF_debug", "reopen-as-session move failed task=$taskId; fallback cold launch")
+                        windowBackend.launchAppForSession(component, XposedHelpers.getIntField(info, "userId"), window.windowId)
+                    }
                 } else {
                     WindowSessions.hostedTasks.add(taskId)
                     switchToSmoothFreeform(taskId)
@@ -382,10 +382,9 @@ object YAMFManager : IYAMFManager.Stub() {
                 }
             } else if (startCmd?.componentName != null) {
                 pendingSmoothFreeformApps[startCmd.componentName] = window
-                // 意图级调用：以"小窗会话 + SESSION_DENSITY_DPI 密度"语义启动该应用——
-                // freeform 目标、密度落地（承载根容器级覆盖）、启动即入根等执行细节全部由
-                // 实现层负责（出生即处于会话密度之下，避免中途密度变更引发的重建/缓存残影）。
-                windowBackend.launchAppForSession(startCmd.componentName, startCmd.userId ?: 0, SESSION_DENSITY_DPI)
+                // 意图级调用：以"小窗会话"语义进入会话——迁移/启动等执行细节全部由实现层负责：
+                // 同包既有任务就地迁移（无杀进程）；无既有任务时冷启动到会话屏。小窗不改应用 DPI。
+                windowBackend.launchAppForSession(startCmd.componentName, startCmd.userId ?: 0, window.windowId)
             }
         }
     }
@@ -458,10 +457,9 @@ object YAMFManager : IYAMFManager.Stub() {
             XposedHelpers.getObjectField(taskInfo, "topActivity") as? ComponentName
         }.getOrNull()?.let { WindowSessions.taskActivities[taskId] = it }
 
-        // 系统窗口后端：认领（organizer/leash）+ 置前 + 恢复可聚焦；
-        // 会话密度由逻辑层声明（SESSION_DENSITY_DPI），落地方式（承载根容器级覆盖）由执行层负责；
-        // 只走后端路径，失败大声报错，不再悄悄回退旧行为
-        if (!windowBackend.openTask(taskId, SESSION_DENSITY_DPI)) {
+        // 系统窗口后端：认领（organizer/leash）+ 置前 + 恢复可聚焦；小窗不改应用 DPI，
+        // 不施加任何密度覆盖。只走后端路径，失败大声报错，不再悄悄回退旧行为
+        if (!windowBackend.openTask(taskId)) {
             log("reYAMF_debug", "ERROR organizer adopt failed task=$taskId (no fallback)")
         }
     }
@@ -470,13 +468,17 @@ object YAMFManager : IYAMFManager.Stub() {
      * 释放平滑任务回全屏。
      * [toFront]：true=置顶回前（下拉全屏路径）；false=沉到原父级栈底（关闭小窗：
      * 任务转后台、留在最近任务，不抢当前前台）。
+     * [sessionWindowId]：会话窗口宿主的显式声明（透传至实现层）——会话回收不依赖
+     * 可失败的任务 displayId 反射查询，且在宿主绑定的 taskId 失配（应用自建新任务）时
+     * 按"该会话显示器上的顶层任务"兜底（真机实锤两轮：判定失败/任务失配都会导致
+     * 回收被跳过 → 会话屏随窗口释放后应用消失）。
      */
-    fun switchTaskToFullscreen(taskId: Int, toFront: Boolean = true): Boolean {
+    fun switchTaskToFullscreen(taskId: Int, toFront: Boolean = true, sessionWindowId: Int = -1): Boolean {
         WindowSessions.hostedTasks.remove(taskId)
         WindowSessions.taskActivities.remove(taskId)
 
         // 系统窗口后端：释放（organizer 优先，未接管任务走旧 WCT 回全屏兜底）
-        val released = windowBackend.releaseTask(taskId, toFront)
+        val released = windowBackend.releaseTask(taskId, toFront, sessionWindowId)
         // 流程层负责把最新受管集合同步给 Launcher（手势目标豁免；M6 批次2）
         broadcastManagedTaskIds()
         return released

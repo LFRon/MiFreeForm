@@ -4,12 +4,14 @@ import android.app.ActivityManager
 import android.content.ComponentName
 import android.content.Intent
 import android.graphics.Rect
-import android.os.Process
+import android.view.MotionEvent
+import android.view.Surface
 import com.buildsession.betterYAMF.window.backend.WindowBackend
 import com.buildsession.betterYAMF.window.backend.WindowBackendCallbacks
 import com.buildsession.betterYAMF.xposed.hook.freeform.FreeformBackend
 import com.buildsession.betterYAMF.xposed.hook.system.SystemSignals
 import com.buildsession.betterYAMF.xposed.hook.system.TaskSystemOps
+import com.buildsession.betterYAMF.xposed.services.YAMFManager
 import com.buildsession.betterYAMF.xposed.utils.Instances
 import com.buildsession.betterYAMF.xposed.utils.log
 import de.robv.android.xposed.XposedHelpers
@@ -31,6 +33,9 @@ object SmoothWindowBackend : WindowBackend {
     private const val WINDOWING_MODE_FULLSCREEN = 1
     private const val WINDOWING_MODE_FREEFORM = 5
 
+    /** 默认（物理）显示器 id（无杀迁移的"回全屏"目标）。 */
+    private const val DEFAULT_DISPLAY_ID = 0
+
     @Volatile
     private var callbacks: WindowBackendCallbacks? = null
 
@@ -51,10 +56,15 @@ object SmoothWindowBackend : WindowBackend {
         SmoothTaskOrganizer.init()
     }
 
-    override fun openTask(taskId: Int, densityDpi: Int): Boolean {
-        // 会话密度先落地（逻辑层声明、执行层贯彻执行）：认领前把承载根密度就位，
-        // 任务归入会话（reparent 入根）时即继承目标密度。
-        SmoothTaskOrganizer.ensureSessionDensity(densityDpi)
+    override fun openTask(taskId: Int): Boolean {
+        // 会话显示器承载：任务已在会话屏上以普通全屏应用身份运行，无任务级承载语义可认领；
+        // 仅恢复可聚焦（可交互）后返回。
+        if (SessionDisplays.isTaskOnSession(taskId)) {
+            setTaskFocusable(taskId, true)
+            log(TAG, "openTask task=$taskId (session display; adopt skipped)")
+            return true
+        }
+        // 容器兜底（无会话显示器）：认领 + 置前；不施加任何密度覆盖——小窗不改应用 DPI。
         val adopted = SmoothTaskOrganizer.adoptTask(taskId)
         val moveResult = runCatching { Instances.activityManager.moveTaskToFront(taskId, 0) }
         log(TAG, "openTask task=$taskId adopted=$adopted moveToFront=$moveResult")
@@ -63,33 +73,31 @@ object SmoothWindowBackend : WindowBackend {
         return adopted
     }
 
-    override fun releaseTask(taskId: Int, toFront: Boolean): Boolean {
+    override fun releaseTask(taskId: Int, toFront: Boolean, sessionWindowId: Int): Boolean {
         // 会话几何先清：无论走 organizer 释放还是旧路径兜底，几何缓存都不应残留
         forgetGeometry(taskId)
+
+        // 会话显示器承载：任务随会话屏存在，无容器可释放；回全屏语义 = **无杀进程迁移**——
+        // 任务整体迁移回默认显示器（toFront=true 置顶=下拉全屏；false 沉底=关闭小窗转后台），
+        // 应用进程/服务/最近任务条目全部保留；不改变任何应用 DPI。
+        // [sessionWindowId]：宿主显式声明（会话窗口）——不依赖 displayId 反射查询；且当宿主绑定的
+        // taskId 已失配（应用自建新任务）时，按"该会话显示器上的顶层任务"兜底解析（真机实锤）。
+        if (sessionWindowId >= 0 || SessionDisplays.isTaskOnSession(taskId)) {
+            setTaskFocusable(taskId, true)
+            val moved = moveTaskOffSession(taskId, toFront, sessionWindowId)
+            log(TAG, "releaseTask task=$taskId (session display; moved off, toFront=$toFront, window=$sessionWindowId) moved=$moved")
+            return moved
+        }
         // 关键：先把任务恢复为可聚焦，再发释放事务。释放事务内的 lifecycle 复算
         // （ensureActivitiesVisible + resumeFocusedTasksTopActivities）需要任务可聚焦，
         // 才会把回全屏后的任务判为可见/可恢复；否则焦点仍留在（已不可见的）launcher 上，
         // 实测 launcher 会随后把 home 置前（以 QuickstepLaunchHome 播放）→"应用看着退出了"。
         if (SmoothTaskOrganizer.isLeashManaged(taskId)) {
             setTaskFocusable(taskId, true)
-            // "平台摘根=外部启动在途"判定（最近任务/图标点击触发的 relaunch 由平台直接把
-            // 任务摘出我方根后再回调 vanish→release）：此类释放本质是"用户要打开应用全屏"，
-            // 必须走确定性重建，否则外部 launch 已折叠为置前、随后进程死亡 → 应用直接消失。
-            val outOfRootBefore = runCatching {
-                val runningTasks = XposedHelpers.callMethod(
-                    Instances.activityTaskManager, "getTasks", Int.MAX_VALUE, false, false, -1
-                ) as? List<*> ?: return@runCatching false
-                val info = runningTasks.filterIsInstance<ActivityManager.RunningTaskInfo>()
-                    .find { it.taskId == taskId } ?: return@runCatching false
-                !SmoothTaskOrganizer.isTaskInFloatingRoot(info)
-            }.getOrDefault(false)
+            // 无杀进程：组织者释放事务就地恢复任务（表面变换复位/回原父级/前后台语义，
+            // 含"平台摘根=外部启动在途"的保持在前判定——SmoothTaskOrganizer#releaseTask
+            // 内部 effectiveToFront 已覆盖）；不回收 UI 进程、不冷启动、不改任何密度。
             if (SmoothTaskOrganizer.releaseTask(taskId, toFront)) {
-                // 会话期应用进程以会话密度"出生"（视图/资源缓存/静态量均为会话密度产物）：
-                // 仅恢复配置不会重建界面 → 回全屏仍小密度。正确收尾 = 回收 UI 进程后
-                // **移除旧任务再显式全屏冷启动**（与"重启进入会话"同一套已验证配方）：
-                // 任务不被移除时显式启动会被 ATMS 折叠为"顶层活动已存在"（START_DELIVERED_TO_TOP，
-                // 实测 result code=3），随后进程死亡 Force removing → 应用消失（真机实证）。
-                recycleUiProcessOnRelease(taskId, toFront || outOfRootBefore)
                 return true
             }
         }
@@ -217,148 +225,256 @@ object SmoothWindowBackend : WindowBackend {
 
     override fun isAlwaysOnTopActive(): Boolean = SmoothTaskOrganizer.isRootAlwaysOnTop()
 
-    override fun isTaskManaged(taskId: Int): Boolean = SmoothTaskOrganizer.isLeashManaged(taskId)
+    override fun isTaskManaged(taskId: Int): Boolean =
+        SmoothTaskOrganizer.isLeashManaged(taskId) || SessionDisplays.isTaskOnSession(taskId)
 
-    override fun managedTaskIds(): IntArray = SmoothTaskOrganizer.managedTaskIds()
+    override fun managedTaskIds(): IntArray {
+        val base = SmoothTaskOrganizer.managedTaskIds().toMutableList()
+        if (SessionDisplays.anyActive()) {
+            runCatching {
+                val tasks = XposedHelpers.callMethod(
+                    Instances.activityTaskManager, "getTasks", Int.MAX_VALUE, false, false, -1
+                ) as? List<*> ?: return@runCatching
+                tasks.filterIsInstance<ActivityManager.RunningTaskInfo>()
+                    .filter { SessionDisplays.containsDisplay(XposedHelpers.getIntField(it, "displayId")) }
+                    .forEach { if (!base.contains(it.taskId)) base.add(it.taskId) }
+            }
+        }
+        return base.toIntArray()
+    }
 
     override fun isTaskInSessionRoot(taskInfo: ActivityManager.RunningTaskInfo): Boolean =
-        SmoothTaskOrganizer.isTaskInFloatingRoot(taskInfo)
+        SmoothTaskOrganizer.isTaskInFloatingRoot(taskInfo) ||
+                SessionDisplays.containsDisplay(XposedHelpers.getIntField(taskInfo, "displayId"))
 
     /**
-     * 结束既有任务（"重启进入会话"用）：从最近任务移除 + 结束**承载该任务的 UI 进程**。
+     * 任务是否运行在任一会话显示器上（流程分拣：会话屏任务是"我方启动"的，
+     * 与容器路径的"已在会话根内"语义等价，共用同一分拣分支）。
+     */
+    override fun isTaskInSessionDisplay(taskInfo: ActivityManager.RunningTaskInfo): Boolean =
+        SessionDisplays.containsDisplay(XposedHelpers.getIntField(taskInfo, "displayId"))
+
+    /**
+     * 既有任务迁移进入会话显示器（"重启进入会话"的无杀进程替代）。
      *
-     * 为什么必须清进程：既有任务的应用在显示器密度下渲染过，进程级资源缓存（皮肤引擎/
-     * 位图缓存等）已按旧密度解码，且会跨 Activity 重建存活；`removeTask` 对带常驻服务/
-     * 多进程的应用不保证杀进程，缓存跨进程存活 → 重启后仍会"部分 UI 旧密度"混排（QQ 实锤）。
-     * 最小代价的正确解 = 只结束 UI 进程（缓存所在）；推送/下载等 :子进程 保留。
-     * 顶层活动进程名精确解析失败时退回"结束该应用全部进程"（正确性优先——缓存必须清）。
+     * 迁移链（对照 LoS 24.0 源码）：
+     * 1. `IActivityTaskManager.moveRootTaskToDisplayOnTopOrBottom`（AIDL:416；
+     *    ActivityTaskManagerService.java:3507）→ `RootWindowContainer.moveRootTaskToDisplay`
+     *    （:2120）→ `Task.reparent(TaskDisplayArea, onTop)`（Task.java:6506）+
+     *    `Task.resumeNextFocusAfterReparent`（:5113）→ `resumeFocusedTasksTopActivities`
+     *    + `ensureActivitiesVisible`；
+     * 2. **小窗不改应用 DPI**：会话屏密度与默认显示器一致，迁移仅产生窗口尺寸变化——
+     *    声明了 screenSize/screenLayout 的应用走 onConfigurationChanged 自行重排，
+     *    未声明者由框架按标准语义同进程重建（进程/服务存活，无任何密度适配）；
+     * 3. 无 killApplicationProcess、无 removeTask、无冷启动。
+     *
+     * 失败兜底：任务不是顶层根任务等罕见情形走启动事务迁移（[moveTaskByLaunch]）。
      */
-    override fun discardTask(taskId: Int): Boolean = runCatching {
-        val runningTasks = XposedHelpers.callMethod(
-            Instances.activityTaskManager, "getTasks", Int.MAX_VALUE, false, false, -1
-        ) as? List<*> ?: run {
-            log(TAG, "discardTask task=$taskId: tasks unavailable")
+    override fun moveTaskToSession(taskId: Int, windowId: Int): Boolean {
+        val sessionDisplayId = if (windowId >= 0) SessionDisplays.displayIdFor(windowId) else -1
+        if (sessionDisplayId < 0) return false
+
+        // 已在任一会话屏上：目标屏幂等成功；其它窗口承载中的任务不抢夺
+        val currentDisplayId = SessionDisplays.displayIdOfTask(taskId)
+        if (currentDisplayId != null && SessionDisplays.containsDisplay(currentDisplayId)) {
+            if (currentDisplayId == sessionDisplayId) {
+                setTaskFocusable(taskId, true)
+                return true
+            }
+            log(TAG, "moveTaskToSession task=$taskId already on another session display=$currentDisplayId; skip")
             return false
         }
-        val info = runningTasks.filterIsInstance<ActivityManager.RunningTaskInfo>()
-            .find { it.taskId == taskId } ?: run {
-            log(TAG, "discardTask task=$taskId: not found")
+
+        val info = taskInfoOf(taskId) ?: run {
+            log(TAG, "moveTaskToSession task=$taskId not found")
             return false
         }
-        val pkg = info.baseActivity?.packageName ?: info.topActivity?.packageName
-
-        // 顺序敏感：先杀 UI 进程再移除任务。任务仍挂载时 topActivityProcessName 能解析到
-        // UI 进程名（精确只杀缓存所在进程，:MSF 等子进程保留）；先 removeTask 会让任务
-        // detached → 解析失败 → 退化为"全杀"（真机实证：ui process unresolved）。
-        killUiProcesses(info)
-
-        // removeTask 为隐藏系统 API（SDK 存根不含），统一走反射
-        runCatching { XposedHelpers.callMethod(Instances.activityTaskManager, "removeTask", taskId) }
-            .onFailure { log(TAG, "discardTask removeTask failed task=$taskId", it) }
-
-        log(TAG, "discardTask task=$taskId pkg=$pkg (removed + ui process recycled)")
-        true
-    }.onFailure { log(TAG, "discardTask failed task=$taskId", it) }.getOrDefault(false)
-
-    /**
-     * 结束承载该任务顶层活动的进程（进程级资源缓存所在）。
-     * 精确解析失败时退回"结束该应用全部进程"（正确性优先——缓存必须清，否则密度残影）。
-     */
-    private fun killUiProcesses(info: ActivityManager.RunningTaskInfo) {
-        val pkg = info.baseActivity?.packageName ?: info.topActivity?.packageName
-        val uiProcess = topActivityProcessName(info)
-        val procs = Instances.activityManager.getRunningAppProcesses()
-        if (uiProcess != null) {
-            procs?.filter { it.processName == uiProcess }?.forEach { pr ->
-                runCatching { Process.killProcess(pr.pid) }
-                    .onFailure { log(TAG, "kill UI process failed pid=${pr.pid}", it) }
-            }
-            log(TAG, "killUiProcesses uiProcess=$uiProcess (siblings preserved)")
-        } else if (pkg != null) {
-            procs?.filter { it.processName == pkg || it.processName.startsWith("$pkg:") }?.forEach { pr ->
-                runCatching { Process.killProcess(pr.pid) }
-                    .onFailure { log(TAG, "kill app processes failed pid=${pr.pid}", it) }
-            }
-            log(TAG, "killUiProcesses pkg=$pkg (ui process unresolved; all processes killed)")
+        if (TaskSystemOps.isHomeTask(info)) {
+            log(TAG, "moveTaskToSession task=$taskId is home; skip")
+            return false
         }
+
+        if (moveTaskToDisplay(taskId, sessionDisplayId, toFront = true)) {
+            setTaskFocusable(taskId, true)
+            log(TAG, "moveTaskToSession task=$taskId -> display=$sessionDisplayId (in-place, no kill)")
+            return true
+        }
+        if (moveTaskByLaunch(info, sessionDisplayId)) {
+            log(TAG, "moveTaskToSession task=$taskId -> display=$sessionDisplayId (launch fallback)")
+            return true
+        }
+        log(TAG, "moveTaskToSession task=$taskId failed")
+        return false
+    }
+
+    /** 回全屏/关闭收尾：把会话屏上的任务迁移回默认显示器（[toFront]=false 沉底=关闭转后台）。 */
+    private fun moveTaskOffSession(taskId: Int, toFront: Boolean, sessionWindowId: Int): Boolean {
+        val info = resolveSessionTask(taskId, sessionWindowId) ?: run {
+            // 任务已不在会话屏（如下拉全屏路径的二次释放调用）：no-op 成功
+            log(TAG, "moveTaskOffSession task=$taskId: no task on session display (no-op)")
+            return true
+        }
+        if (moveTaskToDisplay(info.taskId, DEFAULT_DISPLAY_ID, toFront)) {
+            log(TAG, "moveTaskOffSession task=${info.taskId} -> display $DEFAULT_DISPLAY_ID (onTop=$toFront, in-place, no kill)")
+            return true
+        }
+        if (moveTaskByLaunch(info, DEFAULT_DISPLAY_ID)) {
+            log(TAG, "moveTaskOffSession task=${info.taskId} -> display $DEFAULT_DISPLAY_ID (launch fallback)")
+            return true
+        }
+        log(TAG, "moveTaskOffSession task=$taskId failed")
+        return false
     }
 
     /**
-     * 回全屏收尾（"重启进入会话"在退出侧的对称实现）：
-     * 1. 先杀承载该任务的 UI 进程（进程级资源缓存所在；任务仍挂载时才能精确解析 UI 进程名）；
-     * 2. 需要回到前台的场景（toFront=true：下拉全屏 / 平台摘根=外部启动在途）
-     *    再 `removeTask` 移除旧任务 —— 否则显式启动会被 ATMS 折叠为"顶层活动已存在"
-     *    （START_DELIVERED_TO_TOP），随后进程死亡 Force removing → 应用消失（真机实证）；
-     * 3. 最后以全屏语义显式冷启动：新建任务、全新进程出生配置即显示器密度。
-     *
-     * 关闭小窗（toFront=false 且任务仍在我方根内）只回收不拉起：任务留在最近任务，
-     * 下次打开即冷启动正确密度。
+     * 解析会话屏上的目标任务：taskId 精确命中（且确实在会话屏上）优先；
+     * 失配（应用自建新任务后宿主绑定失效，真机实锤）按"该窗口会话屏上的顶层任务"兜底
+     * （getTasks 顺序即根容器自顶向下，首个命中即当前顶层任务）。
      */
-    private fun recycleUiProcessOnRelease(taskId: Int, toFront: Boolean) {
-        val resolved = runCatching {
-            val runningTasks = XposedHelpers.callMethod(
-                Instances.activityTaskManager, "getTasks", Int.MAX_VALUE, false, false, -1
-            ) as? List<*> ?: return@runCatching null
-            val info = runningTasks.filterIsInstance<ActivityManager.RunningTaskInfo>()
-                .find { it.taskId == taskId } ?: return@runCatching null
-            val component = info.topActivity ?: info.baseActivity ?: return@runCatching null
-            val userId = XposedHelpers.getIntField(info, "userId")
-            killUiProcesses(info)
-            if (toFront) {
-                runCatching { XposedHelpers.callMethod(Instances.activityTaskManager, "removeTask", taskId) }
-                    .onFailure { log(TAG, "removeTask before relaunch failed task=$taskId", it) }
+    private fun resolveSessionTask(taskId: Int, sessionWindowId: Int): ActivityManager.RunningTaskInfo? {
+        val infos = runningTaskInfos()
+        val exact = infos.find { it.taskId == taskId }
+        if (exact != null && runCatching {
+                SessionDisplays.containsDisplay(XposedHelpers.getIntField(exact, "displayId"))
+            }.getOrDefault(false)) {
+            return exact
+        }
+        if (sessionWindowId >= 0) {
+            val displayId = SessionDisplays.displayIdFor(sessionWindowId)
+            if (displayId >= 0) {
+                return infos.find {
+                    runCatching { XposedHelpers.getIntField(it, "displayId") == displayId }
+                        .getOrDefault(false)
+                }
             }
-            component to userId
-        }.getOrNull() ?: return
+        }
+        return null
+    }
 
-        if (!toFront) return
-        runCatching {
-            // 显式全屏冷启动：无 launchRootTask（留在默认 TDA），NEW_TASK 必新建任务
-            // （旧任务已移除，启动不再可能被折叠）；全新进程以当前配置（显示器密度）出生。
+    /**
+     * 把任务（须为显示区顶层根任务）移动到目标显示器顶层/底层：
+     * `moveRootTaskToDisplayOnTopOrBottom` → `TaskDisplayArea` reparent + 顶层/底部定序
+     * （onTop=true 触发 `onTaskMoved` → `notifyTaskMovedToFront`，真机事件日志实锤
+     * wm_task_to_front）。返回是否成功送达系统调用。
+     */
+    private fun moveTaskToDisplay(taskId: Int, displayId: Int, toFront: Boolean): Boolean = runCatching {
+        XposedHelpers.callMethod(
+            Instances.activityTaskManager,
+            "moveRootTaskToDisplayOnTopOrBottom", taskId, displayId, toFront
+        )
+        true
+    }.getOrElse {
+        log(TAG, "moveTaskToDisplay failed task=$taskId display=$displayId onTop=$toFront", it)
+        false
+    }
+
+    /**
+     * 启动事务迁移兜底：以任务 baseIntent（剥掉 NEW_DOCUMENT/MULTIPLE_TASK，仅保留 NEW_TASK）
+     * 重新请求启动到目标屏——`ActivityStarter.resolveReusableTask`（:3133）按
+     * realActivity/affinity 命中同一任务后 `reparentToTargetRootTask`（:3287），
+     * 无新实例、无杀进程（真机实锤：同 taskId/同 ActivityRecord 跨屏往返）。
+     */
+    private fun moveTaskByLaunch(info: ActivityManager.RunningTaskInfo, displayId: Int): Boolean = runCatching {
+        val baseIntent = info.baseIntent ?: return false
+        val options = android.app.ActivityOptions.makeBasic()
+        XposedHelpers.callMethod(options, "setLaunchDisplayId", displayId)
+        val intent = Intent(baseIntent).apply {
+            // 复用解析要求 baseIntent 不带 MULTIPLE_TASK/NEW_DOCUMENT；NEW_TASK 必需
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK
+        }
+        val userId = XposedHelpers.getIntField(info, "userId")
+        val userHandle = XposedHelpers.callStaticMethod(android.os.UserHandle::class.java, "of", userId)
+        XposedHelpers.callMethod(
+            Instances.systemContext, "startActivityAsUser",
+            arrayOf(Intent::class.java, android.os.Bundle::class.java, android.os.UserHandle::class.java),
+            intent, options.toBundle(), userHandle
+        )
+        true
+    }.getOrElse {
+        log(TAG, "moveTaskByLaunch failed task=${info.taskId} display=$displayId", it)
+        false
+    }
+
+    /** 全量任务快照（getTasks；顺序即顶层在前）。 */
+    private fun runningTaskInfos(): List<ActivityManager.RunningTaskInfo> = runCatching {
+        val tasks = XposedHelpers.callMethod(
+            Instances.activityTaskManager, "getTasks", Int.MAX_VALUE, false, false, -1
+        ) as? List<*> ?: return emptyList()
+        tasks.filterIsInstance<ActivityManager.RunningTaskInfo>()
+    }.getOrDefault(emptyList())
+
+    private fun taskInfoOf(taskId: Int): ActivityManager.RunningTaskInfo? =
+        runningTaskInfos().find { it.taskId == taskId }
+
+    /** 同包可迁移任务（排除已运行在会话屏上的与 Home——不抢夺其它窗口承载中的实例/桌面任务）。 */
+    private fun findMovableTaskIdForPackage(packageName: String): Int? =
+        runningTaskInfos().firstOrNull { info ->
+            val pkg = info.topActivity?.packageName ?: info.baseActivity?.packageName
+            pkg == packageName &&
+                    !TaskSystemOps.isHomeTask(info) &&
+                    runCatching {
+                        !SessionDisplays.containsDisplay(XposedHelpers.getIntField(info, "displayId"))
+                    }.getOrDefault(false)
+        }?.taskId
+
+    /**
+     * 小窗会话启动（两条实现路径）：
+     *
+     * - **会话显示器承载（现行默认）**：宿主窗口已有会话屏 → 同包既有任务就地迁移进会话屏
+     *   （无杀进程、不改 DPI）；无既有任务时以普通全屏活动冷启动到会话屏
+     *   （NEW_TASK，允许 ATMS 复用既有任务，不制造重复实例）。
+     * - **容器兜底（无会话屏）**：freeform 启动 + **启动即入承载根**（承载根标识属实现细节，
+     *   逻辑层不感知）。源码对齐：`RootWindowContainer#getOrCreateRootTask`（:3156）第一优先取
+     *   `options.getLaunchRootTask()`；`TaskDisplayArea#getLaunchRootTask`（:1012）校验
+     *   `mCreatedByOrganizer`（我们的承载根满足）；`ActivityOptions#toBundle`（:2498）携带
+     *   `KEY_LAUNCH_ROOT_TASK_TOKEN` 过 Binder。根未就绪则退回默认启动路径（认领兜底）。
+     */
+    override fun launchAppForSession(component: ComponentName, userId: Int, windowId: Int): Boolean = runCatching {
+        // 会话显示器承载（实现路由）：宿主窗口已有会话屏 → 应用以普通全屏活动进入该屏。
+        // **小窗不改应用 DPI**：会话屏密度跟随默认显示器，跨屏迁移只产生窗口尺寸变化
+        // （标准 Android 窗口行为）；不设 launchWindowingMode/launchRootTask（容器实现细节）。
+        val sessionDisplayId = if (windowId >= 0) SessionDisplays.displayIdFor(windowId) else -1
+        if (sessionDisplayId >= 0) {
+            // 无杀进程优先：同包既有任务就地迁移进入会话屏（应用进程存活、任务身份保留，
+            // 不再制造重复实例）——失败才退回冷启动（下面 NEW_TASK 分支）。
+            findMovableTaskIdForPackage(component.packageName)?.let { existing ->
+                if (moveTaskToDisplay(existing, sessionDisplayId, toFront = true)) {
+                    setTaskFocusable(existing, true)
+                    log(TAG, "launchAppForSession move-existing task=$existing display=$sessionDisplayId pkg=${component.packageName}")
+                    return@runCatching true
+                }
+                log(TAG, "launchAppForSession move-existing failed task=$existing pkg=${component.packageName}; fallback cold launch")
+            }
+
+            val options = android.app.ActivityOptions.makeBasic()
+            XposedHelpers.callMethod(options, "setLaunchDisplayId", sessionDisplayId)
+
+            // 关键：只带 FLAG_ACTIVITY_NEW_TASK（不带 NEW_DOCUMENT/MULTIPLE_TASK）——
+            // 允许 ATMS 复用既有任务（ActivityStarter.resolveReusableTask :3133），
+            // 冷启动同样"一应用一任务"，不再制造重复实例。
             val intent = Intent().apply {
-                component = resolved.first
+                this.component = component
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
+
             val userHandle = XposedHelpers.callStaticMethod(
-                android.os.UserHandle::class.java, "of", resolved.second
+                android.os.UserHandle::class.java,
+                "of",
+                userId
             )
             XposedHelpers.callMethod(
-                Instances.systemContext, "startActivityAsUser",
-                arrayOf(Intent::class.java, android.os.Bundle::class.java, android.os.UserHandle::class.java),
-                intent, null, userHandle
+                Instances.systemContext,
+                "startActivityAsUser",
+                intent,
+                options.toBundle(),
+                userHandle
             )
-            log(TAG, "relaunch fullscreen after release task=$taskId component=${resolved.first}")
-        }.onFailure { log(TAG, "relaunch fullscreen failed task=$taskId", it) }
-    }
+            log(TAG, "launchAppForSession cold display=$sessionDisplayId component=$component user=$userId")
+            return@runCatching true
+        }
 
-    /** 解析任务顶层活动所在进程名（UI 进程，缓存所在）；失败返回 null。 */
-    private fun topActivityProcessName(taskInfo: ActivityManager.RunningTaskInfo): String? = runCatching {
-        val token = XposedHelpers.getObjectField(taskInfo, "token") ?: return null
-        val binder = XposedHelpers.callMethod(token, "asBinder") as? android.os.IBinder ?: return null
-        val wcClass = Instances.systemContext.classLoader
-            .loadClass("com.android.server.wm.WindowContainer")
-        val wc = XposedHelpers.callStaticMethod(wcClass, "fromBinder", binder) ?: return null
-        val task = XposedHelpers.callMethod(wc, "asTask") ?: return null
-        val activity = XposedHelpers.callMethod(task, "topRunningActivity") ?: return null
-        // ActivityRecord#getProcessName（ActivityRecord.java:9267）
-        XposedHelpers.callMethod(activity, "getProcessName") as? String
-    }.getOrNull()
-
-    /**
-     * 小窗会话启动：freeform 目标 + **启动即入承载根**（承载根标识属实现细节，逻辑层不感知）。
-     *
-     * 源码对齐：`RootWindowContainer#getOrCreateRootTask`（:3156）第一优先取
-     * `options.getLaunchRootTask()`；`TaskDisplayArea#getLaunchRootTask`（:1012）校验
-     * `mCreatedByOrganizer`（我们的承载根满足）；`ActivityOptions#toBundle`（:2498）携带
-     * `KEY_LAUNCH_ROOT_TASK_TOKEN` 过 Binder。
-     *
-     * 意义：应用从首帧起就处于根级密度覆盖之下，不再经历"先按显示器密度渲染、settle 时再改
-     * 密度"的重建 + 缓存残影（QQ 大小混排的根因）。根未就绪则退回默认启动路径（认领兜底）。
-     */
-    override fun launchAppForSession(component: ComponentName, userId: Int, densityDpi: Int): Boolean = runCatching {
-        // 密度先于启动落地：应用任务出生（入根）时承载根密度已就位 → 首帧即会话密度。
-        // 落地方式（承载根容器级覆盖 + WCT）是执行层细节，逻辑层只声明目标值。
-        SmoothTaskOrganizer.ensureSessionDensity(densityDpi)
+        // 容器兜底路径（无会话显示器）：freeform 启动入承载根；不施加任何密度覆盖——
+        // 小窗不改应用 DPI，应用按默认显示器密度与窗口尺寸自行布局。
         val options = android.app.ActivityOptions.makeBasic()
         XposedHelpers.callMethod(options, "setLaunchWindowingMode", WINDOWING_MODE_FREEFORM)
         SmoothTaskOrganizer.launchRootToken()?.let { rootToken ->
@@ -414,6 +530,41 @@ object SmoothWindowBackend : WindowBackend {
     override fun recentsGestureSuppressUntilMs(): Long = SystemSignals.recentsGestureSuppressUntilMs
 
     override fun injectHomeKey(): Boolean = TaskSystemOps.injectHomeKey()
+
+    // === 会话显示器能力（"虚拟屏承载"实现细节收口在 SessionDisplays） ===
+
+    override fun usesDisplaySession(): Boolean = runCatching {
+        // 配置读取（旧配置文件无此键 → null → 视为默认启用"显示器承载"）
+        YAMFManager.config.useVirtualDisplay != false
+    }.getOrDefault(false)
+
+    override fun attachSessionDisplay(windowId: Int, width: Int, height: Int): Int =
+        SessionDisplays.createForWindow(windowId, width, height, defaultDisplayDensity())
+
+    /** 默认（物理）显示器当前密度——会话屏沿用（小窗不改应用 DPI，跨屏无密度差异）。 */
+    private fun defaultDisplayDensity(): Int = runCatching {
+        Instances.systemContext.resources.displayMetrics.densityDpi
+    }.getOrDefault(android.util.DisplayMetrics.DENSITY_DEFAULT)
+
+    override fun updateSessionDisplaySurface(windowId: Int, surface: Surface?) {
+        SessionDisplays.setSurface(windowId, surface)
+    }
+
+    override fun resizeSessionDisplay(windowId: Int, width: Int, height: Int) {
+        SessionDisplays.resize(windowId, width, height)
+    }
+
+    override fun releaseSessionDisplay(windowId: Int) {
+        SessionDisplays.release(windowId)
+    }
+
+    override fun sessionDisplayId(windowId: Int): Int = SessionDisplays.displayIdFor(windowId)
+
+    override fun injectSessionPointer(windowId: Int, event: MotionEvent, viewWidth: Int, viewHeight: Int): Boolean =
+        SessionDisplays.injectPointer(windowId, event, viewWidth, viewHeight)
+
+    override fun injectSessionKey(windowId: Int, keyCode: Int): Boolean =
+        SessionDisplays.injectKey(windowId, keyCode)
 
     // === 后端 → 宿主回灌（由 SmoothTaskOrganizer 在系统回调内调用） ===
 
