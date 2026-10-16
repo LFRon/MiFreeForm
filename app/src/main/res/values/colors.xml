@@ -3,6 +3,8 @@
     <color name="color_warning">#FBC02D</color>
     <color name="black">#FF000000</color>
     <color name="accentColor">@android:color/system_accent1_500</color>
+    <color name="window_handle_gray">#8C8C8C</color>
+    <color name="window_bezel">#E0E0E0</color>
 
     //dark theme
     <color name="darkThemeText">#cdcccc</color>
