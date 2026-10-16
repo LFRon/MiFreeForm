@@ -61,6 +61,16 @@ class SettingActivity : AppCompatActivity() {
                 }
             })
 
+            sliderBarRounded.addOnSliderTouchListener(object : Slider.OnSliderTouchListener {
+                override fun onStartTrackingTouch(slider: Slider) {}
+
+                override fun onStopTrackingTouch(slider: Slider) {
+                    tvBarRoundedValue.text = "${slider.value.toInt()}"
+                    config.barRoundedCorner = slider.value.toInt()
+                    SettingsRepository.setBarRoundedCorner(slider.value.toInt())
+                }
+            })
+
             sliderAnimationSpeed.addOnSliderTouchListener(object : Slider.OnSliderTouchListener {
                 override fun onStartTrackingTouch(slider: Slider) {}
 
@@ -83,8 +93,10 @@ class SettingActivity : AppCompatActivity() {
             etSizeH.setText(if (config.defaultWindowHeight > 0) config.defaultWindowHeight.toString() else "")
             etSizeW.setText(config.defaultWindowWidth.toString())
             sliderRounded.value = config.windowRoundedCorner.toFloat()
+            sliderBarRounded.value = config.barRoundedCorner.toFloat()
             sliderAnimationSpeed.value = config.animationSpeed
             tvRoundedValue.text = "${config.windowRoundedCorner}"
+            tvBarRoundedValue.text = "${config.barRoundedCorner}"
             tvAnimationSpeedValue.text = if (config.animationSpeed == 5100f) {
                 getString(R.string.default_speed)
             } else {

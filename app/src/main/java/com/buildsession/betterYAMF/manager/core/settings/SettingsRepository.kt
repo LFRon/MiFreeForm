@@ -75,6 +75,8 @@ object SettingsRepository {
 
     fun setWindowRoundedCorner(dp: Int) = update { it.windowRoundedCorner = dp }
 
+    fun setBarRoundedCorner(dp: Int) = update { it.barRoundedCorner = dp }
+
     fun setAnimationSpeed(speed: Float) = update { it.animationSpeed = speed }
 
     fun setWindowSize(widthDp: Int, heightDp: Int) = update {

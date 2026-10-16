@@ -3,28 +3,44 @@ package com.buildsession.betterYAMF.window.core
 /**
  * mini/贴边几何策略（纯逻辑，零平台依赖；宿主只负责传值与执行）。
  *
- * 公式与宿主旧实现逐位对齐（整数除法、coerce 次序、insets 为原始像素值）：
- * - 目标尺寸：角落 = 原尺寸 ÷ 2；侧边 = 原尺寸 ÷ 3；
+ * 模型（参考澎湃OS 5.jpg）：mini 目标 = **屏幕比例尺寸**——窗宽 ≈ 屏宽 28.5%、
+ * 窗高 ≈ 屏高 20%；与角落/侧边无关（只影响贴靠位置）。应用在框内拉伸铺满
+ * （不保比例，见 writeLeashTransform），故 mini 尺寸不再随应用内容区/分除变化。
+ *
+ * 公式约定（整数除法、coerce 次序、insets 为原始像素值）：
  * - 角落 TL/BL/BR 贴对应角，TR 与未知 kind 走"右上角"兜底；
  * - 侧边 y 以进入前的位置为基准并夹取到 [margin, screenH-h-margin]（下界不小于 margin）。
  */
 object MiniPolicy {
 
+    /** 外壳固定厚度：窗口卡与内容区之差（分除不作用于它）。 */
+    data class ShellInsets(val left: Int, val top: Int, val right: Int, val bottom: Int) {
+        val width: Int get() = left + right
+        val height: Int get() = top + bottom
+
+        companion object {
+            /** 逐帧插值（mini 进出动画中，外壳厚度随模式平滑过渡）。 */
+            fun lerp(from: ShellInsets, to: ShellInsets, f: Float): ShellInsets = ShellInsets(
+                (from.left + (to.left - from.left) * f).toInt(),
+                (from.top + (to.top - from.top) * f).toInt(),
+                (from.right + (to.right - from.right) * f).toInt(),
+                (from.bottom + (to.bottom - from.bottom) * f).toInt()
+            )
+        }
+    }
+
     fun enterTarget(
         corner: DropKind,
         screenWidth: Int,
         screenHeight: Int,
-        originalWidth: Int,
-        originalHeight: Int,
         marginPx: Int,
         topInsetPx: Int,
         bottomInsetPx: Int,
         currentTop: Int?
     ): WindowRect {
-        val isSide = corner == DropKind.SIDE_LEFT || corner == DropKind.SIDE_RIGHT
-        val miniDivisor = if (isSide) 3 else 2
-        val w = originalWidth / miniDivisor
-        val h = originalHeight / miniDivisor
+        // 屏幕比例尺寸（整数除法，与参考图逐项对齐）
+        val w = screenWidth * 285 / 1000
+        val h = screenHeight * 200 / 1000
         val margin = marginPx
         return when (corner) {
             DropKind.CORNER_TL -> WindowRect(

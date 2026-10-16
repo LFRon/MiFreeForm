@@ -38,6 +38,8 @@
     <string name="sidebar_transparency">侧边栏透明度</string>
     <string name="_80">80</string>
     <string name="window_rounded_corner">窗口圆角大小</string>
+    <string name="bar_rounded_corner">顶/底栏圆角大小</string>
+    <string name="_12">12</string>
     <string name="_20">20</string>
     <string name="sidebar_position">右置侧边栏</string>
     <string name="app_added_to_sidebar">App added to sidebar</string>

@@ -38,6 +38,8 @@
     <string name="sidebar_transparency">Sidebar Transparency</string>
     <string name="_80">80</string>
     <string name="window_rounded_corner">Window Rounded Corner</string>
+    <string name="bar_rounded_corner">Handle Bar Corner</string>
+    <string name="_12">12</string>
     <string name="_20">20</string>
     <string name="sidebar_position">Sidebar Position</string>
     <string name="app_added_to_sidebar">App added to sidebar</string>

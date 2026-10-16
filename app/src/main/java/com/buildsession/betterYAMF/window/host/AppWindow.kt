@@ -14,6 +14,8 @@ import android.content.res.ColorStateList
 import android.content.res.Configuration
 import android.content.res.Resources
 import android.graphics.PixelFormat
+import android.graphics.drawable.GradientDrawable
+import com.google.android.material.shape.ShapeAppearanceModel
 import android.hardware.display.DisplayManager
 import android.os.Build
 import android.util.DisplayMetrics
@@ -39,6 +41,7 @@ import androidx.dynamicanimation.animation.FlingAnimation
 import androidx.dynamicanimation.animation.flingAnimationOf
 import androidx.wear.widget.RoundedDrawable
 import com.google.android.material.color.MaterialColors
+import com.buildsession.betterYAMF.R
 import com.buildsession.betterYAMF.common.getAttr
 import com.buildsession.betterYAMF.common.onException
 import com.buildsession.betterYAMF.common.ipc.Protocol
@@ -81,6 +84,8 @@ class AppWindow(
 ) : WindowHost {
     companion object {
         const val TAG = "reYAMF_AppWindow"
+        /** mini 贴边边框厚度（dp）：对齐澎湃OS小窗装饰的银色边框环。 */
+        private const val MINI_BEZEL_DP = 6f
         private const val HOME_REFRONT_DELAY_MS = 0L
         private const val MINI_START_DELAY_MS = 500L
         private val shellRegistry = WindowShellRegistry()
@@ -133,6 +138,18 @@ class AppWindow(
     private var frameOffsetY = 0
     private var frameOffsetKnown = false
     private var contentTouchThrough = true
+
+    /** mini 化中（外壳装饰 / 内容区几何随模式切换，见 shellInsets 与 applyXCrome）。 */
+    private var miniActive = false
+
+    /** 进出 mini 动画中外壳厚度的逐帧插值值（null=按当前模式取常量）。 */
+    private var animInsets: MiniPolicy.ShellInsets? = null
+
+    /** 手势进行中（移动/侧/底栏拖拽）：此间几何走 leash 缩放，结束再落真实 bounds。 */
+    private var dragging = false
+
+    /** 缩放手势进行中（拖拽缩放预览）：此间几何走 leash 缩放，提交时落真实 bounds。 */
+    private var resizeGesture = false
     private val frameOffsetLayoutListener =
         android.view.ViewTreeObserver.OnGlobalLayoutListener { refreshFrameOffset() }
 
@@ -242,9 +259,11 @@ class AppWindow(
             dispatchInput(WindowInputEvent.Tap(windowId, System.currentTimeMillis(), RegionId.BAR_SIDE))
         }
 
+        // 顶部拖动栏：整栏可拖（白底 + 居中三点；模式与窗口移动语义由核心决策，
+        // 宿主只把整栏的触摸事件接入 HANDLE 手势输入）
         binding.ibSuper.setOnTouchListener { _, event ->
             translateMoveGesture(RegionId.HANDLE, event)
-            false
+            true
         }
 
         binding.cvBarClickMask.setOnTouchListener(object : View.OnTouchListener {
@@ -289,20 +308,16 @@ class AppWindow(
 
         isResize = false
         binding.cvBackground.post {
-            originalWidth = binding.cvBackground.width
-            originalHeight = binding.cvBackground.height
             binding.cvBackground.visibility = View.VISIBLE
-
-            binding.cvBackground.radius = config.windowRoundedCorner.dpToPx()
-
-
-            binding.cvParent.radius = (config.windowRoundedCorner+2).dpToPx()
-            // 圆角裁剪在系统侧完成：会话期 SmoothTaskOrganizer 关闭"客户端自绘圆角"优化
-            // （toggleClientDrawnRoundedCornersOpt(false)），SF 直接对 leash 做圆角裁剪，
-            // 应用侧零圆角状态 → 无镜像、无残留；宿主侧不再需要遮罩视图。
+            binding.cvParent.visibility = View.VISIBLE
+            // 应用本体永不自绘圆角（会话期 toggleClientDrawnRoundedCornersOpt(false) +
+            // leash 侧不再写圆角）：可见圆角/边框一律由外壳装饰提供（点击态=方角；
+            // mini=贴边边框盖住应用方角，与澎湃OS"装饰提供圆角"模型一致）。
+            applyNormalChrome()
+            applyHandleBarChrome()
+            // 记录窗口卡的自然尺寸（退出 mini 的展开/夹取以卡片为基准；分除基准见 shellInsets）
             originalWidth = binding.cvParent.width
             originalHeight = binding.cvParent.height
-            binding.cvParent.visibility = View.VISIBLE
 
             // M7：内容就绪前整卡不可见（消除打开时的"孤钮/空白卡"帧）。
             // 就绪信号 = onOrganizerLeash（任务 leash 到手并摆放）；另有超时兜底。
@@ -409,9 +424,13 @@ class AppWindow(
             // 触下即接管几何：取消惯性/夹取/内容矩形动画（修复"框自己跳走"）
             cancelGeometryAnimators()
             gestureRegion = region
+            dragging = true
             val params = binding.root.layoutParams as WindowManager.LayoutParams
             dragAnchorX = params.x
             dragAnchorY = params.y
+        } else if (event.action == MotionEvent.ACTION_UP || event.action == MotionEvent.ACTION_CANCEL) {
+            // 手势结束：后续推导即落真实 bounds（应用按窗口尺寸重排）
+            dragging = false
         }
         moveGestureDetector.onTouchEvent(event)
         when (event.action) {
@@ -699,7 +718,7 @@ class AppWindow(
             return
         }
 
-        applySmoothBounds(rect)
+        applySmoothBounds(rect, animated = false)
     }
 
     /**
@@ -710,26 +729,35 @@ class AppWindow(
     private fun updateSmoothBounds(rect: android.graphics.Rect) {
         if (currentTaskId == -1) return
         if (rect.width() <= 0 || rect.height() <= 0) return
-        applySmoothBounds(rect)
+        applySmoothBounds(rect, animated = true)
     }
 
-    /** 几何落地共享尾部（两条入口必须一致）：触摸洞 + 圆角 + 后端应用。 */
-    private fun applySmoothBounds(rect: android.graphics.Rect) {
+    /**
+     * 几何落地共享尾部（两条入口）：触摸洞 + 内容盒 + 后端应用。
+     * [animated]（或 mini/手势/惯性/夹取进行中）= 过渡态：leash 缩放保持流畅；
+     * 静止态则落**真实窗口 bounds**（应用按窗口尺寸自行重排——不扁、不裁，对齐澎湃OS）。
+     */
+    private fun applySmoothBounds(rect: android.graphics.Rect, animated: Boolean) {
+        // rect 为窗口卡（外壳）矩形；内容盒 = 应用内容区 = 卡内沿去掉固定外壳。
+        val contentBox = contentBoxOf(rect)
+
+        // 触摸洞 = 应用内容区精确矩形（正常态：内容交互直通应用；外壳条/边距由 chrome 自持）
         if (contentTouchThrough) {
-            val handleHeight = binding.ibSuper.height.takeIf { it > 0 } ?: 25.dpToPx().toInt()
-            WindowSessions.chromeTouchHoles[windowId] = android.graphics.Rect(
-                rect.left,
-                rect.top + handleHeight,
-                rect.right,
-                rect.bottom
-            )
+            WindowSessions.chromeTouchHoles[windowId] = android.graphics.Rect(contentBox)
         } else {
             WindowSessions.chromeTouchHoles.remove(windowId)
         }
 
-        if (YAMFManager.windowBackend.currentGeometry(currentTaskId) != rect) {
+        val settling = !animated && !miniActive && !resizeGesture && !dragging &&
+            flingXAnimation?.isRunning != true &&
+            flingYAnimation?.isRunning != true &&
+            keepInScreenAnimator?.isRunning != true
+        if (settling) {
+            // 静止：真实 bounds（应用自适应重排）
+            YAMFManager.windowBackend.applyRealBounds(currentTaskId, contentBox)
+        } else if (YAMFManager.windowBackend.currentGeometry(currentTaskId) != contentBox) {
             // 系统窗口后端：几何落地（leash 变换或兼容路径由实现决定，宿主不感知）
-            YAMFManager.windowBackend.applyGeometry(currentTaskId, rect)
+            YAMFManager.windowBackend.applyGeometry(currentTaskId, contentBox)
         }
     }
 
@@ -1004,7 +1032,11 @@ class AppWindow(
             val targetX = params.x.coerceIn(minX, maxX)
             val targetY = params.y.coerceIn(minY, maxY)
 
-            if (targetX == params.x && targetY == params.y) return@post
+            if (targetX == params.x && targetY == params.y) {
+                // 已就位：直接落真实 bounds（惯性/夹取链的静止收尾）
+                updateSmoothBounds()
+                return@post
+            }
 
             keepInScreenAnimator?.cancel()
 
@@ -1023,6 +1055,12 @@ class AppWindow(
                             updateSmoothBounds()
                         }
                     }
+                    addListener(object : android.animation.AnimatorListenerAdapter() {
+                        override fun onAnimationEnd(animation: android.animation.Animator) {
+                            // 夹取结束：落真实 bounds（应用按窗口尺寸/位置重排）
+                            updateSmoothBounds()
+                        }
+                    })
                     start()
                 }
             } else {
@@ -1047,6 +1085,92 @@ class AppWindow(
         return android.graphics.Rect(left, top, left + binding.cvParent.width, top + binding.cvParent.height)
     }
 
+    /**
+     * 外壳固定厚度：窗口卡内沿与应用内容区之差。应用内容区（= 用户设定的"窗口尺寸"）
+     * 才是 leash 缩放盒；mini 分除、等比适配均以内容区为基准。
+     * - 点击态：2dp 边距 + 顶部拖动栏（白底 + 三点）；
+     * - mini：贴边边框（均匀厚度，装饰对齐澎湃OS小窗）；
+     * - 进出 mini 动画：取动画插值值，几何平滑过渡。
+     */
+    private fun shellInsets(): MiniPolicy.ShellInsets {
+        animInsets?.let { return it }
+        return if (miniActive) miniInsets() else normalInsets()
+    }
+
+    /** 点击态外壳：2dp 边距 + 顶部拖动栏。 */
+    private fun normalInsets(): MiniPolicy.ShellInsets {
+        val margin = 2.dpToPx().toInt()
+        val strip = binding.ibSuper.height.takeIf { it > 0 } ?: 18.dpToPx().toInt()
+        return MiniPolicy.ShellInsets(margin, margin + strip, margin, margin)
+    }
+
+    /** mini 外壳：贴边边框（均匀厚度）。 */
+    private fun miniInsets(): MiniPolicy.ShellInsets {
+        val bezel = MINI_BEZEL_DP.dpToPx().toInt()
+        return MiniPolicy.ShellInsets(bezel, bezel, bezel, bezel)
+    }
+
+    /** 窗口卡矩形 → 应用内容区矩形（leash 缩放盒；宽高下限 1px 防动画终点负值）。 */
+    private fun contentBoxOf(card: android.graphics.Rect): android.graphics.Rect {
+        val insets = shellInsets()
+        val left = card.left + insets.left
+        val top = card.top + insets.top
+        return android.graphics.Rect(
+            left,
+            top,
+            (card.right - insets.right).coerceAtLeast(left + 1),
+            (card.bottom - insets.bottom).coerceAtLeast(top + 1)
+        )
+    }
+
+    /**
+     * 点击态外壳装饰：应用方角（"可点击时不需要圆角"）+ 白顶栏 + 底栏手势。
+     * 装饰只承担顶/底栏与边框（应用本体不做任何裁剪/圆角 —— 澎湃OS小窗模型）。
+     */
+    private fun applyNormalChrome() {
+        binding.cvBackground.radius = 0f
+        binding.cvParent.radius = 0f
+        binding.cvParent.strokeWidth = 2.dpToPx().toInt()
+        binding.cvParent.setStrokeColor(ColorStateList.valueOf(context.getColor(R.color.transparentOutline)))
+        binding.ibSuper.visibility = View.VISIBLE
+    }
+
+    /**
+     * 顶/底栏圆角（设置项 barRoundedCorner）：白顶栏背景 + 底部白容器（手势线=灰，见布局）。
+     * 与内容贴合的一侧恒为方角（顶栏下缘 / 底栏上缘），只圆外侧两角——"贴住应用"的观感。
+     */
+    private fun applyHandleBarChrome() {
+        val r = config.barRoundedCorner.dpToPx()
+        binding.ibSuper.background = GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            setColor(0xFFFFFFFF.toInt())
+            // 上两角圆、下缘方（紧贴应用顶边）
+            cornerRadii = floatArrayOf(r, r, r, r, 0f, 0f, 0f, 0f)
+        }
+        // 下两角圆、上缘方（紧贴应用底边）
+        binding.cvBar.shapeAppearanceModel = ShapeAppearanceModel.builder()
+            .setTopLeftCornerSize(0f)
+            .setTopRightCornerSize(0f)
+            .setBottomLeftCornerSize(r)
+            .setBottomRightCornerSize(r)
+            .build()
+    }
+
+    /**
+     * mini 外壳装饰（对齐澎湃OS）：银色圆角边框环盖住应用方角 ——
+     * 外沿圆角 = 圆角设置，厚度 = 边框宽，内沿圆角 = 外沿-厚度（同心）；
+     * 可见圆角由边框提供，应用本体保持方角。顶栏（白条+三点）在 mini 隐藏。
+     */
+    private fun applyMiniChrome() {
+        val bezel = MINI_BEZEL_DP.dpToPx()
+        val r = config.windowRoundedCorner.dpToPx()
+        binding.cvParent.radius = r
+        binding.cvBackground.radius = (r - bezel).coerceAtLeast(0f)
+        binding.cvParent.strokeWidth = bezel.toInt()
+        binding.cvParent.setStrokeColor(ColorStateList.valueOf(context.getColor(R.color.window_bezel)))
+        binding.ibSuper.visibility = View.GONE
+    }
+
     /** 逐帧应用内容矩形：窗口位置 + 卡片尺寸 + leash 一次到位（同一几何事实源）。 */
     private fun applyContentRectFrame(rect: android.graphics.Rect) {
         val params = binding.root.layoutParams as? WindowManager.LayoutParams ?: return
@@ -1068,6 +1192,8 @@ class AppWindow(
         from: android.graphics.Rect,
         to: android.graphics.Rect,
         durationMs: Long,
+        insetsFrom: MiniPolicy.ShellInsets? = null,
+        insetsTo: MiniPolicy.ShellInsets? = null,
         onEnd: (() -> Unit)? = null
     ) {
         // 内容矩形动画独占几何：取消惯性/夹取/上一次几何动画（修复"框自己跳走"）
@@ -1075,6 +1201,7 @@ class AppWindow(
         animDeltaW = (binding.cvParent.width - binding.cvBackground.width).coerceAtLeast(0)
         animDeltaH = (binding.cvParent.height - binding.cvBackground.height).coerceAtLeast(0)
         if (durationMs <= 0L || from == to) {
+            animInsets = null
             applyContentRectFrame(to)
             onEnd?.invoke()
             return
@@ -1084,6 +1211,10 @@ class AppWindow(
             interpolator = DecelerateInterpolator()
             addUpdateListener { anim ->
                 val f = anim.animatedValue as Float
+                // 外壳厚度随模式切换逐帧插值（点击态 ↔ mini），内容盒不做跳变
+                if (insetsFrom != null && insetsTo != null) {
+                    animInsets = MiniPolicy.ShellInsets.lerp(insetsFrom, insetsTo, f)
+                }
                 applyContentRectFrame(
                     android.graphics.Rect(
                         (from.left + (to.left - from.left) * f).toInt(),
@@ -1096,6 +1227,7 @@ class AppWindow(
             addListener(object : android.animation.AnimatorListenerAdapter() {
                 override fun onAnimationEnd(animation: android.animation.Animator) {
                     if (boundsAnimator === animation) boundsAnimator = null
+                    animInsets = null
                     onEnd?.invoke()
                 }
             })
@@ -1123,9 +1255,11 @@ class AppWindow(
                 val p = binding.root.layoutParams as? WindowManager.LayoutParams
                 val loc = IntArray(2)
                 binding.root.getLocationOnScreen(loc)
+                val insets = shellInsets()
+                val card = currentContentRect()
                 log(
                     TAG,
-                    "GEOM window=$windowId task=$currentTaskId destroyed=$isDestroyed " +
+                    "GEOM window=$windowId task=$currentTaskId destroyed=$isDestroyed mini=$miniActive " +
                         "params=(${p?.x},${p?.y}) loc=(${loc[0]},${loc[1]}) " +
                         "root=${binding.root.width}x${binding.root.height} alpha=${binding.root.alpha} vis=${binding.root.visibility} " +
                         "revealed=$chromeRevealed pendingReveal=$pendingReveal " +
@@ -1135,6 +1269,8 @@ class AppWindow(
                         "${binding.cvBackground.width}x${binding.cvBackground.height},vis=${binding.cvBackground.visibility}) " +
                         "ibSuper=(l=${binding.ibSuper.left},t=${binding.ibSuper.top}," +
                         "${binding.ibSuper.width}x${binding.ibSuper.height},vis=${binding.ibSuper.visibility}) " +
+                        "insets=(l=${insets.left},t=${insets.top},r=${insets.right},b=${insets.bottom}) " +
+                        "contentBox=${card?.let { contentBoxOf(it) } ?: "n/a"} " +
                         "offset=(${frameOffsetX},${frameOffsetY},known=$frameOffsetKnown)"
                 )
             }.onFailure { log(TAG, "dumpGeometry failed", it) }
@@ -1169,11 +1305,6 @@ class AppWindow(
                 }
                 setBackgroundWrapContent()
 
-                CoroutineScope(Dispatchers.Main).launch {
-                    delay(200)
-                    binding.cvParent.strokeWidth = 2.dpToPx().toInt()
-                }
-
                 if (binding.ibRightResize.visibility == View.VISIBLE) {
                     isResize = true
                 }
@@ -1203,19 +1334,24 @@ class AppWindow(
         // 位置记忆：记住进 mini 前的位置（重复进入不覆盖；退出 mini 回此位置）
         miniMemory.rememberIfAbsent(from?.toWindowRect())
         // M7：内容矩形动画（chrome 与 leash 同源）——收缩与贴角在一个动画里完成；
-        // 目标几何由核心策略（MiniPolicy）计算，宿主只传值并执行
+        // 目标几何由核心策略（MiniPolicy）计算，宿主只传值并执行。
+        // 分除基准 = 应用内容区（vSizePreviewer 尺寸 = 用户设定的"窗口尺寸"）；
+        // mini 外壳 = 贴边边框（均匀厚度），点击态外壳（白顶栏+边距）随动画逐帧过渡。
+        val fromInsets = shellInsets()
+        miniActive = true
+        applyMiniChrome()
+        val toInsets = miniInsets()
+        // mini 目标 = 屏幕比例尺寸（核心策略内置比例；应用在框内拉伸铺满）
         val to = MiniPolicy.enterTarget(
             corner = corner,
             screenWidth = dm.widthPixels,
             screenHeight = dm.heightPixels,
-            originalWidth = originalWidth,
-            originalHeight = originalHeight,
             marginPx = 8.dpToPx().toInt(),
             topInsetPx = 140,
             bottomInsetPx = 120,
             currentTop = from?.top
         ).toAndroidRect()
-        animateContentRect(from ?: to, to, geometryAnimDuration())
+        animateContentRect(from ?: to, to, geometryAnimDuration(), insetsFrom = fromInsets, insetsTo = toInsets)
     }
 
     private fun execExitMini() {
@@ -1232,8 +1368,9 @@ class AppWindow(
         val from = currentContentRect() ?: return
         // M7：位置记忆——回到进 mini 前的矩形；无记忆则围绕当前中心展开。
         // 两者都经安全边距夹取（贴屏会让圆角/边框/阴影出屏 = "边缘消失"缺陷）；
-        // 目标几何由核心策略（MiniPolicy）计算。
+        // 目标几何由核心策略（MiniPolicy）计算。外壳厚度 mini→点击态随动画过渡。
         val dm = context.resources.displayMetrics
+        val fromInsets = shellInsets()
         val to = MiniPolicy.exitTarget(
             remembered = miniMemory.take(),
             current = from.toWindowRect(),
@@ -1243,8 +1380,11 @@ class AppWindow(
             screenHeight = dm.heightPixels,
             marginPx = 8.dpToPx().toInt()
         ).toAndroidRect()
-        animateContentRect(from, to, geometryAnimDuration()) {
-            // 终态恢复 wrap-content（保持既有布局约定，后续测量与吸附基于自然尺寸）
+        val toInsets = normalInsets()
+        animateContentRect(from, to, geometryAnimDuration(), insetsFrom = fromInsets, insetsTo = toInsets) {
+            // 终态：退出 mini——恢复点击态外壳装饰与 wrap-content（后续测量/吸附基于自然尺寸）
+            miniActive = false
+            applyNormalChrome()
             setBackgroundWrapContent()
             setParrentWrapContent()
             binding.root.post(::updateSmoothBounds)
@@ -1290,6 +1430,7 @@ class AppWindow(
     }
 
     private fun execResizePreviewStart() {
+        resizeGesture = true
         binding.vSizePreviewer.layoutParams.let {
             resizeBeginWidth = it.width
             resizeBeginHeight = it.height
@@ -1310,6 +1451,8 @@ class AppWindow(
     }
 
     private fun execResizePreviewCommit() {
+        // 手势结束：keepInScreen 的推导会把新尺寸落为真实 bounds（应用重排一次）
+        resizeGesture = false
         binding.vSizePreviewer.visibility = View.GONE
         binding.cvParent.strokeWidth = 2.dpToPx().toInt()
         keepInScreen()
