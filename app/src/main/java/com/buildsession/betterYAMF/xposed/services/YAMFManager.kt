@@ -451,7 +451,7 @@ object YAMFManager : IYAMFManager.Stub() {
             addWindow(window)
 
             if (startCmd?.openAsMini == true) {
-                window.markOpenAsMini()
+                window.markOpenAsMini(startCmd.dropX, startCmd.dropY)
             }
 
             if (taskId != -1) {
@@ -671,8 +671,10 @@ object YAMFManager : IYAMFManager.Stub() {
             val userId = intent.getIntExtra(Protocol.EXTRA_USER_ID, 0)
             val source = intent.getIntExtra(Protocol.EXTRA_SOURCE, Protocol.SOURCE_UNSPECIFIED)
             val fromDropZone = intent.getBooleanExtra(Protocol.EXTRA_FROM_DROP_ZONE, false)
-            log("reYAMF_debug", "openInYAMF task=$taskId source=$source fromZone=$fromDropZone component=$componentName")
-            createWindow(StartCmd(componentName, userId, taskId, openAsMini = fromDropZone))
+            val dropX = intent.getIntExtra(Protocol.EXTRA_DROP_X, -1)
+            val dropY = intent.getIntExtra(Protocol.EXTRA_DROP_Y, -1)
+            log("reYAMF_debug", "openInYAMF task=$taskId source=$source fromZone=$fromDropZone drop=($dropX,$dropY) component=$componentName")
+            createWindow(StartCmd(componentName, userId, taskId, openAsMini = fromDropZone, dropX = dropX, dropY = dropY))
 
             // TODO: better way to close recents
             if (source == Protocol.SOURCE_RECENT) {

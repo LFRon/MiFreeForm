@@ -19,7 +19,7 @@ interface WindowHost {
     val isSessionHosted: Boolean get() = false
 
     /** 「打开即 mini」：任务就绪后由宿主请求进入角落 mini。 */
-    fun markOpenAsMini()
+    fun markOpenAsMini(dropX: Int = -1, dropY: Int = -1)
 
     /** organizer 路径：任务 leash 已就绪，按当前几何摆放。 */
     fun onOrganizerLeash()

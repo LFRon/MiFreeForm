@@ -38,6 +38,7 @@ import android.view.ViewOutlineProvider
 import android.view.WindowManager
 import android.view.animation.AccelerateInterpolator
 import android.view.animation.DecelerateInterpolator
+import android.view.animation.PathInterpolator
 import android.widget.FrameLayout
 import android.widget.ImageButton
 import androidx.constraintlayout.widget.ConstraintLayout
@@ -95,6 +96,9 @@ class AppWindow(
         private const val MINI_BEZEL_DP = 6f
         private const val HOME_REFRONT_DELAY_MS = 0L
         private const val MINI_START_DELAY_MS = 500L
+
+        /** 回收区投放登场动画的起始卡片 = 磁吸槽位卡片的放大倍数（示范视频前段 ≈ 84% 屏宽收缩）。 */
+        private const val DROP_ENTRY_START_SCALE = 3.0f
         private val shellRegistry = WindowShellRegistry()
         private val windowIdGen = java.util.concurrent.atomic.AtomicInteger(1)
     }
@@ -106,6 +110,9 @@ class AppWindow(
     override var currentTaskId = -1
     private var isDestroyed = false
     private var openAsMiniPending = false
+
+    /** 回收区投放的松手点（屏坐标；仅 openAsMini 登场动画使用，一次性）。 */
+    private var dropPoint: android.graphics.Point? = null
 
     override val isSessionHosted: Boolean get() = displaySession
     private var miniRequested = false
@@ -126,7 +133,7 @@ class AppWindow(
     private var pendingReveal = false
     @Volatile
     private var chromeRevealed = false
-    private val revealRunnable = Runnable { revealChrome() }
+    private val revealRunnable = Runnable { revealChromeOrDropEntry() }
     /** M7：进 mini 前的内容矩形（位置记忆，经核心纯逻辑）；退出 mini 回到此位置（见视频规范 §2.2） */
     private val miniMemory = PositionMemory()
     private var flingXAnimation: FlingAnimation? = null
@@ -172,6 +179,9 @@ class AppWindow(
 
     /** mini 化中（外壳装饰 / 内容区几何随模式切换，见 shellInsets 与 applyXCrome）。 */
     private var miniActive = false
+
+    /** 投放登场飞行期间的视口景深系数（1=常态；<1 = 内容相对卡片轻微回缩，落定时归 1）。 */
+    private var miniFlightDip = 1f
 
     /** 顶栏（ibSuper 白条）透明度动画（进出 mini 时平滑显隐；见 [animateSuperBarAlpha]）。 */
     private var superBarAlphaAnimator: android.animation.ValueAnimator? = null
@@ -981,8 +991,8 @@ class AppWindow(
             topMargin = ins.top
         }
         if (sessionDisplayW > 0 && sessionDisplayH > 0) {
-            tv.scaleX = w.toFloat() / sessionDisplayW
-            tv.scaleY = h.toFloat() / sessionDisplayH
+            tv.scaleX = w.toFloat() / sessionDisplayW * miniFlightDip
+            tv.scaleY = h.toFloat() / sessionDisplayH * miniFlightDip
         }
         if (w != loggedViewportW || h != loggedViewportH ||
             sessionDisplayW != loggedDisplayW || sessionDisplayH != loggedDisplayH
@@ -1035,7 +1045,7 @@ class AppWindow(
                 }
             }.onFailure { log(TAG, "onOrganizerLeash failed", it) }
             // M7：内容已就绪 → 打开淡入（与首帧摆放同帧完成，杜绝空卡帧）
-            revealChrome()
+            revealChromeOrDropEntry()
         }
     }
 
@@ -1099,7 +1109,7 @@ class AppWindow(
                 // 显示器承载：任务经流程分拣绑定到本壳即内容就绪（无 leash 回调可等）——
                 // 立即按当前几何对齐显示器像素并淡入（回收区投放则走"从松手点飞入"登场）。
                 updateSmoothBounds()
-                revealChrome()
+                revealChromeOrDropEntry()
             }
             maybeRequestMini()
             return
@@ -1127,8 +1137,11 @@ class AppWindow(
         }
     }
 
-    override fun markOpenAsMini() {
+    override fun markOpenAsMini(dropX: Int, dropY: Int) {
         openAsMiniPending = true
+        if (dropX >= 0 && dropY >= 0) {
+            dropPoint = android.graphics.Point(dropX, dropY)
+        }
     }
 
     private fun maybeRequestMini() {
@@ -1269,6 +1282,8 @@ class AppWindow(
             boundsAnimator?.cancel()
             boundsAnimator = null
         }
+        // 登场飞行的景深/渐变随动画取消一并复位（防中断残留）
+        miniFlightDip = 1f
     }
 
     private fun keepInScreen(animate: Boolean = true) {
@@ -1505,6 +1520,8 @@ class AppWindow(
         durationMs: Long,
         insetsFrom: MiniPolicy.ShellInsets? = null,
         insetsTo: MiniPolicy.ShellInsets? = null,
+        interpolator: android.animation.TimeInterpolator = DecelerateInterpolator(),
+        onFrame: ((Float) -> Unit)? = null,
         onEnd: (() -> Unit)? = null
     ) {
         // 内容矩形动画独占几何：取消惯性/夹取/上一次几何动画（修复"框自己跳走"）
@@ -1514,12 +1531,14 @@ class AppWindow(
         if (durationMs <= 0L || from == to) {
             animInsets = null
             applyContentRectFrame(to)
+            onFrame?.invoke(1f)
             onEnd?.invoke()
             return
         }
+        val animInterp = interpolator
         boundsAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
             duration = durationMs
-            interpolator = DecelerateInterpolator()
+            this.interpolator = animInterp
             addUpdateListener { anim ->
                 val f = anim.animatedValue as Float
                 // 外壳厚度随模式切换逐帧插值（点击态 ↔ mini），内容盒不做跳变
@@ -1534,11 +1553,13 @@ class AppWindow(
                         (from.bottom + (to.bottom - from.bottom) * f).toInt()
                     )
                 )
+                onFrame?.invoke(f)
             }
             addListener(object : android.animation.AnimatorListenerAdapter() {
                 override fun onAnimationEnd(animation: android.animation.Animator) {
                     if (boundsAnimator === animation) boundsAnimator = null
                     animInsets = null
+                    onFrame?.invoke(1f)
                     onEnd?.invoke()
                 }
             })
@@ -1588,6 +1609,26 @@ class AppWindow(
         }
     }
 
+    /**
+     * 打开揭示的统一入口：
+     * - 回收区投放（openAsMini + 松手点，且任务已认领/尺寸已测量）：不揭示普通窗口、不等 500ms，
+     *   直接发 [WindowInputEvent.RequestMini]——**核心状态机转身（mode=MINI）** 后回发
+     *   [WindowCommand.EnterMini]，由 [execEnterMini] 执行"从松手点区域一镜收缩入位"的登场动画
+     *   （核心 mode 必须同步，否则单击放大被吞）。未就绪时退回常规揭示，任务就绪后经本入口再走投放。
+     * - 其余场景：常规淡入揭示（openAsMini 的 500ms 后 RequestMini 流程不变）。
+     */
+    private fun revealChromeOrDropEntry() {
+        if (openAsMiniPending && dropPoint != null && currentTaskId > 0 &&
+            originalWidth > 0 && originalHeight > 0 && binding.cvParent.width > 0
+        ) {
+            openAsMiniPending = false
+            miniRequested = true
+            dispatchInput(WindowInputEvent.RequestMini(windowId, System.currentTimeMillis()))
+        } else {
+            revealChrome()
+        }
+    }
+
     /** 打开后的内容就绪淡入（消除"孤钮/空白卡"帧）。 */
     private fun revealChrome() {
         if (!pendingReveal || isDestroyed) return
@@ -1628,6 +1669,9 @@ class AppWindow(
             log(TAG, "execEnterMini skipped: size not measured")
             return
         }
+        // 回收区投放登场：消费一次性松手点（非投放路径为 null → 走原"从当前矩形收缩"行为）
+        val drop = dropPoint
+        dropPoint = null
 
         isResize = false
 
@@ -1641,25 +1685,24 @@ class AppWindow(
         WindowSessions.chromeTouchHoles.remove(windowId)
 
         val dm = context.resources.displayMetrics
-        val from = currentContentRect()
-        // 位置记忆：记住进 mini 前的位置（重复进入不覆盖；退出 mini 回此位置）
-        miniMemory.rememberIfAbsent(from?.toWindowRect())
+        val centered = currentContentRect()
+        // 位置记忆：记住进 mini 前的（默认居中）位置（重复进入不覆盖；退出 mini 回此位置）
+        miniMemory.rememberIfAbsent(centered?.toWindowRect())
         // M7：内容矩形动画（chrome 与 leash 同源）——收缩与贴角在一个动画里完成；
         // 目标几何由核心策略（MiniPolicy）计算，宿主只传值并执行。
         // 分除基准 = 应用内容区（vSizePreviewer 尺寸 = 用户设定的"窗口尺寸"）；
         // mini 外壳 = 贴边边框（均匀厚度），点击态外壳（白顶栏+边距）随动画逐帧过渡。
-        val fromInsets = shellInsets()
+        // 投放登场：起点外壳为"零内衬"（整幅内容的大卡片），mini 描边随飞行渐成。
+        val fromInsets = if (drop != null) MiniPolicy.ShellInsets(0, 0, 0, 0) else shellInsets()
         miniActive = true
         applyMiniChrome()
-        // 顶栏渐隐：动画期间先保持可见（覆盖其条带），结束再 GONE（见 [animateSuperBarAlpha]）
-        animateSuperBarAlpha(1f, 0f, geometryAnimDuration(), hideAtEnd = true)
         updateSessionViewportBounds()
         val toInsets = miniInsets()
         // mini 目标 = 当前内容区**等比缩放**到磁吸槽位（保持宽高比——参考图帧_02/帧_05 实锤：
         // mini 与展开态是同一 UI 的纯缩放）。比例一致 ⇒ 过渡 = 纯几何缩放、无拉伸；
         // 显示器尺寸全程不变（应用零重排/零表面重建）——这是最简单且最平滑的实现方式。
-        val fromContentW = ((from?.width() ?: 0) - fromInsets.width).coerceAtLeast(1)
-        val fromContentH = ((from?.height() ?: 0) - fromInsets.height).coerceAtLeast(1)
+        val fromContentW = ((centered?.width() ?: 0) - fromInsets.width).coerceAtLeast(1)
+        val fromContentH = ((centered?.height() ?: 0) - fromInsets.height).coerceAtLeast(1)
         val to = MiniPolicy.enterTarget(
             corner = corner,
             screenWidth = dm.widthPixels,
@@ -1667,13 +1710,68 @@ class AppWindow(
             marginPx = 8.dpToPx().toInt(),
             topInsetPx = 140,
             bottomInsetPx = 120,
-            currentTop = from?.top,
+            currentTop = centered?.top,
             contentWidth = fromContentW,
             contentHeight = fromContentH,
             insets = toInsets
         ).toAndroidRect()
-        animateContentRect(from ?: to, to, geometryAnimDuration(), insetsFrom = fromInsets, insetsTo = toInsets) {
-            // 终态：补一次结算（视口/缩放/轮廓落定；显示器像素在 mini 态保持不变）
+
+        if (drop == null) {
+            // 顶栏渐隐：动画期间先保持可见（覆盖其条带），结束再 GONE（见 [animateSuperBarAlpha]）
+            animateSuperBarAlpha(1f, 0f, geometryAnimDuration(), hideAtEnd = true)
+            animateContentRect(centered ?: to, to, geometryAnimDuration(), insetsFrom = fromInsets, insetsTo = toInsets) {
+                // 终态：补一次结算（视口/缩放/轮廓落定；显示器像素在 mini 态保持不变）
+                binding.root.post(::updateSmoothBounds)
+            }
+            return
+        }
+
+        // —— 回收区投放登场（对齐"米窗示范"视频逐帧量化结论：一条从大到小的连续强减速飞行，
+        //    右缘锚定槽位右上角、圆角/描边随飞行渐成，落点即 mini，全程无"可点击中间态"）——
+        pendingReveal = false
+        chromeRevealed = true
+        binding.ibSuper.visibility = View.GONE
+        val margin = 8.dpToPx().toInt()
+        val startW = (to.width() * DROP_ENTRY_START_SCALE).toInt()
+        val startH = (to.height() * DROP_ENTRY_START_SCALE).toInt()
+        val startLeft = (to.right - startW).coerceAtLeast(margin)
+        val startTop = to.top.coerceIn(140, (dm.heightPixels - 120 - startH).coerceAtLeast(140))
+        val start = android.graphics.Rect(startLeft, startTop, startLeft + startW, startTop + startH)
+        // 起手帧直接落到起点（root 仍透明），随后轻淡入 + 一条减速飞行入位
+        applyContentRectFrame(start)
+        binding.root.alpha = 0f
+        ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = 160
+            addUpdateListener { anim -> binding.root.alpha = anim.animatedValue as Float }
+            addListener(object : android.animation.AnimatorListenerAdapter() {
+                override fun onAnimationEnd(animation: android.animation.Animator) {
+                    binding.root.alpha = 1f
+                }
+            })
+            start()
+        }
+        val radius = config.windowRoundedCorner.dpToPx()
+        val bezel = MINI_BEZEL_DP.dpToPx()
+        // 起手即"零圆角/零描边"（与 f=0 帧一致，防首帧闪现终态 mini 装饰）
+        binding.cvParent.radius = 0f
+        binding.cvParent.strokeWidth = 0
+        binding.cvBackground.radius = 0f
+        log(TAG, "drop entry task=$currentTaskId from=$start to=$to")
+        animateContentRect(
+            start, to, geometryAnimDuration(base = 500L),
+            insetsFrom = fromInsets, insetsTo = toInsets,
+            // 视频实测起步即高速、长尾收束；给首帧一丝缓起更细腻
+            interpolator = PathInterpolator(0.05f, 0f, 0.12f, 1f),
+            onFrame = { f ->
+                // 圆角/描边随飞行渐成（大卡片方角 → mini 描边边框）；内容轻微景深回缩
+                binding.cvParent.radius = radius * f
+                binding.cvParent.strokeWidth = (bezel * f).toInt()
+                binding.cvBackground.radius = ((radius - bezel) * f).coerceAtLeast(0f)
+                miniFlightDip = 1f - 0.03f * kotlin.math.sin((Math.PI * f).toFloat())
+                updateSessionViewportBounds()
+            }
+        ) {
+            miniFlightDip = 1f
             binding.root.post(::updateSmoothBounds)
         }
     }
