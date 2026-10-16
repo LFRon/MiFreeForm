@@ -81,7 +81,7 @@ object YAMFManager : IYAMFManager.Stub() {
                         activeWindows.values.forEach { it.onTaskMovedToFront(taskInfo) }
                         activeWindows.values.forEach { w ->
                             if (w.currentTaskId == taskInfo.taskId) {
-                                w.onTaskVisibilityChanged(taskInfo.isVisible)
+                                notifyTaskVisible(w, taskInfo.isVisible)
                             }
                         }
 
@@ -148,7 +148,7 @@ object YAMFManager : IYAMFManager.Stub() {
                         val taskInfo = args[0] as android.app.ActivityManager.RunningTaskInfo
                         activeWindows.values.forEach { w ->
                             if (w.currentTaskId == taskInfo.taskId) {
-                                w.onTaskVisibilityChanged(taskInfo.isVisible)
+                                notifyTaskVisible(w, taskInfo.isVisible)
                             }
                         }
                     }
@@ -213,12 +213,105 @@ object YAMFManager : IYAMFManager.Stub() {
                 val info = tasks.find {
                     XposedHelpers.getIntField(it, "taskId") == w.currentTaskId
                 }
-                val visible = info?.let { XposedHelpers.getBooleanField(it, "isVisible") } ?: true
-                if (BuildConfig.DEBUG) {
-                    log("reYAMF_debug", "visibility task=${w.currentTaskId} found=${info != null} visible=$visible")
+                if (info == null) {
+                    // 承载任务已不存在：任务被系统内部移除（如 top-resumed 超时强停）不会回调
+                    // onTaskRemovalStarted（真机实证：任务 9 消失后无任何 stack 事件）——
+                    // 旧行为 not-found 默认 visible=true，会让死任务窗口常驻且显示空白会话屏
+                    // （真机实证：窗口 2373055 在任务 9 消失 20 分钟后仍可见）。改：二次确认后拆除。
+                    if (w.currentTaskId > 0) {
+                        val miss = (missingTaskChecks[w.windowId] ?: 0) + 1
+                        missingTaskChecks[w.windowId] = miss
+                        if (BuildConfig.DEBUG) {
+                            log("reYAMF_debug", "visibility task=${w.currentTaskId} found=false miss=$miss")
+                        }
+                        if (miss >= 2) {
+                            missingTaskChecks.remove(w.windowId)
+                            log("reYAMF_debug", "host task gone; destroy window=${w.windowId} task=${w.currentTaskId}")
+                            runCatching { w.onDestroy(releaseTask = false) }
+                        }
+                    }
+                    return@forEach
                 }
-                w.onTaskVisibilityChanged(visible)
+                missingTaskChecks.remove(w.windowId)
+                // 会话窗口的宿主任务被外部拉回普通显示器（桌面图标重启 = 平台复用任务重挂回默认屏）：
+                // 窗口已失去承载对象（会话屏不再包含该任务），旧行为会留下一个冻结在最后一帧的
+                // 幽灵小窗（真机实证：任务 9 被拉回桌面后窗口 2373055 的会话视口定格在 QQ 最后一帧）。
+                // 待认领（pendingSmoothFreeformApps 仍挂在本窗口）= 打开流程进行中（迁移可能被
+                // 过渡闸门推迟），不得误杀。二次确认后拆除。
+                if (w.isSessionHosted) {
+                    val onSession = runCatching {
+                        windowBackend.isTaskInSessionDisplay(info as android.app.ActivityManager.RunningTaskInfo)
+                    }.getOrDefault(true)
+                    val awaitingClaim = pendingSmoothFreeformApps.values.any { it === w }
+                    if (!onSession && !awaitingClaim) {
+                        val miss = (staleHostChecks[w.windowId] ?: 0) + 1
+                        staleHostChecks[w.windowId] = miss
+                        if (BuildConfig.DEBUG) {
+                            log("reYAMF_debug", "session host stale window=${w.windowId} task=${w.currentTaskId} miss=$miss")
+                        }
+                        if (miss >= 2) {
+                            staleHostChecks.remove(w.windowId)
+                            log("reYAMF_debug", "session task left session display; destroy window=${w.windowId} task=${w.currentTaskId}")
+                            runCatching { w.onDestroy(releaseTask = false) }
+                        }
+                        return@forEach
+                    }
+                    staleHostChecks.remove(w.windowId)
+                }
+                val visible = XposedHelpers.getBooleanField(info, "isVisible")
+                if (BuildConfig.DEBUG) {
+                    log("reYAMF_debug", "visibility task=${w.currentTaskId} found=true visible=$visible")
+                }
+                notifyTaskVisible(w, visible)
             }
+        }
+    }
+
+    /** 任务消失确认计数（防任务列表瞬时抖动误杀窗口）。 */
+    private val missingTaskChecks = mutableMapOf<Int, Int>()
+
+    /** 宿主任务离开会话屏确认计数（防迁移/过渡期间误杀）。 */
+    private val staleHostChecks = mutableMapOf<Int, Int>()
+
+    /** 进行中的可见性复核任务集（防重复调度）。 */
+    private val visibilityRechecks = mutableSetOf<Int>()
+
+    /**
+     * 可见性通知统一入口：false 时附带一次延迟复核。
+     *
+     * 背景（真机实证）：任务刚迁移进新建会话屏的瞬间 `isVisible` 会瞬时为 false
+     * （显示器点亮/恢复尚未完成），旧实现据此把窗口置 INVISIBLE 后没有任何事件回灌
+     * （onTaskInfoChanged 不再触发，onTaskStackChanged 被 700ms 节流且 home 顶置分支不再评估）
+     * ——窗口滞留隐藏（真机实证：窗口 1f9ab5d 打开后一直不可见）。
+     * 复核按真实状态纠正，幂等且最多两轮。
+     */
+    private fun notifyTaskVisible(w: WindowHost, visible: Boolean) {
+        w.onTaskVisibilityChanged(visible)
+        if (!visible) scheduleVisibilityRecheck(w.windowId, 0)
+    }
+
+    private fun scheduleVisibilityRecheck(windowId: Int, attempt: Int) {
+        val key = windowId * 10 + attempt
+        if (!visibilityRechecks.add(key)) return
+        runMain {
+            delay(if (attempt == 0) 450L else 900L)
+            visibilityRechecks.remove(key)
+            val w = activeWindows[windowId] ?: return@runMain
+            if (w.currentTaskId <= 0) return@runMain
+            val tasks = runCatching {
+                XposedHelpers.callMethod(
+                    Instances.activityTaskManager, "getTasks", Int.MAX_VALUE, false, false, -1
+                ) as List<*>
+            }.getOrNull() ?: return@runMain
+            val info = tasks.find {
+                XposedHelpers.getIntField(it, "taskId") == w.currentTaskId
+            } ?: return@runMain
+            val visible = XposedHelpers.getBooleanField(info, "isVisible")
+            if (BuildConfig.DEBUG) {
+                log("reYAMF_debug", "visibility recheck window=$windowId task=${w.currentTaskId} visible=$visible")
+            }
+            w.onTaskVisibilityChanged(visible)
+            if (!visible && attempt == 0) scheduleVisibilityRecheck(windowId, 1)
         }
     }
 
