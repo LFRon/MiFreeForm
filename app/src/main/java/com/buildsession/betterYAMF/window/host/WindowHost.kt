@@ -15,9 +15,6 @@ interface WindowHost {
     /** 当前承载的任务 id（流程在认领时写入；-1 = 尚未认领）。 */
     var currentTaskId: Int
 
-    /** 是否由会话显示器承载（false = 容器路径）。供流程层判断"宿主任务离开会话屏"的陈旧态。 */
-    val isSessionHosted: Boolean get() = false
-
     /** 「打开即 mini」：任务就绪后由宿主请求进入角落 mini。 */
     fun markOpenAsMini(dropX: Int = -1, dropY: Int = -1)
 

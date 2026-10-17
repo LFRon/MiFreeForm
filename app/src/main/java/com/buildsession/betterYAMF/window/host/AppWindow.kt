@@ -26,10 +26,8 @@ import android.view.InputDevice
 import android.view.KeyEvent
 import android.view.LayoutInflater
 import android.graphics.Outline
-import android.graphics.SurfaceTexture
 import android.view.MotionEvent
 import android.view.Surface
-import android.view.TextureView
 import android.view.View
 import android.view.ViewGroup
 import android.view.ViewOutlineProvider
@@ -37,7 +35,6 @@ import android.view.WindowManager
 import android.view.animation.AccelerateInterpolator
 import android.view.animation.DecelerateInterpolator
 import android.view.animation.PathInterpolator
-import android.widget.FrameLayout
 import android.widget.ImageButton
 import androidx.constraintlayout.widget.ConstraintLayout
 import androidx.core.graphics.ColorUtils
@@ -116,7 +113,6 @@ class AppWindow(
     /** 回收区投放的松手点（屏坐标；仅 openAsMini 登场动画使用，一次性）。 */
     private var dropPoint: android.graphics.Point? = null
 
-    override val isSessionHosted: Boolean get() = displaySession
     private var miniRequested = false
 
     private var originalWidth: Int = 0
@@ -157,42 +153,11 @@ class AppWindow(
     private var frameOffsetKnown = false
     private var contentTouchThrough = true
 
-    // ==== 会话显示器承载（实现层形态；宿主只问后端，不判断具体条件） ====
-    /** 是否以"显示器视口"承载内容（false = 传统任务容器承载；创建失败时本窗口回退）。 */
-    private var displaySession = YAMFManager.windowBackend.usesDisplaySession()
-    /** 视口裁剪容器（圆角裁剪 + 可见区布局；内容视图恒为显示器尺寸、由 scale 缩放到本容器）。 */
-    private var sessionViewport: FrameLayout? = null
-    /** 内容视口（显示器内容本体；仅显示器承载时创建）。 */
-    private var sessionTextureView: TextureView? = null
-    /** 交给显示器的表面包装（随纹理生命周期创建/释放）。 */
-    private var sessionSurface: Surface? = null
-    /**
-     * 显示器像素（内容基准，本宿主唯一记账点；每次下发 resize 时更新）。
-     * 不能用 SurfaceTexture 回调的宽高作基准——那是 TextureView 自设的"视图侧默认缓冲尺寸"
-     * （实测恒为视图尺寸），与显示器生产者实际产出的像素无关。
-     */
-    private var sessionDisplayW = 0
-    private var sessionDisplayH = 0
-
-    /** 投放登场首帧占位层（最近任务快照直接拉伸；真实首帧到达后淡出）。 */
-    private var sessionSnapshotView: android.widget.ImageView? = null
-    private var dropSnapshotBitmap: android.graphics.Bitmap? = null
-    private var dropSnapshotActive = false
-    private var dropSnapshotFadeRunnable: Runnable? = null
-
     /** 几何飞行期间的刷新率提升状态（进入/退出幂等）。 */
     private var flightFrameRateBoosted = false
-    /** 视口布局诊断去抖（仅尺寸变化时打一行，logcat 可见）。 */
-    private var loggedViewportW = -1
-    private var loggedViewportH = -1
-    private var loggedDisplayW = -1
-    private var loggedDisplayH = -1
 
     /** mini 化中（外壳装饰 / 内容区几何随模式切换，见 shellInsets 与 applyXCrome）。 */
     private var miniActive = false
-
-    /** 投放登场飞行期间的视口景深系数（1=常态；<1 = 内容相对卡片轻微回缩，落定时归 1）。 */
-    private var miniFlightDip = 1f
 
     /** 顶栏（ibSuper 白条）透明度动画（进出 mini 时平滑显隐；见 [animateSuperBarAlpha]）。 */
     private var superBarAlphaAnimator: android.animation.ValueAnimator? = null
@@ -364,10 +329,6 @@ class AppWindow(
             this.width = windowWidth
             this.height = windowHeight
         }
-        // 会话显示器承载：先建屏（早于 onWindowInit 中的启动调用——应用的启动目标就是它）。
-        if (displaySession) {
-            setupSessionDisplayView(windowWidth, windowHeight)
-        }
         onWindowInit(this, windowId)
 
         isResize = false
@@ -391,7 +352,6 @@ class AppWindow(
                 binding.root.alpha = 0f
                 runMain { binding.root.postDelayed(revealRunnable, 700) }
             }
-            if (displaySession) updateSessionViewportBounds()
         }
 
     }
@@ -404,18 +364,8 @@ class AppWindow(
         boundsAnimator?.cancel()
         boundsAnimator = null
         pendingReveal = false
-        // 快照占位与刷新率提升清理
-        runCatching {
-            dropSnapshotFadeRunnable?.let { binding.root.removeCallbacks(it) }
-            dropSnapshotFadeRunnable = null
-            dropSnapshotActive = false
-            sessionSnapshotView?.animate()?.cancel()
-            sessionSnapshotView?.visibility = View.GONE
-            sessionSnapshotView?.setImageDrawable(null)
-            dropSnapshotBitmap?.recycle()
-            dropSnapshotBitmap = null
-            setFlightFrameRateBoost(false)
-        }
+        // 刷新率提升清理（幂等）
+        runCatching { setFlightFrameRateBoost(false) }
         runMain { runCatching { binding.root.removeCallbacks(revealRunnable) } }
 
         // 关闭小窗：任务复位为全屏并下沉到原父级栈底（后台、留在最近任务，不抢前台，
@@ -423,19 +373,10 @@ class AppWindow(
         // 此处二次调用为 no-op；任务移交新壳（releaseTask=false）时静默销毁。
         if (releaseTask) {
             runCatching {
-                if (currentTaskId > 0) YAMFManager.switchTaskToFullscreen(
-                    currentTaskId, toFront = false,
-                    sessionWindowId = if (displaySession) windowId else -1
-                )
+                if (currentTaskId > 0) YAMFManager.switchTaskToFullscreen(currentTaskId, toFront = false)
             }.onFailure {
                 log(TAG, "release task to background failed", it)
             }
-        }
-
-        // 会话显示器承载：回收会话屏（私有屏移除即销毁其内容；释放语义已在 releaseTask 完成）。
-        if (displaySession) {
-            runCatching { YAMFManager.windowBackend.releaseSessionDisplay(windowId) }
-                .onFailure { log(TAG, "release session display failed", it) }
         }
         
         runCatching { context.unregisterReceiver(broadcastReceiver) }
@@ -466,35 +407,12 @@ class AppWindow(
     }
 
     private fun moveToTop() {
-        // 会话屏承载：remove/add 会重建内容表面——先以当前帧盖住视口，
-        // 重挂后由新表面首帧（onSurfaceTextureUpdated）走既有淡出逻辑，杜绝黑卡窗口期
-        if (displaySession) coverViewportForRaise()
         if (binding.root.isAttachedToWindow) {
             Instances.windowManager.removeView(binding.root)
         }
         Instances.windowManager.addView(binding.root, binding.root.layoutParams)
         // 重挂会更换 ViewRoot，布局监听需要重新注册
         binding.root.viewTreeObserver.addOnGlobalLayoutListener(frameOffsetLayoutListener)
-    }
-
-    /** 抬层前用内容视口当前帧覆盖快照层（复用投放登场占位管线；1.5s 兜底淡出）。 */
-    private fun coverViewportForRaise() {
-        runCatching {
-            val view = sessionSnapshotView ?: return
-            val frame = runCatching { sessionTextureView?.bitmap }.getOrNull() ?: return
-            val previous = dropSnapshotBitmap
-            dropSnapshotBitmap = frame
-            dropSnapshotActive = true
-            view.animate().cancel()
-            view.setImageBitmap(frame)
-            view.alpha = 1f
-            view.visibility = View.VISIBLE
-            dropSnapshotFadeRunnable?.let { binding.root.removeCallbacks(it) }
-            val fade = Runnable { fadeDropSnapshotOverlay() }
-            dropSnapshotFadeRunnable = fade
-            binding.root.postDelayed(fade, 1500)
-            previous?.recycle()
-        }.onFailure { log(TAG, "cover viewport for raise failed", it) }
     }
 
     private fun dispatchInput(event: WindowInputEvent) {
@@ -776,18 +694,9 @@ class AppWindow(
         when (origin) {
             FullscreenOrigin.DRAG_DOWN_BAR -> {
                 runCatching {
-                    // sessionWindowId：本窗口确知内容跑在会话显示器上——释放必走"回收 UI 进程 +
-                    // 移除任务 + 全屏冷启"配方；任务 id 失配时实现层按会话屏顶层任务兜底。
-                    YAMFManager.switchTaskToFullscreen(
-                        currentTaskId,
-                        sessionWindowId = if (displaySession) windowId else -1
-                    )
+                    YAMFManager.switchTaskToFullscreen(currentTaskId)
+                    YAMFManager.windowBackend.bringTaskToFront(currentTaskId)
                 }.onSuccess {
-                    // 会话路径：旧任务已被移除，置前由冷启（startActivityAsUser）完成，
-                    // 再对已移除任务 bringTaskToFront 会抛错并把窗口留在原地。容器路径维持原语义。
-                    if (!displaySession) {
-                        runCatching { YAMFManager.windowBackend.bringTaskToFront(currentTaskId) }
-                    }
                     onDestroy(releaseTask = true)
                 }.onFailure {
                     execResetWindowScale()
@@ -893,29 +802,6 @@ class AppWindow(
         // rect 为窗口卡（外壳）矩形；内容盒 = 应用内容区 = 卡内沿去掉固定外壳。
         val contentBox = contentBoxOf(rect)
 
-        // 会话显示器承载：内容由壳内视口表面直呈（随布局自动重排），不存在任务级几何
-        // （无 leash/变换），触摸洞机制亦不适用（视口表面自持触摸）。
-        // 显示器像素只在"静止态"对齐（mini/手势/动画期间保持上一次尺寸——视口自动缩放呈现），
-        // 避免动画期间逐帧 relayout 风暴。
-        if (displaySession) {
-            WindowSessions.chromeTouchHoles.remove(windowId)
-            updateSessionViewportBounds()
-            val settling = !animated && !resizeGesture && !dragging &&
-                animInsets == null &&
-                boundsAnimator?.isRunning != true &&
-                flingXAnimation?.isRunning != true &&
-                flingYAnimation?.isRunning != true &&
-                keepInScreenAnimator?.isRunning != true
-            if (settling && !miniActive) {
-                // 显示器像素对齐**只在正常态静止点**下发（内容区 1:1，逐像素清晰）。
-                // mini 态不重设显示器：mini = 视口等比降采样（MiniPolicy 保宽高比，与展开态
-                // 同一 UI 纯缩放）⇒ 应用在模式切换全程零重排/零表面重建，动画天然平滑，
-                // 也根除了曾出现的 "mini DPI 漂移"。见 [MiniPolicy.enterTarget]。
-                resizeSessionDisplay(contentBox.width(), contentBox.height())
-            }
-            return
-        }
-
         // 触摸洞 = 应用内容区精确矩形（正常态：内容交互直通应用；外壳条/边距由 chrome 自持）
         if (contentTouchThrough) {
             WindowSessions.chromeTouchHoles[windowId] = android.graphics.Rect(contentBox)
@@ -934,199 +820,6 @@ class AppWindow(
             // 系统窗口后端：几何落地（leash 变换或兼容路径由实现决定，宿主不感知）
             YAMFManager.windowBackend.applyGeometry(currentTaskId, contentBox)
         }
-    }
-
-    /**
-     * 会话显示器承载：内容视口 = 裁剪容器（圆角）+ 恒定尺寸的 TextureView（视图 scale 做视觉缩放）。
-     * 显示器由系统侧（SessionDisplays）创建并持有；设计要点（AOSP 源码 + 真机双向实锤）：
-     *
-     * 1. **呈现链**：TextureView.draw() → applyUpdate() → mLayer.prepare(视图宽, 视图高)；
-     *    图层绘制 Layer::draw（Layer.cpp:99-145，textureMatrix=逆(scale(1/图层宽,1/图层高)·flipV·
-     *    scale(图像宽,图像高))）把**整幅缓冲图像**自动适配铺满"图层尺寸"，而**图层尺寸只在
-     *    "新帧到达"时才刷新**（DeferredLayerUpdater::apply 仅在 dequeue 到缓冲时 setSize）。
-     *    ⇒ 若让视图尺寸随 mini 动画逐帧变化，而生产者（静态页面）不再推新帧，适配会停在旧尺寸
-     *    —— 真机实锤：内容约 1:1 被裁到左上角。
-     *    **正确做法（本实现）**：内容视图布局尺寸恒等于显示器尺寸（缓冲≈视图 ⇒ 适配恒≈1:1、
-     *    与刷新时机无关），视觉缩放改为视图自身的 scaleX/scaleY（普通 View 变换，父节点合成，
-     *    不涉及纹理层适配）——动画期间零布局、零表面重建、零适配失效。
-     * 2. **圆角**：裁剪容器带圆角 outline + clipToOutline（clip 作用于整个子树），内容被裁进
-     *    可见圆角内（此前内容直角渗出卡片圆角）。
-     * 3. **触摸注入**：视图本地坐标=显示器像素（scale 由框架在派发前还原）⇒ 注入按
-     *    "显示器px/视图px"换算，因子≈1，与视觉严格一致；mini 时 [contentTouchThrough]=false，
-     *    触摸交还外壳拖动/复位热区。
-     * 4. **尺寸对齐**：显示器**只在正常态静止点**对齐到内容区 1:1（逐像素清晰）；
-     *    mini 态显示器保持不变——mini 只是视口等比降采样（MiniPolicy 保宽高比，
-     *    与展开态是同一 UI 纯缩放），模式切换全程应用零重排（动画平滑的最简单实现）。
-     */
-    private fun setupSessionDisplayView(windowWidth: Int, windowHeight: Int) {
-        runCatching {
-            // 裁剪容器：只负责"圆角 + 可见区尺寸/位置"（尺寸/边距由 updateSessionViewportBounds 维护；
-            // 不能依赖约束链——mini 下顶栏 GONE、父容器 wrap 高度被尺寸锚点撑到逻辑全高）。
-            val clip = FrameLayout(context)
-            clip.clipToOutline = true
-            clip.outlineProvider = object : ViewOutlineProvider() {
-                override fun getOutline(view: View, outline: Outline) {
-                    // 圆角与装饰内沿同心：mini = 边框内沿圆角（外沿圆角 − 边框宽）；
-                    // 点击态 = 方角（设计注释："点击态=方角"，圆角一律由装饰提供）。
-                    val r = if (miniActive) {
-                        (config.windowRoundedCorner.dpToPx() - MINI_BEZEL_DP.dpToPx()).coerceAtLeast(0f)
-                    } else 0f
-                    outline.setRoundRect(0, 0, view.width, view.height, r)
-                }
-            }
-            val lp = ConstraintLayout.LayoutParams(1, 1)
-            lp.startToStart = ConstraintLayout.LayoutParams.PARENT_ID
-            lp.topToTop = ConstraintLayout.LayoutParams.PARENT_ID
-            binding.background.addView(clip, 0, lp)
-            sessionViewport = clip
-
-            // 内容视图：布局尺寸恒等于显示器像素；视觉缩放交给 scale（见方法注释）。
-            val tv = TextureView(context)
-            tv.pivotX = 0f
-            tv.pivotY = 0f
-            clip.addView(tv, FrameLayout.LayoutParams(1, 1))
-            // 快照占位层（叠于内容之上）：登场首帧用最近任务快照直接拉伸铺满（杜绝黑屏开场）
-            val snapView = android.widget.ImageView(context)
-            snapView.scaleType = android.widget.ImageView.ScaleType.FIT_XY
-            snapView.visibility = View.GONE
-            snapView.alpha = 0f
-            clip.addView(
-                snapView,
-                FrameLayout.LayoutParams(
-                    FrameLayout.LayoutParams.MATCH_PARENT,
-                    FrameLayout.LayoutParams.MATCH_PARENT
-                )
-            )
-            sessionSnapshotView = snapView
-            sessionTextureView = tv
-
-            val initialBox = contentBoxOf(android.graphics.Rect(0, 0, windowWidth, windowHeight))
-            val displayId = YAMFManager.windowBackend.attachSessionDisplay(
-                windowId, initialBox.width(), initialBox.height()
-            )
-            log(TAG, "session display attach window=$windowId display=$displayId size=${initialBox.width()}x${initialBox.height()}")
-            if (displayId < 0) {
-                // 会话屏创建失败：本窗口退回容器承载（后续流程按 displaySession=false 走原路径）
-                displaySession = false
-                log(TAG, "session display unavailable, fallback to container realization")
-                return@runCatching
-            }
-            sessionDisplayW = initialBox.width()
-            sessionDisplayH = initialBox.height()
-            tv.updateLayoutParams<FrameLayout.LayoutParams> {
-                width = sessionDisplayW
-                height = sessionDisplayH
-            }
-
-            fun attachSurface(st: SurfaceTexture) {
-                val surface = Surface(st)
-                sessionSurface = surface
-                YAMFManager.windowBackend.updateSessionDisplaySurface(windowId, surface)
-                // 回调尺寸是"视图侧默认缓冲尺寸"（=视图尺寸），与呈现无关：适配由图层自动完成，
-                // 显示器像素以本宿主记账为准（创建初始 + 静止态对齐）。
-            }
-
-            tv.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
-                override fun onSurfaceTextureAvailable(st: SurfaceTexture, width: Int, height: Int) {
-                    attachSurface(st)
-                }
-
-                override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, width: Int, height: Int) {
-                    // 视图尺寸=显示器尺寸，仅显示器 resize（静止态对齐）时触发；适配随新帧自动刷新。
-                }
-
-                override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
-                    YAMFManager.windowBackend.updateSessionDisplaySurface(windowId, null)
-                    sessionSurface?.release()
-                    sessionSurface = null
-                    return true
-                }
-
-                override fun onSurfaceTextureUpdated(st: SurfaceTexture) {
-                    // 真实首帧到达：快照占位淡出退场
-                    if (dropSnapshotActive) {
-                        dropSnapshotActive = false
-                        binding.root.post { fadeDropSnapshotOverlay() }
-                    }
-                }
-            }
-            // 竞态兜底：监听注册前纹理可能已就绪（不会补发 available 回调）
-            runCatching {
-                val st = tv.surfaceTexture
-                if (tv.isAvailable && st != null && sessionSurface == null) {
-                    attachSurface(st)
-                }
-            }
-
-            tv.setOnTouchListener { _, event -> handleSessionTouch(event) }
-            tv.setOnGenericMotionListener { _, event -> handleSessionTouch(event) }
-        }.onFailure { log(TAG, "session display view setup failed", it) }
-    }
-
-    /** 视口触摸：仅内容交互态注入（mini/手势态返回 false 让外壳拖动/复位热区接管）。 */
-    private fun handleSessionTouch(event: MotionEvent): Boolean {
-        if (!displaySession || !contentTouchThrough) return false
-        val tv = sessionTextureView ?: return false
-        return YAMFManager.windowBackend.injectSessionPointer(windowId, event, tv.width, tv.height)
-    }
-
-    /**
-     * 视口几何：裁剪容器布局到"可见内容区"（卡片 cvBackground 减壳层内衬 shellInsets），
-     * 内容视图以自身 scale 缩放到该容器（布局尺寸恒=显示器尺寸，见 [setupSessionDisplayView]）。
-     * 每帧几何（applySmoothBounds）与装饰切换时同步；幂等、无布局风暴（scale 不触发布局）。
-     */
-    private fun updateSessionViewportBounds() {
-        val clip = sessionViewport ?: return
-        val tv = sessionTextureView ?: return
-        // 尺寸基准优先取"当前帧刚下发的布局参数"：动画逐帧只改 lp（布局要到下一趟才生效），
-        // 若读已测量尺寸会拿到上一帧结果 → 视口比边框晚一帧（真机逐帧实测：开启动画期间
-        // 内容右缘落后边框 7~21px 拖尾 = "内容跟边框错位"）。取 lp 则与边框同帧对齐。
-        val lp = binding.cvBackground.layoutParams
-        val cardW = lp?.width?.takeIf { it > 0 } ?: binding.cvBackground.width
-        val cardH = lp?.height?.takeIf { it > 0 } ?: binding.cvBackground.height
-        if (cardW <= 0 || cardH <= 0) return
-        val ins = shellInsets()
-        val w = (cardW - ins.left - ins.right).coerceAtLeast(1)
-        val h = (cardH - ins.top - ins.bottom).coerceAtLeast(1)
-        clip.updateLayoutParams<ConstraintLayout.LayoutParams> {
-            width = w
-            height = h
-            leftMargin = ins.left
-            topMargin = ins.top
-        }
-        if (sessionDisplayW > 0 && sessionDisplayH > 0) {
-            tv.scaleX = w.toFloat() / sessionDisplayW * miniFlightDip
-            tv.scaleY = h.toFloat() / sessionDisplayH * miniFlightDip
-        }
-        if (w != loggedViewportW || h != loggedViewportH ||
-            sessionDisplayW != loggedDisplayW || sessionDisplayH != loggedDisplayH
-        ) {
-            loggedViewportW = w
-            loggedViewportH = h
-            loggedDisplayW = sessionDisplayW
-            loggedDisplayH = sessionDisplayH
-            clip.invalidateOutline()
-            android.util.Log.i(
-                TAG,
-                "session viewport view=${w}x${h} card=${cardW}x${cardH} " +
-                        "display=${sessionDisplayW}x${sessionDisplayH} " +
-                        "scale=${"%.3f".format(tv.scaleX)},${"%.3f".format(tv.scaleY)} insets=$ins"
-            )
-        }
-    }
-
-    /** 会话屏像素对齐（唯一入口：记账 → 内容视图布局跟随 → 后端 resize → 缩放刷新）。 */
-    private fun resizeSessionDisplay(width: Int, height: Int) {
-        if (width <= 0 || height <= 0) return
-        if (width == sessionDisplayW && height == sessionDisplayH) return
-        sessionDisplayW = width
-        sessionDisplayH = height
-        sessionTextureView?.updateLayoutParams<FrameLayout.LayoutParams> {
-            this.width = width
-            this.height = height
-        }
-        YAMFManager.windowBackend.resizeSessionDisplay(windowId, width, height)
-        updateSessionViewportBounds()
     }
 
     /** 系统窗口后端把任务 leash 交给我们（onTaskAdopted 回灌）后，按当前几何立即摆放 */
@@ -1188,12 +881,6 @@ class AppWindow(
 
         if (taskInfo.taskId == currentTaskId) {
             updateTask(taskInfo)
-            if (displaySession) {
-                // 显示器承载：任务经流程分拣绑定到本壳即内容就绪（无 leash 回调可等）——
-                // 立即按当前几何对齐显示器像素并淡入（回收区投放则走"从松手点飞入"登场）。
-                updateSmoothBounds()
-                revealChromeOrDropEntry()
-            }
             maybeRequestMini()
             return
         }
@@ -1293,8 +980,6 @@ class AppWindow(
 
     private fun keepAboveHome() {
         if (isDestroyed) return
-        // 会话显示器承载：小窗层序由普通窗口（overlay）恒定保证，不存在任务级层序需要抢。
-        if (displaySession) return
         // 置顶身份（承载根 always-on-top）生效后，层序由系统排序规则保证：
         // 此时任何"回置顶"（bringTaskToFront/reorder）都是多余的抢层动作，正是与
         // recents 手势/过渡互相打断的来源 → 直接让路。
@@ -1365,8 +1050,7 @@ class AppWindow(
             boundsAnimator?.cancel()
             boundsAnimator = null
         }
-        // 登场飞行的景深/渐变随动画取消一并复位（防中断残留）；刷新率提升同步撤销
-        miniFlightDip = 1f
+        // 刷新率提升随动画取消一并撤销
         setFlightFrameRateBoost(false)
     }
 
@@ -1507,7 +1191,6 @@ class AppWindow(
         binding.cvParent.setStrokeColor(ColorStateList.valueOf(context.getColor(R.color.transparentOutline)))
         binding.ibSuper.visibility = View.VISIBLE
         binding.ibSuper.alpha = 1f
-        sessionViewport?.invalidateOutline()
     }
 
     /**
@@ -1545,7 +1228,6 @@ class AppWindow(
         binding.cvParent.setStrokeColor(ColorStateList.valueOf(context.getColor(R.color.window_bezel)))
         // 顶栏不在此处硬切：交由 [animateSuperBarAlpha] 随几何动画渐隐（动画期间条带靠它覆盖，
         // 硬切会让"应被白条覆盖"的区域透出壁纸/时钟 = 内容与边框错位）。
-        sessionViewport?.invalidateOutline()
     }
 
     /**
@@ -1770,46 +1452,6 @@ class AppWindow(
     }
 
     /**
-     * 投放登场首帧占位：取任务最近快照（桌面最近任务卡片同源）直接拉伸铺满内容视口——
-     * 起始大卡片不再黑屏；真实画面首帧（onSurfaceTextureUpdated）到达后 200ms 淡出移除，
-     * 1.5s 兜底淡出（防应用不产帧时快照定格）。
-     */
-    private fun showDropSnapshotOverlay() {
-        if (!displaySession) return
-        val view = sessionSnapshotView ?: return
-        val bitmap = runCatching { YAMFManager.windowBackend.taskSnapshot(currentTaskId) }.getOrNull() ?: return
-        dropSnapshotBitmap = bitmap
-        dropSnapshotActive = true
-        runCatching {
-            view.setImageBitmap(bitmap)
-            view.alpha = 1f
-            view.visibility = View.VISIBLE
-            val fade = Runnable { fadeDropSnapshotOverlay() }
-            dropSnapshotFadeRunnable = fade
-            binding.root.postDelayed(fade, 1500)
-        }.onFailure { log(TAG, "drop snapshot overlay failed", it) }
-    }
-
-    private fun fadeDropSnapshotOverlay() {
-        val view = sessionSnapshotView ?: return
-        runCatching {
-            dropSnapshotFadeRunnable?.let { binding.root.removeCallbacks(it) }
-            dropSnapshotFadeRunnable = null
-            dropSnapshotActive = false
-            if (view.visibility != View.VISIBLE) return
-            view.animate().cancel()
-            view.animate().alpha(0f).setDuration(200).withEndAction {
-                runCatching {
-                    view.visibility = View.GONE
-                    view.setImageDrawable(null)
-                    dropSnapshotBitmap?.recycle()
-                    dropSnapshotBitmap = null
-                }
-            }.start()
-        }
-    }
-
-    /**
      * 几何飞行的刷新率提升：向系统请求显示器最高刷新率（帧率吃满），结束/取消即复位——
      * 动画由 Choreographer 逐帧驱动，显示器不升频则全程 60Hz（"帧率低"的真因）。
      * 双通道投票（取运行时最高模式值，不写死）：①LayoutParams.preferredRefreshRate（WMS 侧
@@ -1878,13 +1520,12 @@ class AppWindow(
         val fromInsets = if (drop != null) MiniPolicy.ShellInsets(0, 0, 0, 0) else shellInsets()
         miniActive = true
         applyMiniChrome()
-        // 首帧内衬 = 起点内衬（防"卡还是点击态、内衬已切 mini"的 1 帧视口跳变）
+        // 首帧内衬 = 起点内衬（防"卡还是点击态、内衬已切 mini"的 1 帧内衬跳变）
         animInsets = fromInsets
-        updateSessionViewportBounds()
         val toInsets = miniInsets()
         // mini 目标 = 当前内容区**等比缩放**到磁吸槽位（保持宽高比——参考图帧_02/帧_05 实锤：
-        // mini 与展开态是同一 UI 的纯缩放）。比例一致 ⇒ 过渡 = 纯几何缩放、无拉伸；
-        // 显示器尺寸全程不变（应用零重排/零表面重建）——这是最简单且最平滑的实现方式。
+        // mini 与展开态是同一 UI 的纯缩放）。比例一致 ⇒ mini 期间几何走 leash 缩放、
+        // 应用零重排，动画天然平滑。见 [MiniPolicy.enterTarget]。
         val fromContentW = ((centered?.width() ?: 0) - fromInsets.width).coerceAtLeast(1)
         val fromContentH = ((centered?.height() ?: 0) - fromInsets.height).coerceAtLeast(1)
         val to = MiniPolicy.enterTarget(
@@ -1905,7 +1546,7 @@ class AppWindow(
             animateSuperBarAlpha(1f, 0f, geometryAnimDuration(), hideAtEnd = true)
             animateContentRect(centered ?: to, to, geometryAnimDuration(), insetsFrom = fromInsets, insetsTo = toInsets) { cancelled ->
                 reportCommandResult(cmdId, if (cancelled) CommandStatus.SUPERSEDED else CommandStatus.DONE)
-                // 终态：补一次结算（视口/缩放/轮廓落定；显示器像素在 mini 态保持不变）
+                // 终态：补一次结算（几何/轮廓落定；mini 态保持 leash 缩放，不落真实 bounds）
                 binding.root.post(::updateSmoothBounds)
             }
             return
@@ -1924,8 +1565,6 @@ class AppWindow(
             topInsetPx = topInsetPx,
             bottomInsetPx = bottomInsetPx
         ).toAndroidRect()
-        // 首帧占位：用最近任务里该应用的快照直接拉伸铺满起始卡片（杜绝"黑屏开场"）
-        showDropSnapshotOverlay()
         // 起手帧内衬 = 起点内衬（零内衬大卡片，防 1 帧 mini 内衬跳变）
         animInsets = fromInsets
         // 起手帧直接落到起点（root 仍透明），随后轻淡入 + 一条减速飞行入位
@@ -1957,15 +1596,12 @@ class AppWindow(
                 DropEntryPolicy.CURVE_X2, DropEntryPolicy.CURVE_Y2
             ),
             onFrame = { f ->
-                // 圆角/描边随飞行渐成（大卡片方角 → mini 描边边框）；内容轻微景深回缩
+                // 圆角/描边随飞行渐成（大卡片方角 → mini 描边边框）
                 binding.cvParent.radius = radius * f
                 binding.cvParent.strokeWidth = (bezel * f).toInt()
                 binding.cvBackground.radius = ((radius - bezel) * f).coerceAtLeast(0f)
-                miniFlightDip = DropEntryPolicy.dipAt(f)
-                updateSessionViewportBounds()
             }
         ) { cancelled ->
-            miniFlightDip = 1f
             reportCommandResult(cmdId, if (cancelled) CommandStatus.SUPERSEDED else CommandStatus.DONE)
             binding.root.post(::updateSmoothBounds)
         }
@@ -2006,15 +1642,14 @@ class AppWindow(
         val toInsets = normalInsets()
         // 顶栏渐显：快速点亮（覆盖"边距+条高"条带，避免动画期间透出壁纸/时钟 = 错位感）
         animateSuperBarAlpha(0f, 1f, (geometryAnimDuration() * 0.45f).toLong().coerceAtLeast(1L), hideAtEnd = false)
-        // 显示器像素**全程不随模式变化**（mini 只是视口等比降采样，应用零重排）；
-        // 正常态的内容区对齐由静止结算下发（见 applySmoothBounds）。
+        // mini 期间几何走 leash 缩放（应用零重排）；正常态静止点由静止结算落真实 bounds
+        //（应用按窗口尺寸重排一次，见 applySmoothBounds）。
         animateContentRect(from, to, geometryAnimDuration(), insetsFrom = fromInsets, insetsTo = toInsets) { cancelled ->
             // 终态：退出 mini——恢复点击态外壳装饰与 wrap-content（后续测量/吸附基于自然尺寸）
             miniActive = false
             applyNormalChrome()
             setBackgroundWrapContent()
             setParrentWrapContent()
-            if (displaySession) updateSessionViewportBounds()
             reportCommandResult(cmdId, if (cancelled) CommandStatus.SUPERSEDED else CommandStatus.DONE)
             binding.root.post(::updateSmoothBounds)
         }
