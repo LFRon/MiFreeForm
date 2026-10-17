@@ -24,7 +24,9 @@ data class WindowRegistration(
 
 data class CoreConfig(
     val verticalDragThresholdDp: Float = 80f,
-    val doubleTapTimeoutMs: Long = 300L
+    val doubleTapTimeoutMs: Long = 300L,
+    /** 栏点按判定位移上限（dp）：Press→Up 位移在此内视为一次"点按"（双击关闭用）。 */
+    val barTapSlopDp: Float = 8f
 )
 
 sealed interface WindowInputEvent {
@@ -77,14 +79,6 @@ sealed interface WindowInputEvent {
         override val screenY: Float
     ) : Pointer
 
-    data class Tap(
-        override val windowId: Int,
-        override val timeMs: Long,
-        override val region: RegionId,
-        override val screenX: Float = 0f,
-        override val screenY: Float = 0f
-    ) : Pointer
-
     /** 外部请求（宿主内部触发，如"打开即 mini"）：进入角落 mini 态，等价于在右上角投放。 */
     data class RequestMini(
         override val windowId: Int,
@@ -97,7 +91,25 @@ sealed interface WindowInputEvent {
         val velocityX: Float,
         val velocityY: Float
     ) : WindowInputEvent
+
+    /** 命令结果回灌（闭环不变量 2）：异步命令的 Done / Failed / Superseded。 */
+    data class CommandResult(
+        override val windowId: Int,
+        override val timeMs: Long,
+        val commandId: Long,
+        val status: CommandStatus
+    ) : WindowInputEvent
+
+    /** 屏幕指标变化（旋转/尺寸变化；宿主采集后以事件入核）。 */
+    data class ScreenMetricsChanged(
+        override val windowId: Int,
+        override val timeMs: Long,
+        val width: Int,
+        val height: Int
+    ) : WindowInputEvent
 }
+
+enum class CommandStatus { DONE, FAILED, SUPERSEDED }
 
 sealed interface WindowCommand {
     val windowId: Int
@@ -118,8 +130,14 @@ sealed interface WindowCommand {
     data class ResizePreviewStart(override val windowId: Int) : WindowCommand
     data class ResizePreviewUpdate(override val windowId: Int, val dx: Float, val dy: Float) : WindowCommand
     data class ResizePreviewCommit(override val windowId: Int) : WindowCommand
-    data class EnterMini(override val windowId: Int, val corner: DropKind = DropKind.CORNER_TR) : WindowCommand
-    data class ExitMini(override val windowId: Int) : WindowCommand
+    data class EnterMini(
+        override val windowId: Int,
+        val corner: DropKind = DropKind.CORNER_TR,
+        /** 命令 id（>0 时宿主执行完毕回灌 CommandResult；0 = 不追踪）。 */
+        val cmdId: Long = 0L
+    ) : WindowCommand
+
+    data class ExitMini(override val windowId: Int, val cmdId: Long = 0L) : WindowCommand
     data class RequestClose(override val windowId: Int, val origin: CloseOrigin) : WindowCommand
     data class RequestFullscreen(override val windowId: Int, val origin: FullscreenOrigin) : WindowCommand
     data class RaiseWindow(override val windowId: Int) : WindowCommand

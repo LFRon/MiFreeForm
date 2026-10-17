@@ -10,6 +10,7 @@ import android.util.DisplayMetrics
 import android.view.View
 import com.buildsession.betterYAMF.common.ui.dpToPx
 import com.buildsession.betterYAMF.window.core.DropKind
+import com.buildsession.betterYAMF.window.core.DropTargetCalculator
 
 internal class CornerDropZoneView(context: Context) : View(context) {
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
@@ -24,11 +25,8 @@ internal class CornerDropZoneView(context: Context) : View(context) {
     private val radius: Float
         get() {
             val dm = getRealScreenMetrics()
-            return if (dm.widthPixels > dm.heightPixels) {
-                dm.heightPixels * 0.20f
-            } else {
-                dm.widthPixels * 0.20f
-            }
+            // 与命中策略同源（core.DropTargetCalculator）：避免两处常量各自漂移
+            return minOf(dm.widthPixels, dm.heightPixels) * DropTargetCalculator.CORNER_RADIUS_RATIO
         }
 
     private var currentCorner = -1 // -1: none, 0: TL, 1: TR, 2: BL, 3: BR
@@ -66,8 +64,17 @@ internal class CornerDropZoneView(context: Context) : View(context) {
             1 -> drawCorner(canvas, w, 0f, 90f, 90f) // TR
             2 -> drawCorner(canvas, 0f, h, 270f, 90f) // BL
             3 -> drawCorner(canvas, w, h, 180f, 90f) // BR
-            4 -> drawSide(canvas, 0f, h * 0.1f, w * 0.05f, h * 0.9f) // Left
-            5 -> drawSide(canvas, w * 0.95f, h * 0.1f, w, h * 0.9f) // Right
+            4 -> drawSide( // Left
+                canvas, 0f,
+                h * DropTargetCalculator.SIDE_HEIGHT_START_RATIO,
+                w * DropTargetCalculator.SIDE_WIDTH_RATIO,
+                h * DropTargetCalculator.SIDE_HEIGHT_END_RATIO
+            )
+            5 -> drawSide( // Right
+                canvas, w * (1f - DropTargetCalculator.SIDE_WIDTH_RATIO),
+                h * DropTargetCalculator.SIDE_HEIGHT_START_RATIO,
+                w, h * DropTargetCalculator.SIDE_HEIGHT_END_RATIO
+            )
         }
     }
 
