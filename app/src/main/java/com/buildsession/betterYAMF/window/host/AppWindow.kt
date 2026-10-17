@@ -75,8 +75,9 @@ import com.buildsession.betterYAMF.xposed.services.YAMFManager.config
 import com.buildsession.betterYAMF.xposed.utils.Instances
 import com.buildsession.betterYAMF.xposed.utils.RunMainThreadQueue
 import com.buildsession.betterYAMF.xposed.utils.TipUtil
-import com.buildsession.betterYAMF.xposed.utils.log
 import com.buildsession.betterYAMF.xposed.utils.getActivityInfoCompat
+import com.buildsession.betterYAMF.xposed.utils.log
+import de.robv.android.xposed.XposedHelpers
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -171,6 +172,15 @@ class AppWindow(
      */
     private var sessionDisplayW = 0
     private var sessionDisplayH = 0
+
+    /** 投放登场首帧占位层（最近任务快照直接拉伸；真实首帧到达后淡出）。 */
+    private var sessionSnapshotView: android.widget.ImageView? = null
+    private var dropSnapshotBitmap: android.graphics.Bitmap? = null
+    private var dropSnapshotActive = false
+    private var dropSnapshotFadeRunnable: Runnable? = null
+
+    /** 几何飞行期间的刷新率提升状态（进入/退出幂等）。 */
+    private var flightFrameRateBoosted = false
     /** 视口布局诊断去抖（仅尺寸变化时打一行，logcat 可见）。 */
     private var loggedViewportW = -1
     private var loggedViewportH = -1
@@ -388,6 +398,18 @@ class AppWindow(
         boundsAnimator?.cancel()
         boundsAnimator = null
         pendingReveal = false
+        // 快照占位与刷新率提升清理
+        runCatching {
+            dropSnapshotFadeRunnable?.let { binding.root.removeCallbacks(it) }
+            dropSnapshotFadeRunnable = null
+            dropSnapshotActive = false
+            sessionSnapshotView?.animate()?.cancel()
+            sessionSnapshotView?.visibility = View.GONE
+            sessionSnapshotView?.setImageDrawable(null)
+            dropSnapshotBitmap?.recycle()
+            dropSnapshotBitmap = null
+            setFlightFrameRateBoost(false)
+        }
         runMain { runCatching { binding.root.removeCallbacks(revealRunnable) } }
 
         // 关闭小窗：任务复位为全屏并下沉到原父级栈底（后台、留在最近任务，不抢前台，
@@ -900,6 +922,19 @@ class AppWindow(
             tv.pivotX = 0f
             tv.pivotY = 0f
             clip.addView(tv, FrameLayout.LayoutParams(1, 1))
+            // 快照占位层（叠于内容之上）：登场首帧用最近任务快照直接拉伸铺满（杜绝黑屏开场）
+            val snapView = android.widget.ImageView(context)
+            snapView.scaleType = android.widget.ImageView.ScaleType.FIT_XY
+            snapView.visibility = View.GONE
+            snapView.alpha = 0f
+            clip.addView(
+                snapView,
+                FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.MATCH_PARENT
+                )
+            )
+            sessionSnapshotView = snapView
             sessionTextureView = tv
 
             val initialBox = contentBoxOf(android.graphics.Rect(0, 0, windowWidth, windowHeight))
@@ -944,7 +979,13 @@ class AppWindow(
                     return true
                 }
 
-                override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
+                override fun onSurfaceTextureUpdated(st: SurfaceTexture) {
+                    // 真实首帧到达：快照占位淡出退场
+                    if (dropSnapshotActive) {
+                        dropSnapshotActive = false
+                        binding.root.post { fadeDropSnapshotOverlay() }
+                    }
+                }
             }
             // 竞态兜底：监听注册前纹理可能已就绪（不会补发 available 回调）
             runCatching {
@@ -1282,8 +1323,9 @@ class AppWindow(
             boundsAnimator?.cancel()
             boundsAnimator = null
         }
-        // 登场飞行的景深/渐变随动画取消一并复位（防中断残留）
+        // 登场飞行的景深/渐变随动画取消一并复位（防中断残留）；刷新率提升同步撤销
         miniFlightDip = 1f
+        setFlightFrameRateBoost(false)
     }
 
     private fun keepInScreen(animate: Boolean = true) {
@@ -1535,6 +1577,8 @@ class AppWindow(
             onEnd?.invoke()
             return
         }
+        // 飞行期间请求最高刷新率（结束/取消复位）——帧率吃满手机最高刷新率
+        setFlightFrameRateBoost(true)
         val animInterp = interpolator
         boundsAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
             duration = durationMs
@@ -1560,6 +1604,7 @@ class AppWindow(
                     if (boundsAnimator === animation) boundsAnimator = null
                     animInsets = null
                     onFrame?.invoke(1f)
+                    setFlightFrameRateBoost(false)
                     onEnd?.invoke()
                 }
             })
@@ -1664,6 +1709,87 @@ class AppWindow(
         }
     }
 
+    /**
+     * 投放登场首帧占位：取任务最近快照（桌面最近任务卡片同源）直接拉伸铺满内容视口——
+     * 起始大卡片不再黑屏；真实画面首帧（onSurfaceTextureUpdated）到达后 200ms 淡出移除，
+     * 1.5s 兜底淡出（防应用不产帧时快照定格）。
+     */
+    private fun showDropSnapshotOverlay() {
+        if (!displaySession) return
+        val view = sessionSnapshotView ?: return
+        val bitmap = runCatching { YAMFManager.windowBackend.taskSnapshot(currentTaskId) }.getOrNull() ?: return
+        dropSnapshotBitmap = bitmap
+        dropSnapshotActive = true
+        runCatching {
+            view.setImageBitmap(bitmap)
+            view.alpha = 1f
+            view.visibility = View.VISIBLE
+            val fade = Runnable { fadeDropSnapshotOverlay() }
+            dropSnapshotFadeRunnable = fade
+            binding.root.postDelayed(fade, 1500)
+        }.onFailure { log(TAG, "drop snapshot overlay failed", it) }
+    }
+
+    private fun fadeDropSnapshotOverlay() {
+        val view = sessionSnapshotView ?: return
+        runCatching {
+            dropSnapshotFadeRunnable?.let { binding.root.removeCallbacks(it) }
+            dropSnapshotFadeRunnable = null
+            dropSnapshotActive = false
+            if (view.visibility != View.VISIBLE) return
+            view.animate().cancel()
+            view.animate().alpha(0f).setDuration(200).withEndAction {
+                runCatching {
+                    view.visibility = View.GONE
+                    view.setImageDrawable(null)
+                    dropSnapshotBitmap?.recycle()
+                    dropSnapshotBitmap = null
+                }
+            }.start()
+        }
+    }
+
+    /**
+     * 几何飞行的刷新率提升：向系统请求显示器最高刷新率（帧率吃满），结束/取消即复位——
+     * 动画由 Choreographer 逐帧驱动，显示器不升频则全程 60Hz（"帧率低"的真因）。
+     * 双通道投票（取运行时最高模式值，不写死）：①LayoutParams.preferredRefreshRate（WMS 侧
+     * DisplayModeDirector 依票选型）；②窗口 SurfaceControl 的 frame rate（SF 层票，平台自身
+     * ViewRootImpl#setPreferredFrameRate :14329 即走此 Transaction 通道），FIXED_SOURCE =
+     * 内容严格依赖该帧率，结束用 clearFrameRate 撤销。
+     */
+    private fun setFlightFrameRateBoost(enabled: Boolean) {
+        if (flightFrameRateBoosted == enabled) return
+        flightFrameRateBoosted = enabled
+        runCatching {
+            val display = context.getSystemService(android.hardware.display.DisplayManager::class.java)
+                ?.getDisplay(Display.DEFAULT_DISPLAY)
+            val maxHz = display?.supportedModes?.maxOfOrNull { it.refreshRate } ?: 0f
+            if (enabled && maxHz <= 0f) return@runCatching
+
+            // 通道 1（WMS 票）：LayoutParams.preferredRefreshRate——DisplayModeDirector 依票选型
+            val params = binding.root.layoutParams as? WindowManager.LayoutParams
+            if (params != null) {
+                params.preferredRefreshRate = if (enabled) maxHz else 0f
+                Instances.windowManager.updateViewLayout(binding.root, params)
+            }
+
+            // 通道 2（SF 层票）：窗口 SurfaceControl 的 frame rate——平台自身
+            // （ViewRootImpl#setPreferredFrameRate :14329）即走此 Transaction 通道；
+            // FIXED_SOURCE = 内容严格依赖该帧率，结束用 clearFrameRate 撤销。
+            val vri = XposedHelpers.callMethod(binding.root, "getViewRootImpl") ?: return@runCatching
+            val sc = XposedHelpers.callMethod(vri, "getSurfaceControl") as? android.view.SurfaceControl ?: return@runCatching
+            val tx = android.view.SurfaceControl.Transaction()
+            if (enabled) {
+                tx.setFrameRate(sc, maxHz, Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE)
+            } else {
+                tx.clearFrameRate(sc)
+            }
+            tx.apply()
+            tx.close()
+            log(TAG, "flight frame rate boost=${if (enabled) "${maxHz}Hz" else "cleared"} window=$windowId")
+        }.onFailure { log(TAG, "flight frame rate boost($enabled) failed", it) }
+    }
+
     private fun execEnterMini(corner: DropKind) {
         if (originalWidth <= 0 || originalHeight <= 0) {
             log(TAG, "execEnterMini skipped: size not measured")
@@ -1737,6 +1863,8 @@ class AppWindow(
         val startLeft = (to.right - startW).coerceAtLeast(margin)
         val startTop = to.top.coerceIn(140, (dm.heightPixels - 120 - startH).coerceAtLeast(140))
         val start = android.graphics.Rect(startLeft, startTop, startLeft + startW, startTop + startH)
+        // 首帧占位：用最近任务里该应用的快照直接拉伸铺满起始卡片（杜绝"黑屏开场"）
+        showDropSnapshotOverlay()
         // 起手帧直接落到起点（root 仍透明），随后轻淡入 + 一条减速飞行入位
         applyContentRectFrame(start)
         binding.root.alpha = 0f

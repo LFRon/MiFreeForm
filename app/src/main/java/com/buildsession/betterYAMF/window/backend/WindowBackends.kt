@@ -45,6 +45,8 @@ private object NoopWindowBackend : WindowBackend {
     override fun recentsGestureSuppressUntilMs(): Long = 0L
     override fun injectHomeKey(): Boolean = false
 
+    override fun taskSnapshot(taskId: Int): android.graphics.Bitmap? = null
+
     override fun launchAppForSession(component: ComponentName, userId: Int, windowId: Int): Boolean = false
 
     override fun moveTaskToSession(taskId: Int, windowId: Int): Boolean = false

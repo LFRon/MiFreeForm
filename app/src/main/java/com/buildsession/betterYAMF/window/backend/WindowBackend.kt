@@ -147,6 +147,13 @@ interface WindowBackend {
     /** 注入 HOME 键（"从最近任务打开即小窗"后关闭最近任务界面）。 */
     fun injectHomeKey(): Boolean
 
+    /**
+     * 任务的最近快照（= 桌面最近任务卡片同一来源）：
+     * 返回**已拷贝为稳定位图、方向已归一**的图（与快照缓冲生命周期解耦，可直接拉伸显示）；
+     * null = 无可用快照。用途：小窗登场动画的首帧占位（杜绝"黑屏开场"）。
+     */
+    fun taskSnapshot(taskId: Int): android.graphics.Bitmap?
+
     // ==== 会话显示器能力（"虚拟屏承载"实现的实现层契约；逻辑层不调用） ====
 
     /**

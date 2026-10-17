@@ -3,6 +3,7 @@ package com.buildsession.betterYAMF.xposed.hook.organizer
 import android.app.ActivityManager
 import android.content.ComponentName
 import android.content.Intent
+import android.graphics.Bitmap
 import android.graphics.Rect
 import android.view.MotionEvent
 import android.view.Surface
@@ -34,6 +35,9 @@ object SmoothWindowBackend : WindowBackend {
     private const val TAG = "reYAMF_Backend"
     private const val WINDOWING_MODE_FULLSCREEN = 1
     private const val WINDOWING_MODE_FREEFORM = 5
+
+    /** 快照占位图限宽（登场首帧占位，超出等比降采样防大图内存）。 */
+    private const val SNAPSHOT_MAX_WIDTH = 1200
 
     /** 默认（物理）显示器 id（无杀迁移的"回全屏"目标）。 */
     private const val DEFAULT_DISPLAY_ID = 0
@@ -612,6 +616,58 @@ object SmoothWindowBackend : WindowBackend {
     override fun recentsGestureSuppressUntilMs(): Long = SystemSignals.recentsGestureSuppressUntilMs
 
     override fun injectHomeKey(): Boolean = TaskSystemOps.injectHomeKey()
+
+    /**
+     * 任务的最近快照（桌面最近任务卡片的同一来源；形态与取用路径对齐 LoS 24.0）：
+     * `WindowManagerService.mTaskSnapshotController`（:787-788 字段并存，兼容两处命名）→
+     * `TaskSnapshotController.getSnapshot(taskId, RESOLUTION_HIGH, REFERENCE_NONE)`
+     * （:272；缓存检索不触盘、内部自持 mLock，与 ATMS.getTaskSnapshotInner 的取用参数一致）。
+     * `TaskSnapshot.wrapToBitmap()`（TaskSnapshot.java:244）包的是快照缓冲本体——**拷贝**
+     * 成独立 ARGB_8888 位图后与缓存生命周期解耦；同帧完成方向归一（getRotation 为
+     * Surface 旋转常量 :331，按 ×90 旋转回正）与限宽降采样（防大图内存）。
+     */
+    override fun taskSnapshot(taskId: Int): Bitmap? = runCatching {
+        val wms = XposedHelpers.getObjectField(Instances.activityTaskManager, "mWindowManager")
+        val controller = runCatching {
+            val sc = XposedHelpers.getObjectField(wms, "mSnapshotController")
+            XposedHelpers.getObjectField(sc, "mTaskSnapshotController")
+        }.getOrNull()
+            ?: runCatching { XposedHelpers.getObjectField(wms, "mTaskSnapshotController") }.getOrNull()
+            ?: return null
+        // RESOLUTION_HIGH=1（TaskSnapshotManager.java:56）；REFERENCE_NONE=0（TaskSnapshot.java:93）
+        val snapshot = XposedHelpers.callMethod(controller, "getSnapshot", taskId, 1, 0) ?: return null
+        val wrapped = XposedHelpers.callMethod(snapshot, "wrapToBitmap") as? Bitmap ?: return null
+        val rotation = (XposedHelpers.callMethod(snapshot, "getRotation") as? Int) ?: 0
+        val srcW = wrapped.width
+        val srcH = wrapped.height
+        if (srcW <= 0 || srcH <= 0) return null
+        val rotateSwap = rotation % 2 == 1
+        val rotW = if (rotateSwap) srcH else srcW
+        val rotH = if (rotateSwap) srcW else srcH
+        val scale = if (rotW > SNAPSHOT_MAX_WIDTH) SNAPSHOT_MAX_WIDTH.toFloat() / rotW else 1f
+        val matrix = android.graphics.Matrix()
+        if (rotation != 0) {
+            matrix.postRotate((rotation * 90).toFloat())
+            when (rotation) {
+                1 -> matrix.postTranslate(srcH.toFloat(), 0f)
+                2 -> matrix.postTranslate(srcW.toFloat(), srcH.toFloat())
+                3 -> matrix.postTranslate(0f, srcW.toFloat())
+            }
+        }
+        if (scale != 1f) matrix.postScale(scale, scale)
+        val out = Bitmap.createBitmap(
+            (rotW * scale).toInt().coerceAtLeast(1),
+            (rotH * scale).toInt().coerceAtLeast(1),
+            Bitmap.Config.ARGB_8888
+        )
+        android.graphics.Canvas(out).drawBitmap(
+            wrapped, matrix,
+            android.graphics.Paint(android.graphics.Paint.FILTER_BITMAP_FLAG)
+        )
+        runCatching { wrapped.recycle() }
+        log(TAG, "taskSnapshot task=$taskId src=${srcW}x$srcH rot=$rotation -> ${out.width}x${out.height}")
+        out
+    }.onFailure { log(TAG, "taskSnapshot failed task=$taskId", it) }.getOrNull()
 
     // === 会话显示器能力（"虚拟屏承载"实现细节收口在 SessionDisplays） ===
 
