@@ -144,14 +144,8 @@ object YAMFManager : IYAMFManager.Stub() {
                             }
                         }
                     }
-                    "onTaskInfoChanged" -> {
-                        val taskInfo = args[0] as android.app.ActivityManager.RunningTaskInfo
-                        activeWindows.values.forEach { w ->
-                            if (w.currentTaskId == taskInfo.taskId) {
-                                notifyTaskVisible(w, taskInfo.isVisible)
-                            }
-                        }
-                    }
+                    // 注：ITaskStackListener（LoS 24）没有 onTaskInfoChanged 回调（该名字仅存在于
+                    // ITaskOrganizer）——可见性刷新由 onTaskMovedToFront + 栈复检 + 延迟复核覆盖。
                     "onTaskDescriptionChanged" -> {
                         val taskInfo = args[0] as android.app.ActivityManager.RunningTaskInfo
                         activeWindows.values.forEach { it.onTaskDescriptionChanged(taskInfo) }

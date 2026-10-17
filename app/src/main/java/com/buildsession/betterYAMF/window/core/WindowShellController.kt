@@ -1,5 +1,7 @@
 package com.buildsession.betterYAMF.window.core
 
+import kotlin.math.abs
+
 class WindowShellController(
     private val registration: WindowRegistration,
     private val config: CoreConfig = CoreConfig(),
@@ -16,6 +18,10 @@ class WindowShellController(
     private var pressY = 0f
     private var dropActive: DropKind? = null
     private var lastBarTapMs = 0L
+    /** 闭环（不变量 2）：模式迁移命令的指令计数与未决登记。 */
+    private var nextCommandId = 1L
+    private var pendingMiniCommandId = 0L
+    private var pendingMiniFromMode = ShellMode.NORMAL
 
     fun onScreenMetricsChanged(width: Int, height: Int) {
         screenWidth = width
@@ -37,17 +43,44 @@ class WindowShellController(
             is WindowInputEvent.Up -> onUp(event)
             is WindowInputEvent.Cancel -> onCancel(event)
             is WindowInputEvent.TapConfirmed -> onTapConfirmed()
-            is WindowInputEvent.Tap -> onTap(event)
             is WindowInputEvent.RequestMini -> onRequestMini()
             is WindowInputEvent.Fling -> listOf(WindowCommand.FlingBy(windowId, event.velocityX, event.velocityY))
+            is WindowInputEvent.CommandResult -> onCommandResult(event)
+            is WindowInputEvent.ScreenMetricsChanged -> {
+                onScreenMetricsChanged(event.width, event.height)
+                emptyList()
+            }
         }
     }
 
     /** 外部请求进入 mini（如"打开即 mini"）：仅 NORMAL→MINI 迁移，幂等。 */
     private fun onRequestMini(): List<WindowCommand> {
         if (mode == ShellMode.MINI) return emptyList()
-        mode = ShellMode.MINI
-        return listOf(WindowCommand.EnterMini(windowId, DropKind.CORNER_TR))
+        return listOf(
+            miniCommand(ShellMode.MINI) { id -> WindowCommand.EnterMini(windowId, DropKind.CORNER_TR, id) }
+        )
+    }
+
+    /**
+     * 模式迁移命令（进/出 mini）：分配命令 id 并登记未决回灌——
+     * 宿主执行失败回 Failed（回退模式）；被后续命令取代则闭包作废（陈旧结果忽略）。
+     */
+    private fun miniCommand(target: ShellMode, build: (Long) -> WindowCommand): WindowCommand {
+        val id = nextCommandId++
+        pendingMiniCommandId = id
+        pendingMiniFromMode = mode
+        mode = target
+        return build(id)
+    }
+
+    /** 命令结果回灌：仅收敛当前未决的模式命令；陈旧结果（已被取代/已收敛）一律忽略。 */
+    private fun onCommandResult(event: WindowInputEvent.CommandResult): List<WindowCommand> {
+        if (event.commandId != pendingMiniCommandId) return emptyList()
+        pendingMiniCommandId = 0L
+        if (event.status == CommandStatus.FAILED) {
+            mode = pendingMiniFromMode
+        }
+        return emptyList()
     }
 
     private fun onPress(event: WindowInputEvent.Press): List<WindowCommand> {
@@ -121,7 +154,7 @@ class WindowShellController(
         raiseIfNeeded(out)
         when (event.region) {
             RegionId.BODY_MASK, RegionId.HANDLE -> decideDrop(out)
-            RegionId.BAR_BOTTOM, RegionId.BAR_SIDE -> decideBarRelease(out, event)
+            RegionId.BAR_BOTTOM, RegionId.BAR_SIDE -> decideBarRelease(out, event, tapEligible = true)
             RegionId.RESIZE_HANDLE -> {
                 out += WindowCommand.ResizePreviewCommit(windowId)
                 pressedRegion = null
@@ -136,24 +169,22 @@ class WindowShellController(
         val out = mutableListOf<WindowCommand>()
         when (event.region) {
             RegionId.BODY_MASK, RegionId.HANDLE -> decideDrop(out)
-            RegionId.BAR_BOTTOM, RegionId.BAR_SIDE -> decideBarRelease(out, event)
+            RegionId.BAR_BOTTOM, RegionId.BAR_SIDE -> decideBarRelease(out, event, tapEligible = false)
+            RegionId.RESIZE_HANDLE -> {
+                out += WindowCommand.ResizePreviewCommit(windowId)
+                pressedRegion = null
+            }
             else -> pressedRegion = null
         }
         return out
     }
 
     private fun decideDrop(out: MutableList<WindowCommand>) {
-        val kind = dropActive
-        when (kind) {
-            DropKind.CORNER_TL, DropKind.CORNER_TR, DropKind.CORNER_BL, DropKind.CORNER_BR -> {
-                out += WindowCommand.EnterMini(windowId, kind)
-                mode = ShellMode.MINI
-            }
-            // 侧边吸附与角落一致：缩小并贴边显示应用画面（不再收起为图标球）
-            DropKind.SIDE_LEFT, DropKind.SIDE_RIGHT -> {
-                out += WindowCommand.EnterMini(windowId, kind)
-                mode = ShellMode.MINI
-            }
+        when (val kind = dropActive) {
+            // 角落与侧边一致：缩小并贴边显示应用画面（不再收起为图标球）
+            DropKind.CORNER_TL, DropKind.CORNER_TR, DropKind.CORNER_BL, DropKind.CORNER_BR,
+            DropKind.SIDE_LEFT, DropKind.SIDE_RIGHT ->
+                out += miniCommand(ShellMode.MINI) { id -> WindowCommand.EnterMini(windowId, kind, id) }
             null -> out += WindowCommand.ClampToScreen(windowId, animated = true)
         }
         out += WindowCommand.DropZoneHide(windowId)
@@ -161,37 +192,40 @@ class WindowShellController(
         pressedRegion = null
     }
 
-    private fun decideBarRelease(out: MutableList<WindowCommand>, event: WindowInputEvent.Pointer) {
+    /**
+     * 栏释放判定。[tapEligible]=false（Cancel 打断）绝不计数点按。
+     * 栏点按（双击关闭）由 Press→Up 位移判定：宿主点击回调被 OnTouchListener 吞掉
+     * （View.dispatchTouchEvent 语义），判定收归核心；跨栏共享计时。
+     */
+    private fun decideBarRelease(
+        out: MutableList<WindowCommand>,
+        event: WindowInputEvent.Pointer,
+        tapEligible: Boolean
+    ) {
         val threshold = config.verticalDragThresholdDp * registration.density
+        val slop = config.barTapSlopDp * registration.density
         val diffY = event.screenY - pressY
+        val diffX = event.screenX - pressX
         when {
             diffY < -threshold -> out += WindowCommand.RequestClose(windowId, CloseOrigin.DRAG_UP_BAR)
             diffY > threshold -> out += WindowCommand.RequestFullscreen(windowId, FullscreenOrigin.DRAG_DOWN_BAR)
-            else -> out += WindowCommand.ClearVerticalDragPreview(windowId)
+            else -> {
+                out += WindowCommand.ClearVerticalDragPreview(windowId)
+                if (tapEligible && abs(diffY) <= slop && abs(diffX) <= slop) {
+                    if (event.timeMs - lastBarTapMs < config.doubleTapTimeoutMs) {
+                        out += WindowCommand.RequestClose(windowId, CloseOrigin.DOUBLE_TAP_BAR)
+                    }
+                    lastBarTapMs = event.timeMs
+                }
+            }
         }
         pressedRegion = null
     }
 
     private fun onTapConfirmed(): List<WindowCommand> = when (mode) {
-        ShellMode.MINI -> {
-            mode = ShellMode.NORMAL
-            listOf(WindowCommand.ExitMini(windowId))
-        }
+        ShellMode.MINI ->
+            listOf(miniCommand(ShellMode.NORMAL) { id -> WindowCommand.ExitMini(windowId, id) })
         else -> emptyList()
-    }
-
-    private fun onTap(event: WindowInputEvent.Tap): List<WindowCommand> {
-        return when (event.region) {
-            RegionId.BAR_BOTTOM, RegionId.BAR_SIDE -> {
-                val out = mutableListOf<WindowCommand>()
-                if (event.timeMs - lastBarTapMs < config.doubleTapTimeoutMs) {
-                    out += WindowCommand.RequestClose(windowId, CloseOrigin.DOUBLE_TAP_BAR)
-                }
-                lastBarTapMs = event.timeMs
-                out
-            }
-            else -> emptyList()
-        }
     }
 
     private fun raiseIfNeeded(out: MutableList<WindowCommand>) {

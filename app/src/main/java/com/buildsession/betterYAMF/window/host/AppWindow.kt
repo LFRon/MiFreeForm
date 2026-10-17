@@ -9,7 +9,6 @@ import android.content.Context
 import android.content.Context.DISPLAY_SERVICE
 import android.content.Intent
 import android.content.IntentFilter
-import android.content.pm.PackageManager
 import android.content.res.ColorStateList
 import android.content.res.Configuration
 import android.content.res.Resources
@@ -17,7 +16,6 @@ import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
 import com.google.android.material.shape.ShapeAppearanceModel
 import android.hardware.display.DisplayManager
-import android.os.Build
 import android.util.DisplayMetrics
 import android.util.Log
 import android.util.TypedValue
@@ -57,7 +55,11 @@ import com.buildsession.betterYAMF.common.runMain
 import com.buildsession.betterYAMF.common.ui.animateAlpha
 import com.buildsession.betterYAMF.common.ui.dpToPx
 import com.buildsession.betterYAMF.databinding.WindowAppBinding
+import com.buildsession.betterYAMF.window.core.AnimTimingPolicy
+import com.buildsession.betterYAMF.window.core.ClampPolicy
 import com.buildsession.betterYAMF.window.core.CloseOrigin
+import com.buildsession.betterYAMF.window.core.CommandStatus
+import com.buildsession.betterYAMF.window.core.DropEntryPolicy
 import com.buildsession.betterYAMF.window.core.DropKind
 import com.buildsession.betterYAMF.window.core.FullscreenOrigin
 import com.buildsession.betterYAMF.window.core.MiniPolicy
@@ -70,6 +72,7 @@ import com.buildsession.betterYAMF.window.core.WindowShellController
 import com.buildsession.betterYAMF.window.core.WindowShellRegistry
 import com.buildsession.betterYAMF.window.session.WindowSessions
 import com.buildsession.betterYAMF.common.model.resolveWindowSizePx
+import com.buildsession.betterYAMF.xposed.hook.system.ViewSurfaceOps
 import com.buildsession.betterYAMF.xposed.services.YAMFManager
 import com.buildsession.betterYAMF.xposed.services.YAMFManager.config
 import com.buildsession.betterYAMF.xposed.utils.Instances
@@ -77,7 +80,6 @@ import com.buildsession.betterYAMF.xposed.utils.RunMainThreadQueue
 import com.buildsession.betterYAMF.xposed.utils.TipUtil
 import com.buildsession.betterYAMF.xposed.utils.getActivityInfoCompat
 import com.buildsession.betterYAMF.xposed.utils.log
-import de.robv.android.xposed.XposedHelpers
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -98,8 +100,6 @@ class AppWindow(
         private const val HOME_REFRONT_DELAY_MS = 0L
         private const val MINI_START_DELAY_MS = 500L
 
-        /** 回收区投放登场动画的起始卡片 = 磁吸槽位卡片的放大倍数（示范视频前段 ≈ 84% 屏宽收缩）。 */
-        private const val DROP_ENTRY_START_SCALE = 3.0f
         private val shellRegistry = WindowShellRegistry()
         private val windowIdGen = java.util.concurrent.atomic.AtomicInteger(1)
     }
@@ -207,6 +207,15 @@ class AppWindow(
     private val frameOffsetLayoutListener =
         android.view.ViewTreeObserver.OnGlobalLayoutListener { refreshFrameOffset() }
 
+    /** 屏幕指标事件化：旋转/尺寸变化经 DisplayListener 入核（不再只靠手势兜底刷新）。 */
+    private val displayListener = object : DisplayManager.DisplayListener {
+        override fun onDisplayAdded(displayId: Int) {}
+        override fun onDisplayRemoved(displayId: Int) {}
+        override fun onDisplayChanged(displayId: Int) {
+            if (displayId == Display.DEFAULT_DISPLAY && ::shell.isInitialized) dispatchScreenMetrics()
+        }
+    }
+
     private val broadcastReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             if (intent.action == Protocol.ACTION_RESET_ALL_WINDOW) {
@@ -305,14 +314,6 @@ class AppWindow(
             true
         }
 
-        binding.cvBarClickMask.setOnClickListener {
-            dispatchInput(WindowInputEvent.Tap(windowId, System.currentTimeMillis(), RegionId.BAR_BOTTOM))
-        }
-
-        binding.cvBarSideClickMask.setOnClickListener {
-            dispatchInput(WindowInputEvent.Tap(windowId, System.currentTimeMillis(), RegionId.BAR_SIDE))
-        }
-
         // 顶部拖动栏：整栏可拖（白底 + 居中三点；模式与窗口移动语义由核心决策，
         // 宿主只把整栏的触摸事件接入 HANDLE 手势输入）
         binding.ibSuper.setOnTouchListener { _, event ->
@@ -351,7 +352,11 @@ class AppWindow(
         shell = shellRegistry.register(
             WindowRegistration(windowId, Resources.getSystem().displayMetrics.density)
         )
-        updateShellScreenMetrics()
+        dispatchScreenMetrics()
+        runCatching {
+            (context.getSystemService(DISPLAY_SERVICE) as DisplayManager)
+                .registerDisplayListener(displayListener, null)
+        }
         
         context.registerReceiver(broadcastReceiver, IntentFilter(Protocol.ACTION_RESET_ALL_WINDOW), Context.RECEIVER_EXPORTED)
         binding.vSizePreviewer.updateLayoutParams {
@@ -433,6 +438,10 @@ class AppWindow(
         }
         
         runCatching { context.unregisterReceiver(broadcastReceiver) }
+        runCatching {
+            (context.getSystemService(DISPLAY_SERVICE) as DisplayManager)
+                .unregisterDisplayListener(displayListener)
+        }
         
         // 流程收口：窗口登记 / 待认领表 / 会话表 / 几何缓存 / 打开计数 统一由流程撤销
         YAMFManager.unregisterHost(this)
@@ -456,6 +465,9 @@ class AppWindow(
     }
 
     private fun moveToTop() {
+        // 会话屏承载：remove/add 会重建内容表面——先以当前帧盖住视口，
+        // 重挂后由新表面首帧（onSurfaceTextureUpdated）走既有淡出逻辑，杜绝黑卡窗口期
+        if (displaySession) coverViewportForRaise()
         if (binding.root.isAttachedToWindow) {
             Instances.windowManager.removeView(binding.root)
         }
@@ -464,7 +476,30 @@ class AppWindow(
         binding.root.viewTreeObserver.addOnGlobalLayoutListener(frameOffsetLayoutListener)
     }
 
+    /** 抬层前用内容视口当前帧覆盖快照层（复用投放登场占位管线；1.5s 兜底淡出）。 */
+    private fun coverViewportForRaise() {
+        runCatching {
+            val view = sessionSnapshotView ?: return
+            val frame = runCatching { sessionTextureView?.bitmap }.getOrNull() ?: return
+            val previous = dropSnapshotBitmap
+            dropSnapshotBitmap = frame
+            dropSnapshotActive = true
+            view.animate().cancel()
+            view.setImageBitmap(frame)
+            view.alpha = 1f
+            view.visibility = View.VISIBLE
+            dropSnapshotFadeRunnable?.let { binding.root.removeCallbacks(it) }
+            val fade = Runnable { fadeDropSnapshotOverlay() }
+            dropSnapshotFadeRunnable = fade
+            binding.root.postDelayed(fade, 1500)
+            previous?.recycle()
+        }.onFailure { log(TAG, "cover viewport for raise failed", it) }
+    }
+
     private fun dispatchInput(event: WindowInputEvent) {
+        // 销毁后不再分发：关闭收缩动画被同一手势 Cancel 时会先触发销毁，
+        // 事件处理器后半程继续执行不得再驱动已摘除的窗口（updateViewLayout 会抛错）
+        if (isDestroyed) return
         shell.onInput(event).forEach(::execute)
     }
 
@@ -485,18 +520,31 @@ class AppWindow(
             is WindowCommand.ResizePreviewStart -> execResizePreviewStart()
             is WindowCommand.ResizePreviewUpdate -> execResizePreviewUpdate(command)
             is WindowCommand.ResizePreviewCommit -> execResizePreviewCommit()
-            is WindowCommand.EnterMini -> execEnterMini(command.corner)
-            is WindowCommand.ExitMini -> execExitMini()
+            is WindowCommand.EnterMini -> execEnterMini(command.corner, command.cmdId)
+            is WindowCommand.ExitMini -> execExitMini(command.cmdId)
             is WindowCommand.RequestClose -> execRequestClose(command.origin)
             is WindowCommand.RequestFullscreen -> execRequestFullscreen(command.origin)
             is WindowCommand.RaiseWindow -> moveToTop()
         }
     }
 
-    private fun updateShellScreenMetrics() {
+    /** 屏幕指标采集（事件化入核；DisplayListener 与手势兜底共同驱动）。 */
+    private fun dispatchScreenMetrics() {
         val dm = DisplayMetrics()
         context.display?.getRealMetrics(dm)
-        shell.onScreenMetricsChanged(dm.widthPixels, dm.heightPixels)
+        dispatchInput(
+            WindowInputEvent.ScreenMetricsChanged(
+                windowId, System.currentTimeMillis(), dm.widthPixels, dm.heightPixels
+            )
+        )
+    }
+
+    /** 命令结果回灌（闭环不变量 2）：Failed/Superseded 供核心收敛模式状态。 */
+    private fun reportCommandResult(commandId: Long, status: CommandStatus) {
+        if (commandId <= 0L) return
+        dispatchInput(
+            WindowInputEvent.CommandResult(windowId, System.currentTimeMillis(), commandId, status)
+        )
     }
 
     private fun translateMoveGesture(region: RegionId, event: MotionEvent) {
@@ -715,7 +763,7 @@ class AppWindow(
         val cx = (from.left + from.right) / 2
         val cy = (from.top + from.bottom) / 2
         val to = android.graphics.Rect(cx - 2, cy - 2, cx + 2, cy + 2)
-        animateContentRect(from, to, geometryAnimDuration(220L)) {
+        animateContentRect(from, to, geometryAnimDuration(220L)) { _ ->
             // 动画结束先整壳隐身，再做释放/移除：即使移除被延迟也不留"白点"
             binding.root.visibility = View.INVISIBLE
             onDestroy(releaseTask = true)
@@ -765,7 +813,7 @@ class AppWindow(
     }
 
     private fun updateSmoothBounds() {
-        if (currentTaskId == -1) return
+        if (isDestroyed || currentTaskId == -1) return
 
         // 矩形从窗口 params 确定性推导（+ 首次布局后缓存的帧偏移；偏移未知时按 0 计，
         // 布局完成后会再纠正一次）。视图的 getLocationOnScreen 在 relayout 完成前会返回旧值，
@@ -1097,30 +1145,9 @@ class AppWindow(
                 delay(500) // fixme: use a method that directly determines visibility
             }
 
-            var backgroundColor = 0
-            var navigationBarColor = 0
-            var taskDescription: ActivityManager.TaskDescription?
-
-            if (Build.VERSION.SDK_INT < 35) {
-                taskDescription = Instances.activityTaskManager.getTaskDescription(taskInfo.taskId) ?: return@add
-
-                backgroundColor = taskDescription.backgroundColor
-                navigationBarColor = taskDescription.backgroundColor
-            } else {
-                val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
-                val runningTasks = activityManager.getRunningTasks(5)
-
-                for (task in runningTasks) {
-                    if (task.taskId == taskInfo.taskId) {
-                        try {
-                            backgroundColor = task.taskDescription!!.backgroundColor
-                            navigationBarColor = task.taskDescription!!.backgroundColor
-                        } catch (e: PackageManager.NameNotFoundException) {
-                            e.printStackTrace()
-                        }
-                    }
-                }
-            }
+            // 任务描述色：TaskInfo 公开字段（系统 fillTaskInfo 恒填充）——无需额外服务查询/反射
+            val backgroundColor = taskInfo.taskDescription?.backgroundColor ?: 0
+            val navigationBarColor = backgroundColor
 
             if (config.coloredController) {
                 binding.background.setBackgroundColor(navigationBarColor)
@@ -1345,13 +1372,19 @@ class AppWindow(
             val windowWidth = binding.root.width
             val windowHeight = binding.root.height
 
-            val minX = 0
-            val minY = 0
-            val maxX = screenWidth - windowWidth - frameOffsetX
-            val maxY = screenHeight - windowHeight - frameOffsetY
-
-            val targetX = params.x.coerceIn(minX, maxX)
-            val targetY = params.y.coerceIn(minY, maxY)
+            // 夹取数学 = 核心策略（逻辑层只管策略，宿主只读平台值并执行）
+            val offset = ClampPolicy.clampOffset(
+                x = params.x,
+                y = params.y,
+                windowWidth = windowWidth,
+                windowHeight = windowHeight,
+                screenWidth = screenWidth,
+                screenHeight = screenHeight,
+                frameOffsetX = frameOffsetX,
+                frameOffsetY = frameOffsetY
+            )
+            val targetX = offset.x
+            val targetY = offset.y
 
             if (targetX == params.x && targetY == params.y) {
                 // 已就位：直接落真实 bounds（惯性/夹取链的静止收尾）
@@ -1564,7 +1597,7 @@ class AppWindow(
         insetsTo: MiniPolicy.ShellInsets? = null,
         interpolator: android.animation.TimeInterpolator = DecelerateInterpolator(),
         onFrame: ((Float) -> Unit)? = null,
-        onEnd: (() -> Unit)? = null
+        onEnd: ((cancelled: Boolean) -> Unit)? = null
     ) {
         // 内容矩形动画独占几何：取消惯性/夹取/上一次几何动画（修复"框自己跳走"）
         cancelGeometryAnimators()
@@ -1574,7 +1607,7 @@ class AppWindow(
             animInsets = null
             applyContentRectFrame(to)
             onFrame?.invoke(1f)
-            onEnd?.invoke()
+            onEnd?.invoke(false)
             return
         }
         // 飞行期间请求最高刷新率（结束/取消复位）——帧率吃满手机最高刷新率
@@ -1600,12 +1633,24 @@ class AppWindow(
                 onFrame?.invoke(f)
             }
             addListener(object : android.animation.AnimatorListenerAdapter() {
+                private var cancelled = false
+
+                override fun onAnimationCancel(animation: android.animation.Animator) {
+                    cancelled = true
+                }
+
                 override fun onAnimationEnd(animation: android.animation.Animator) {
                     if (boundsAnimator === animation) boundsAnimator = null
                     animInsets = null
+                    if (cancelled) {
+                        // 被打断（Superseded）：先跑终态收尾（模式/装饰/回灌），再落终态几何——
+                        // 不留"半程卡死"的中间态；销毁中的窗口不再补几何（视图已摘除）
+                        onEnd?.invoke(true)
+                        if (!isDestroyed) applyContentRectFrame(to)
+                    }
                     onFrame?.invoke(1f)
                     setFlightFrameRateBoost(false)
-                    onEnd?.invoke()
+                    if (!cancelled) onEnd?.invoke(false)
                 }
             })
             start()
@@ -1613,7 +1658,7 @@ class AppWindow(
     }
 
     /** 几何动画时长：尊重开发者选项动画缩放；缩放为 0 时立即完成；跟随模块动画速度配置。 */
-    private fun geometryAnimDuration(base: Long = 260L): Long {
+    private fun geometryAnimDuration(base: Long = AnimTimingPolicy.BASE_DURATION_MS): Long {
         val scale = runCatching {
             android.provider.Settings.Global.getFloat(
                 context.contentResolver,
@@ -1621,8 +1666,8 @@ class AppWindow(
             )
         }.getOrDefault(1f)
         if (scale <= 0f) return 0L
-        val configured = if (config.animationSpeed < 5100) config.animationSpeed.toLong() else base
-        return (configured * scale).toLong()
+        // 时长解析 = 核心策略（缩放 0 → 立即完成；配置 ≥ 上限视为自动用 base）
+        return AnimTimingPolicy.resolveDuration(config.animationSpeed, scale, base)
     }
 
     /** 几何诊断：输出本窗口几何/可见性/透明度全景（adb: am broadcast -a com.buildsession.betterYAMF.action.DUMP_GEOMETRY） */
@@ -1636,7 +1681,7 @@ class AppWindow(
                 val card = currentContentRect()
                 log(
                     TAG,
-                    "GEOM window=$windowId task=$currentTaskId destroyed=$isDestroyed mini=$miniActive " +
+                    "GEOM window=$windowId task=$currentTaskId destroyed=$isDestroyed mini=$miniActive coreMode=${shell.snapshot().mode} " +
                         "params=(${p?.x},${p?.y}) loc=(${loc[0]},${loc[1]}) " +
                         "root=${binding.root.width}x${binding.root.height} alpha=${binding.root.alpha} vis=${binding.root.visibility} " +
                         "revealed=$chromeRevealed pendingReveal=$pendingReveal " +
@@ -1773,28 +1818,21 @@ class AppWindow(
                 Instances.windowManager.updateViewLayout(binding.root, params)
             }
 
-            // 通道 2（SF 层票）：窗口 SurfaceControl 的 frame rate——平台自身
-            // （ViewRootImpl#setPreferredFrameRate :14329）即走此 Transaction 通道；
-            // FIXED_SOURCE = 内容严格依赖该帧率，结束用 clearFrameRate 撤销。
-            val vri = XposedHelpers.callMethod(binding.root, "getViewRootImpl") ?: return@runCatching
-            val sc = XposedHelpers.callMethod(vri, "getSurfaceControl") as? android.view.SurfaceControl ?: return@runCatching
-            val tx = android.view.SurfaceControl.Transaction()
-            if (enabled) {
-                tx.setFrameRate(sc, maxHz, Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE)
-            } else {
-                tx.clearFrameRate(sc)
-            }
-            tx.apply()
-            tx.close()
+            // 通道 2（SF 层票）：窗口 SurfaceControl 的 frame rate——
+            // 反射细节收口在适配器（ViewSurfaceOps），宿主不直接碰系统内部
+            ViewSurfaceOps.setViewSurfaceFrameRate(binding.root, maxHz, enabled)
             log(TAG, "flight frame rate boost=${if (enabled) "${maxHz}Hz" else "cleared"} window=$windowId")
         }.onFailure { log(TAG, "flight frame rate boost($enabled) failed", it) }
     }
 
-    private fun execEnterMini(corner: DropKind) {
+    private fun execEnterMini(corner: DropKind, cmdId: Long) {
         if (originalWidth <= 0 || originalHeight <= 0) {
             log(TAG, "execEnterMini skipped: size not measured")
+            reportCommandResult(cmdId, CommandStatus.FAILED)
             return
         }
+        // 新几何动画接管前，先把上一次未决动画打断收尾（Superseded：落终态 + 回灌）
+        cancelGeometryAnimators()
         // 回收区投放登场：消费一次性松手点（非投放路径为 null → 走原"从当前矩形收缩"行为）
         val drop = dropPoint
         dropPoint = null
@@ -1822,6 +1860,8 @@ class AppWindow(
         val fromInsets = if (drop != null) MiniPolicy.ShellInsets(0, 0, 0, 0) else shellInsets()
         miniActive = true
         applyMiniChrome()
+        // 首帧内衬 = 起点内衬（防"卡还是点击态、内衬已切 mini"的 1 帧视口跳变）
+        animInsets = fromInsets
         updateSessionViewportBounds()
         val toInsets = miniInsets()
         // mini 目标 = 当前内容区**等比缩放**到磁吸槽位（保持宽高比——参考图帧_02/帧_05 实锤：
@@ -1845,7 +1885,8 @@ class AppWindow(
         if (drop == null) {
             // 顶栏渐隐：动画期间先保持可见（覆盖其条带），结束再 GONE（见 [animateSuperBarAlpha]）
             animateSuperBarAlpha(1f, 0f, geometryAnimDuration(), hideAtEnd = true)
-            animateContentRect(centered ?: to, to, geometryAnimDuration(), insetsFrom = fromInsets, insetsTo = toInsets) {
+            animateContentRect(centered ?: to, to, geometryAnimDuration(), insetsFrom = fromInsets, insetsTo = toInsets) { cancelled ->
+                reportCommandResult(cmdId, if (cancelled) CommandStatus.SUPERSEDED else CommandStatus.DONE)
                 // 终态：补一次结算（视口/缩放/轮廓落定；显示器像素在 mini 态保持不变）
                 binding.root.post(::updateSmoothBounds)
             }
@@ -1857,19 +1898,23 @@ class AppWindow(
         pendingReveal = false
         chromeRevealed = true
         binding.ibSuper.visibility = View.GONE
-        val margin = 8.dpToPx().toInt()
-        val startW = (to.width() * DROP_ENTRY_START_SCALE).toInt()
-        val startH = (to.height() * DROP_ENTRY_START_SCALE).toInt()
-        val startLeft = (to.right - startW).coerceAtLeast(margin)
-        val startTop = to.top.coerceIn(140, (dm.heightPixels - 120 - startH).coerceAtLeast(140))
-        val start = android.graphics.Rect(startLeft, startTop, startLeft + startW, startTop + startH)
+        // 起点几何 = 核心策略（右缘锚定目标右缘；顶边夹在状态栏/底栏安全带内）
+        val start = DropEntryPolicy.startRect(
+            target = to.toWindowRect(),
+            screenHeight = dm.heightPixels,
+            marginPx = 8.dpToPx().toInt(),
+            topInsetPx = 140,
+            bottomInsetPx = 120
+        ).toAndroidRect()
         // 首帧占位：用最近任务里该应用的快照直接拉伸铺满起始卡片（杜绝"黑屏开场"）
         showDropSnapshotOverlay()
+        // 起手帧内衬 = 起点内衬（零内衬大卡片，防 1 帧 mini 内衬跳变）
+        animInsets = fromInsets
         // 起手帧直接落到起点（root 仍透明），随后轻淡入 + 一条减速飞行入位
         applyContentRectFrame(start)
         binding.root.alpha = 0f
         ValueAnimator.ofFloat(0f, 1f).apply {
-            duration = 160
+            duration = DropEntryPolicy.START_FADE_MS
             addUpdateListener { anim -> binding.root.alpha = anim.animatedValue as Float }
             addListener(object : android.animation.AnimatorListenerAdapter() {
                 override fun onAnimationEnd(animation: android.animation.Animator) {
@@ -1886,25 +1931,36 @@ class AppWindow(
         binding.cvBackground.radius = 0f
         log(TAG, "drop entry task=$currentTaskId from=$start to=$to")
         animateContentRect(
-            start, to, geometryAnimDuration(base = 500L),
+            start, to, geometryAnimDuration(base = DropEntryPolicy.DURATION_BASE_MS),
             insetsFrom = fromInsets, insetsTo = toInsets,
             // 视频实测起步即高速、长尾收束；给首帧一丝缓起更细腻
-            interpolator = PathInterpolator(0.05f, 0f, 0.12f, 1f),
+            interpolator = PathInterpolator(
+                DropEntryPolicy.CURVE_X1, DropEntryPolicy.CURVE_Y1,
+                DropEntryPolicy.CURVE_X2, DropEntryPolicy.CURVE_Y2
+            ),
             onFrame = { f ->
                 // 圆角/描边随飞行渐成（大卡片方角 → mini 描边边框）；内容轻微景深回缩
                 binding.cvParent.radius = radius * f
                 binding.cvParent.strokeWidth = (bezel * f).toInt()
                 binding.cvBackground.radius = ((radius - bezel) * f).coerceAtLeast(0f)
-                miniFlightDip = 1f - 0.03f * kotlin.math.sin((Math.PI * f).toFloat())
+                miniFlightDip = DropEntryPolicy.dipAt(f)
                 updateSessionViewportBounds()
             }
-        ) {
+        ) { cancelled ->
             miniFlightDip = 1f
+            reportCommandResult(cmdId, if (cancelled) CommandStatus.SUPERSEDED else CommandStatus.DONE)
             binding.root.post(::updateSmoothBounds)
         }
     }
 
-    private fun execExitMini() {
+    private fun execExitMini(cmdId: Long) {
+        // 新几何动画接管前，先把上一次未决动画打断收尾（Superseded：落终态 + 回灌）
+        cancelGeometryAnimators()
+        // 几何不可用 = 命令失败：先回灌（核心回退模式），再做任何视觉翻转——状态不分叉
+        val from = currentContentRect() ?: run {
+            reportCommandResult(cmdId, CommandStatus.FAILED)
+            return
+        }
         isResize = true
         contentTouchThrough = true
         binding.rootClickMask.visibility = View.GONE
@@ -1914,8 +1970,6 @@ class AppWindow(
         } else {
             binding.rlBarControllerSide.visibility = View.VISIBLE
         }
-
-        val from = currentContentRect() ?: return
         // M7：位置记忆——回到进 mini 前的矩形；无记忆则围绕当前中心展开。
         // 两者都经安全边距夹取（贴屏会让圆角/边框/阴影出屏 = "边缘消失"缺陷）；
         // 目标几何由核心策略（MiniPolicy）计算。外壳厚度 mini→点击态随动画过渡。
@@ -1935,13 +1989,14 @@ class AppWindow(
         animateSuperBarAlpha(0f, 1f, (geometryAnimDuration() * 0.45f).toLong().coerceAtLeast(1L), hideAtEnd = false)
         // 显示器像素**全程不随模式变化**（mini 只是视口等比降采样，应用零重排）；
         // 正常态的内容区对齐由静止结算下发（见 applySmoothBounds）。
-        animateContentRect(from, to, geometryAnimDuration(), insetsFrom = fromInsets, insetsTo = toInsets) {
+        animateContentRect(from, to, geometryAnimDuration(), insetsFrom = fromInsets, insetsTo = toInsets) { cancelled ->
             // 终态：退出 mini——恢复点击态外壳装饰与 wrap-content（后续测量/吸附基于自然尺寸）
             miniActive = false
             applyNormalChrome()
             setBackgroundWrapContent()
             setParrentWrapContent()
             if (displaySession) updateSessionViewportBounds()
+            reportCommandResult(cmdId, if (cancelled) CommandStatus.SUPERSEDED else CommandStatus.DONE)
             binding.root.post(::updateSmoothBounds)
         }
     }
@@ -2029,7 +2084,7 @@ class AppWindow(
             last2GestureRawY = lastGestureRawY
             lastGestureRawX = e2.rawX
             lastGestureRawY = e2.rawY
-            updateShellScreenMetrics()
+            dispatchScreenMetrics()
             dispatchInput(
                 WindowInputEvent.Move(
                     windowId,

@@ -87,10 +87,11 @@ class WindowShellControllerTest {
             ),
             c.feed(move(RegionId.BODY_MASK, 10f, 10f))
         )
-        assertEquals(
-            listOf(WindowCommand.EnterMini(1, DropKind.CORNER_TL), WindowCommand.DropZoneHide(1)),
-            c.feed(up(RegionId.BODY_MASK, 10f, 10f))
-        )
+        val released = c.feed(up(RegionId.BODY_MASK, 10f, 10f))
+        val enter = released.filterIsInstance<WindowCommand.EnterMini>().single()
+        assertEquals(DropKind.CORNER_TL, enter.corner)
+        assertTrue(enter.cmdId > 0L)
+        assertEquals(WindowCommand.DropZoneHide(1), released.last())
         assertEquals(ShellMode.MINI, c.snapshot().mode)
     }
 
@@ -99,12 +100,14 @@ class WindowShellControllerTest {
         val c = controller()
         c.feed(press(RegionId.BODY_MASK, 10f, 1000f))
         c.feed(move(RegionId.BODY_MASK, 10f, 1000f))
-        assertEquals(
-            listOf(WindowCommand.EnterMini(1, DropKind.SIDE_LEFT), WindowCommand.DropZoneHide(1)),
-            c.feed(up(RegionId.BODY_MASK, 10f, 1000f))
-        )
+        val released = c.feed(up(RegionId.BODY_MASK, 10f, 1000f))
+        val enter = released.filterIsInstance<WindowCommand.EnterMini>().single()
+        assertEquals(DropKind.SIDE_LEFT, enter.corner)
+        assertTrue(enter.cmdId > 0L)
+        assertEquals(WindowCommand.DropZoneHide(1), released.last())
         assertEquals(ShellMode.MINI, c.snapshot().mode)
-        assertEquals(listOf<WindowCommand>(WindowCommand.ExitMini(1)), c.feed(tapConfirmed()))
+        val exit = c.feed(tapConfirmed()).single() as WindowCommand.ExitMini
+        assertTrue(exit.cmdId > 0L)
         assertEquals(ShellMode.NORMAL, c.snapshot().mode)
     }
 
@@ -115,7 +118,8 @@ class WindowShellControllerTest {
         c.feed(move(RegionId.BODY_MASK, 10f, 10f))
         c.feed(up(RegionId.BODY_MASK, 10f, 10f))
         assertEquals(ShellMode.MINI, c.snapshot().mode)
-        assertEquals(listOf<WindowCommand>(WindowCommand.ExitMini(1)), c.feed(tapConfirmed()))
+        val exit = c.feed(tapConfirmed()).single() as WindowCommand.ExitMini
+        assertTrue(exit.cmdId > 0L)
         assertEquals(ShellMode.NORMAL, c.snapshot().mode)
     }
 
@@ -142,10 +146,8 @@ class WindowShellControllerTest {
 
         c.feed(press(RegionId.BODY_MASK, 10f, 1000f))
         c.feed(move(RegionId.BODY_MASK, 10f, 1000f))
-        assertEquals(
-            listOf(WindowCommand.EnterMini(1, DropKind.SIDE_LEFT), WindowCommand.DropZoneHide(1)),
-            c.feed(up(RegionId.BODY_MASK, 10f, 1000f))
-        )
+        val released = c.feed(up(RegionId.BODY_MASK, 10f, 1000f))
+        assertEquals(DropKind.SIDE_LEFT, released.filterIsInstance<WindowCommand.EnterMini>().single().corner)
         assertEquals(ShellMode.MINI, c.snapshot().mode)
     }
 
@@ -247,33 +249,126 @@ class WindowShellControllerTest {
         val c = controller(top = false)
         c.feed(press(RegionId.BODY_MASK, 10f, 10f))
         c.feed(move(RegionId.BODY_MASK, 10f, 10f))
-        assertEquals(
-            listOf(WindowCommand.EnterMini(1, DropKind.CORNER_TL), WindowCommand.DropZoneHide(1)),
-            c.feed(cancel(RegionId.BODY_MASK, 10f, 10f))
-        )
+        val released = c.feed(cancel(RegionId.BODY_MASK, 10f, 10f))
+        assertEquals(DropKind.CORNER_TL, released.filterIsInstance<WindowCommand.EnterMini>().single().corner)
+        assertEquals(WindowCommand.DropZoneHide(1), released.last())
         assertEquals(ShellMode.MINI, c.snapshot().mode)
     }
 
     @Test
-    fun resizeCancelIsIgnored() {
+    fun resizeCancelCommitsLikeUp() {
         val c = controller()
         c.feed(press(RegionId.RESIZE_HANDLE, 900f, 1900f))
-        assertEquals(emptyList<WindowCommand>(), c.feed(cancel(RegionId.RESIZE_HANDLE, 900f, 1900f)))
+        assertEquals(
+            listOf(WindowCommand.ResizePreviewCommit(1)),
+            c.feed(cancel(RegionId.RESIZE_HANDLE, 900f, 1900f))
+        )
+        assertFalse(c.snapshot().resizing)
     }
 
     @Test
-    fun barDoubleTapSharesTimerAcrossBothBars() {
+    fun barDoubleTapClosesWindowAcrossBothBars() {
         val c = controller()
-        assertEquals(emptyList<WindowCommand>(), c.feed(tap(RegionId.BAR_BOTTOM, timeMs = 1000L)))
+        // 第一次点按：复位预览并计时，不关闭
+        c.feed(press(RegionId.BAR_BOTTOM, 500f, 1900f, timeMs = 1000L))
         assertEquals(
-            listOf(WindowCommand.RequestClose(1, CloseOrigin.DOUBLE_TAP_BAR)),
-            c.feed(tap(RegionId.BAR_SIDE, timeMs = 1299L))
+            listOf(WindowCommand.ClearVerticalDragPreview(1)),
+            c.feed(up(RegionId.BAR_BOTTOM, 500f, 1900f, timeMs = 1010L))
         )
-        assertEquals(emptyList<WindowCommand>(), c.feed(tap(RegionId.BAR_BOTTOM, timeMs = 1600L)))
+        // 双击窗口内第二次点按（跨栏共享计时）：请求关闭
+        c.feed(press(RegionId.BAR_SIDE, 950f, 1000f, timeMs = 1200L))
         assertEquals(
-            listOf(WindowCommand.RequestClose(1, CloseOrigin.DOUBLE_TAP_BAR)),
-            c.feed(tap(RegionId.BAR_SIDE, timeMs = 1899L))
+            listOf(
+                WindowCommand.ClearVerticalDragPreview(1),
+                WindowCommand.RequestClose(1, CloseOrigin.DOUBLE_TAP_BAR)
+            ),
+            c.feed(up(RegionId.BAR_SIDE, 950f, 1000f, timeMs = 1210L))
         )
+        // 超时后重新计时：不再关闭
+        c.feed(press(RegionId.BAR_BOTTOM, 500f, 1900f, timeMs = 1600L))
+        assertEquals(
+            listOf(WindowCommand.ClearVerticalDragPreview(1)),
+            c.feed(up(RegionId.BAR_BOTTOM, 500f, 1900f, timeMs = 1610L))
+        )
+    }
+
+    @Test
+    fun barTapBeyondSlopIsNotATap() {
+        val c = controller()
+        // 位移超过 slop（8dp × density2 = 16px）：两次都不计数、不关闭
+        c.feed(press(RegionId.BAR_BOTTOM, 500f, 1900f, timeMs = 1000L))
+        assertEquals(
+            listOf(WindowCommand.ClearVerticalDragPreview(1)),
+            c.feed(up(RegionId.BAR_BOTTOM, 530f, 1900f, timeMs = 1010L))
+        )
+        c.feed(press(RegionId.BAR_BOTTOM, 500f, 1900f, timeMs = 1100L))
+        assertEquals(
+            listOf(WindowCommand.ClearVerticalDragPreview(1)),
+            c.feed(up(RegionId.BAR_BOTTOM, 500f, 1930f, timeMs = 1110L))
+        )
+    }
+
+    @Test
+    fun barCancelDoesNotCountAsTap() {
+        val c = controller()
+        c.feed(press(RegionId.BAR_BOTTOM, 500f, 1900f, timeMs = 1000L))
+        assertEquals(
+            listOf(WindowCommand.ClearVerticalDragPreview(1)),
+            c.feed(cancel(RegionId.BAR_BOTTOM, 500f, 1900f, timeMs = 1010L))
+        )
+        // Cancel 不计数：随后一次 Up 不构成双击
+        c.feed(press(RegionId.BAR_BOTTOM, 500f, 1900f, timeMs = 1100L))
+        assertEquals(
+            listOf(WindowCommand.ClearVerticalDragPreview(1)),
+            c.feed(up(RegionId.BAR_BOTTOM, 500f, 1900f, timeMs = 1110L))
+        )
+    }
+
+    @Test
+    fun failedMiniCommandRevertsModeViaResult() {
+        val c = controller()
+        val enter = c.feed(requestMini()).single() as WindowCommand.EnterMini
+        assertEquals(ShellMode.MINI, c.snapshot().mode)
+        assertEquals(emptyList<WindowCommand>(), c.feed(result(enter.cmdId, CommandStatus.FAILED)))
+        assertEquals(ShellMode.NORMAL, c.snapshot().mode)
+        // 回退后单击不再误发 ExitMini
+        assertEquals(emptyList<WindowCommand>(), c.feed(tapConfirmed()))
+    }
+
+    @Test
+    fun staleOrDoneResultsConvergeWithoutModeChange() {
+        val c = controller()
+        val enter = c.feed(requestMini()).single() as WindowCommand.EnterMini
+        // 陈旧结果（非当前未决命令）：忽略
+        assertEquals(emptyList<WindowCommand>(), c.feed(result(enter.cmdId + 41L, CommandStatus.FAILED)))
+        assertEquals(ShellMode.MINI, c.snapshot().mode)
+        // Done：收敛未决登记，模式保持
+        assertEquals(emptyList<WindowCommand>(), c.feed(result(enter.cmdId, CommandStatus.DONE)))
+        assertEquals(ShellMode.MINI, c.snapshot().mode)
+        // 已收敛后的重复回灌：忽略
+        assertEquals(emptyList<WindowCommand>(), c.feed(result(enter.cmdId, CommandStatus.FAILED)))
+        assertEquals(ShellMode.MINI, c.snapshot().mode)
+    }
+
+    @Test
+    fun exitMiniResultFailureRevertsToMini() {
+        val c = controller()
+        c.feed(press(RegionId.BODY_MASK, 10f, 10f))
+        c.feed(move(RegionId.BODY_MASK, 10f, 10f))
+        c.feed(up(RegionId.BODY_MASK, 10f, 10f))
+        val exit = c.feed(tapConfirmed()).single() as WindowCommand.ExitMini
+        assertEquals(ShellMode.NORMAL, c.snapshot().mode)
+        assertEquals(emptyList<WindowCommand>(), c.feed(result(exit.cmdId, CommandStatus.FAILED)))
+        assertEquals(ShellMode.MINI, c.snapshot().mode)
+    }
+
+    @Test
+    fun screenMetricsChangedEventFeedsDropHover() {
+        val c = WindowShellController(registration, CoreConfig(), FakeTopPort())
+        c.feed(WindowInputEvent.ScreenMetricsChanged(1, 0L, 1000, 2000))
+        c.feed(press(RegionId.BODY_MASK, 10f, 10f))
+        val commands = c.feed(move(RegionId.BODY_MASK, 10f, 10f))
+        assertEquals(WindowCommand.DropHover(1, DropKind.CORNER_TL, true), commands.last())
     }
 
     @Test
@@ -345,16 +440,13 @@ class WindowShellControllerTest {
     @Test
     fun requestMiniEntersCornerMiniAndTapExpands() {
         val c = controller()
-        assertEquals(
-            listOf(WindowCommand.EnterMini(1, DropKind.CORNER_TR)),
-            c.feed(requestMini())
-        )
+        val enter = c.feed(requestMini()).single() as WindowCommand.EnterMini
+        assertEquals(DropKind.CORNER_TR, enter.corner)
+        assertTrue(enter.cmdId > 0L)
         assertEquals(ShellMode.MINI, c.snapshot().mode)
         assertEquals(emptyList<WindowCommand>(), c.feed(requestMini()))
-        assertEquals(
-            listOf(WindowCommand.ExitMini(1)),
-            c.feed(tapConfirmed())
-        )
+        val exit = c.feed(tapConfirmed()).single() as WindowCommand.ExitMini
+        assertTrue(exit.cmdId > 0L)
         assertEquals(ShellMode.NORMAL, c.snapshot().mode)
     }
 }

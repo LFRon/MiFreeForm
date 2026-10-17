@@ -170,7 +170,9 @@ object FreeformBackend {
      */
     private fun hookGlobalTouchTracker(classLoader: ClassLoader) {
         val candidates = listOf(
-            "android.view.PointerEventDispatcher",
+            // LoS 24：android.view.PointerEventDispatcher 已移除；WMS 每显示一台
+            // （DisplayContent.java:1308 创建），全部指针事件经其 onInputEvent 进入
+            // （wm/PointerEventDispatcher.java:43，随后才转发给各 PointerEventListener）。
             "com.android.server.wm.PointerEventDispatcher",
             "com.android.server.input.PointerEventDispatcher"
         )
@@ -179,7 +181,10 @@ object FreeformBackend {
             log(TAG, "PointerEventDispatcher not found, skip touch tracker")
             return
         }
-        findMethod(cls) { name == "onPointerEvent" }.hookBefore { param ->
+        // ⚠ 历史 bug：旧实现钩 `onPointerEvent`——该名字是**监听器接口**的方法（由 dispatcher
+        // 转发时调用），dispatcher 类本身没有此方法 → findMethod 抛 NoSuchMethodException →
+        // 整个钩子静默未安装（isTouchActive 恒 false）。正确锚点 = dispatcher 自己的 onInputEvent。
+        findMethod(cls) { name == "onInputEvent" && paramCount == 1 }.hookBefore { param ->
             runCatching {
                 val event = param.args[0] as? android.view.MotionEvent ?: return@runCatching
                 val now = android.os.SystemClock.uptimeMillis()

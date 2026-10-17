@@ -74,18 +74,8 @@ class HookSystem : IXposedHookZygoteInit, IXposedHookLoadPackage {
             }
             // log(TAG, "system ready")
         }
-        runCatching {
-            findMethod("com.android.server.am.ActivityManagerService") {
-                name == "checkBroadcastFromSystem"
-            }.hookBefore {
-                val intent = it.args[0] as Intent
-                if (intent.action == Protocol.ACTION_RECEIVE_LAUNCHER_CONFIG)
-                    it.result = Unit
-            }
-        }.onFailure {
-            log(TAG, "ActivityManagerService checkBroadcastFromSystem fail")
-        }
-
+        // 注：LoS 24 的 checkBroadcastFromSystem 只存在于 BroadcastController（AMS 无此方法，
+        // 旧 AMS 版钩子每次开机都会失败，仅打日志——已删）。
         runCatching {
             findMethod("com.android.server.am.BroadcastController") {
                 name == "checkBroadcastFromSystem"

@@ -213,8 +213,16 @@ object SmoothTaskOrganizer {
     }
 
     /**
-     * 选择性路由：只有我们悬浮根子树里的任务归我们；其余任务（根任务、系统壳的任务等）
-     * 强制保持上一任 organizer，避免注册把我们变成全局接管者。
+     * 选择性路由（LoS 24 `Task.setTaskOrganizer(org, skip)` :4540 语义对齐）：
+     *
+     * 1. **我方子树任务**：确保归我方 organizer——注册横扫把 `getTaskOrganizer()=peekLast()`
+     *    （=最后注册者，本机为我方）派给全部任务，我方子树必须在系统改动（配置变更等）后
+     *    仍被拉回我方；
+     * 2. **系统把"非我方任务"派给我方**（注册横扫 / 我们是 peekLast 的效应）：交还给
+     *    **当前仍在册的最近一个其他 organizer**（动态解析）——绝不写回"开机时捕获一次的
+     *    旧对象"：SystemUI 重启后旧 ShellTaskOrganizer 已失效，旧实现会把新任务/系统
+     *    重新注册全部劫持到死对象上（新壳簿记残缺 → 概率性异常）；
+     * 3. **其余调用**（系统正常设置其他 organizer / 置空 setTaskOrganizer(null)）一律不干预。
      */
     private fun hookTaskOrganizerRouting() {
         runCatching {
@@ -226,14 +234,23 @@ object SmoothTaskOrganizer {
                     val task = param.thisObject
                     val taskId = runCatching { XposedHelpers.getIntField(task, "mTaskId") }.getOrDefault(-1)
                     val inOurs = isInOurSubtree(task) || pendingAdoption.contains(taskId)
-                    val desired = if (inOurs) organizer else previousOrganizer
-                    if (desired != null) {
-                        if (param.args[0] !== desired) {
-                            param.args[0] = desired
+                    val assigned = param.args[0]
+                    when {
+                        inOurs -> {
+                            if (assigned !== organizer) {
+                                param.args[0] = organizer
+                            }
                         }
-                    } else if (param.args[0] === organizer) {
-                        // 没有上一任可归还时不抢（保持未组织状态，行为与注册前一致）
-                        param.result = false
+                        assigned === organizer -> {
+                            val other = resolveShellOrganizer()
+                            if (other != null) {
+                                param.args[0] = other
+                            } else {
+                                // 无其他可归还者（壳尚未注册等）：保持任务原组织状态，
+                                // 行为与注册前一致
+                                param.result = false
+                            }
+                        }
                     }
                 }
             }

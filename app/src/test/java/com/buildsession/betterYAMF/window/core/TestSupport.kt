@@ -39,12 +39,6 @@ internal fun cancel(
     timeMs: Long = 2L
 ) = WindowInputEvent.Cancel(windowId, timeMs, region, x, y)
 
-internal fun tap(
-    region: RegionId,
-    timeMs: Long = 0L,
-    windowId: Int = 1
-) = WindowInputEvent.Tap(windowId, timeMs, region)
-
 internal fun tapConfirmed(
     region: RegionId = RegionId.BODY_MASK,
     windowId: Int = 1,
@@ -57,6 +51,13 @@ internal fun fling(
     windowId: Int = 1,
     timeMs: Long = 2L
 ) = WindowInputEvent.Fling(windowId, timeMs, velocityX, velocityY)
+
+internal fun result(
+    commandId: Long,
+    status: CommandStatus,
+    windowId: Int = 1,
+    timeMs: Long = 3L
+) = WindowInputEvent.CommandResult(windowId, timeMs, commandId, status)
 
 internal fun requestMini(
     windowId: Int = 1,
