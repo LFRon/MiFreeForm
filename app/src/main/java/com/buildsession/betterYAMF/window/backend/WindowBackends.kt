@@ -27,7 +27,7 @@ private object NoopWindowBackend : WindowBackend {
     override fun openTask(taskId: Int): Boolean = false
     override fun releaseTask(taskId: Int, toFront: Boolean): Boolean = false
     override fun applyGeometry(taskId: Int, physicalBounds: Rect) {}
-    override fun applyRealBounds(taskId: Int, bounds: Rect) {}
+    override fun settleGeometry(taskId: Int, bounds: Rect) {}
     override fun reapplyGeometry(taskId: Int) {}
     override fun ensureTaskVisible(taskId: Int) {}
     override fun setTaskFocusable(taskId: Int, focusable: Boolean) {}

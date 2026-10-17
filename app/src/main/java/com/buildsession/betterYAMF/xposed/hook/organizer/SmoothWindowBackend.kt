@@ -34,7 +34,7 @@ object SmoothWindowBackend : WindowBackend {
     @Volatile
     private var callbacks: WindowBackendCallbacks? = null
 
-    /** 会话几何缓存：唯一写入者 = 本后端（applyGeometry/applyRealBounds 写、release/forget 清）。 */
+    /** 会话几何缓存：唯一写入者 = 本后端（applyGeometry/settleGeometry 写、release/forget 清）。 */
     private val geometryByTask = ConcurrentHashMap<Int, Rect>()
 
     /** 供实现层（SmoothTaskOrganizer / FreeformBackend）读取的几何访问器。 */
@@ -122,11 +122,12 @@ object SmoothWindowBackend : WindowBackend {
         }
     }
 
-    override fun applyRealBounds(taskId: Int, bounds: Rect) {
-        geometryByTask[taskId] = bounds
+    override fun settleGeometry(taskId: Int, contentBox: Rect) {
+        geometryByTask[taskId] = contentBox
         if (SmoothTaskOrganizer.isLeashManaged(taskId)) {
-            // 是否变更/原子复位由 organizer 依"任务当前 bounds"判定
-            SmoothTaskOrganizer.applyRealBounds(taskId, bounds)
+            // 首次塑形 / 纯缩放保持 / 恒等复位 由 organizer 依任务状态判定
+            //（ColorOS 16 缩放逻辑：虚拟尺寸恒定，其后尺寸变化一律纯表面缩放、应用零重排）
+            SmoothTaskOrganizer.settleGeometry(taskId, contentBox)
         } else {
             // 兼容路径（未接管）：走旧变换重断言
             FreeformBackend.reassertTaskById(taskId)
@@ -284,5 +285,10 @@ object SmoothWindowBackend : WindowBackend {
 
     fun notifyTaskVanished(taskId: Int) {
         callbacks?.onTaskVanished(taskId)
+    }
+
+    /** 任务可见性翻转回灌（组织者 onTaskInfoChanged 驱动；见接口注释）。 */
+    fun notifyTaskVisible(taskId: Int, visible: Boolean) {
+        callbacks?.onTaskVisibleChanged(taskId, visible)
     }
 }

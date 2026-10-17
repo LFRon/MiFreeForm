@@ -271,6 +271,15 @@ object YAMFManager : IYAMFManager.Stub() {
                 override fun onTaskVanished(taskId: Int) {
                     onOrganizerTaskVanished(taskId)
                 }
+
+                override fun onTaskVisibleChanged(taskId: Int, visible: Boolean) {
+                    // 可见性翻转路由到宿主窗口（与 onTaskMovedToFront 的可见性回灌同一条路）：
+                    // 熄屏/解锁等无"置前"事件的场景，外壳据此恢复/收起，不再永久卡在隐藏态。
+                    runMain {
+                        activeWindows.values.firstOrNull { it.currentTaskId == taskId }
+                            ?.let { notifyTaskVisible(it, visible) }
+                    }
+                }
             })
         }.onFailure { log("reYAMF_debug", "window backend init failed", it) }
         systemContext.registerReceiver(Protocol.ACTION_OPEN_IN_YAMF, OpenInYAMFBroadcastReceiver)

@@ -62,6 +62,7 @@ import com.buildsession.betterYAMF.window.core.FullscreenOrigin
 import com.buildsession.betterYAMF.window.core.MiniPolicy
 import com.buildsession.betterYAMF.window.core.PositionMemory
 import com.buildsession.betterYAMF.window.core.RegionId
+import com.buildsession.betterYAMF.window.core.ResizePolicy
 import com.buildsession.betterYAMF.window.core.WindowCommand
 import com.buildsession.betterYAMF.window.core.WindowInputEvent
 import com.buildsession.betterYAMF.window.core.WindowRegistration
@@ -796,7 +797,10 @@ class AppWindow(
     /**
      * 几何落地共享尾部（两条入口）：触摸洞 + 内容盒 + 后端应用。
      * [animated]（或 mini/手势/惯性/夹取进行中）= 过渡态：leash 缩放保持流畅；
-     * 静止态则落**真实窗口 bounds**（应用按窗口尺寸自行重排——不扁、不裁，对齐澎湃OS）。
+     * 静止态走后端结算：[WindowBackend.settleGeometry]——**首次结算塑形虚拟尺寸**
+     *（近全屏宽 × 窗口比例、等比缩小显示：UI 元素为全屏版缩放、内容更密——
+     * 对齐 ColorOS/澎湃OS3 小窗观感），**此后一切尺寸变化一律纯表面缩放**
+     *（虚拟尺寸恒定、应用零重排、无损放大缩小）。
      */
     private fun applySmoothBounds(rect: android.graphics.Rect, animated: Boolean) {
         // rect 为窗口卡（外壳）矩形；内容盒 = 应用内容区 = 卡内沿去掉固定外壳。
@@ -814,8 +818,8 @@ class AppWindow(
             flingYAnimation?.isRunning != true &&
             keepInScreenAnimator?.isRunning != true
         if (settling) {
-            // 静止：真实 bounds（应用自适应重排）
-            YAMFManager.windowBackend.applyRealBounds(currentTaskId, contentBox)
+            // 静止结算：首次塑形虚拟尺寸（近全屏宽、应用按全屏布局一次）；此后 = 纯缩放（零重排）
+            YAMFManager.windowBackend.settleGeometry(currentTaskId, contentBox)
         } else if (YAMFManager.windowBackend.currentGeometry(currentTaskId) != contentBox) {
             // 系统窗口后端：几何落地（leash 变换或兼容路径由实现决定，宿主不感知）
             YAMFManager.windowBackend.applyGeometry(currentTaskId, contentBox)
@@ -1704,20 +1708,29 @@ class AppWindow(
     }
 
     private fun execResizePreviewUpdate(command: WindowCommand.ResizePreviewUpdate) {
+        // ColorOS 缩放逻辑：拖拽 = 等比纯缩放（宽高比严格保持，绝不变形）。
+        // 这是"无损放大缩小"的手势策略位——尺寸变化最终由后端以表面缩放落地
+        //（任务虚拟尺寸恒定、应用零重排），见 SettleGeometry/applySmoothBounds。
+        val factor = ResizePolicy.dragScaleFactor(
+            resizeBeginWidth, resizeBeginHeight, command.dx, command.dy
+        )
+        val (targetWidth, targetHeight) = ResizePolicy.scaledSize(
+            resizeBeginWidth, resizeBeginHeight, factor
+        )
         binding.vSizePreviewer.updateLayoutParams {
-            val targetWidth = resizeBeginWidth + command.dx.toInt()
-            if (targetWidth > 0)
-                width = targetWidth
-            val targetHeight = resizeBeginHeight + command.dy.toInt()
-            if (targetHeight > 0)
-                height = targetHeight
+            width = targetWidth
+            height = targetHeight
         }
     }
 
     private fun execResizePreviewCommit() {
-        // 手势结束：keepInScreen 的推导会把新尺寸落为真实 bounds（应用重排一次）
+        // 手势结束：keepInScreen 推导（纯平移夹取）→ 静止结算（后端以纯表面缩放落地，
+        // 任务虚拟尺寸恒定、应用零重排——无损缩放）
         resizeGesture = false
-        binding.vSizePreviewer.visibility = View.GONE
+        // ⚠ 必须 INVISIBLE 而不是 GONE：vSizePreviewer 是窗口卡（wrap_content）的尺寸驱动源，
+        // GONE 会把整卡折叠成仅剩条栏（真机实证：root 33x149，外壳/手柄全部失效，
+        // "resize 一次后装饰消失、手柄再也摸不到"）。INVISIBLE 保持参与布局 = 新尺寸留存。
+        binding.vSizePreviewer.visibility = View.INVISIBLE
         binding.cvParent.strokeWidth = 2.dpToPx().toInt()
         keepInScreen()
     }

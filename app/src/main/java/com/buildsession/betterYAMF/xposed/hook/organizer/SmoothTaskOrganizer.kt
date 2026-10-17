@@ -76,6 +76,18 @@ object SmoothTaskOrganizer {
 
     private val leashes = ConcurrentHashMap<Int, SurfaceControl>()
     private val logicalBounds = ConcurrentHashMap<Int, Rect>()
+
+    /**
+     * 已塑形任务（ColorOS 16 缩放逻辑的关键状态）：首次静止结算已把任务真实 bounds
+     * 固定为"虚拟尺寸"——应用据此布局一次；此后同一任务的一切尺寸变化只做表面等比
+     * 缩放（leash），bounds 不再改动（应用零重排、无损放大缩小）。
+     * 释放 / 任务消失 / 重新认领即失效。
+     */
+    private val shapedTasks = ConcurrentHashMap.newKeySet<Int>()
+
+    /** 每任务最近一次观察到的可见性（去重"可见性翻转回灌"；首次观察只记录不回灌）。 */
+    private val lastVisibleState = ConcurrentHashMap<Int, Boolean>()
+
     private val originalParentTokens = ConcurrentHashMap<Int, Any>()
     private val adoptedTasks = ConcurrentHashMap.newKeySet<Int>()
 
@@ -519,6 +531,8 @@ object SmoothTaskOrganizer {
                 if (adoptedTasks.remove(taskId)) {
                     leashes.remove(taskId)?.let { releaseQuietly(it) }
                     logicalBounds.remove(taskId)
+                    shapedTasks.remove(taskId)
+                    lastVisibleState.remove(taskId)
                     originalParentTokens.remove(taskId)
                     updateRootVisibility()
                     if (releasingTasks.contains(taskId)) {
@@ -533,6 +547,14 @@ object SmoothTaskOrganizer {
                 val info = args.getOrNull(0) as? ActivityManager.RunningTaskInfo ?: return
                 if (adoptedTasks.contains(info.taskId)) {
                     log(TAG, "onTaskInfoChanged task=${info.taskId} visible=${info.isVisible}")
+                    // 可见性翻转回灌宿主：熄屏/亮屏/锁屏解锁不产生"置前"事件，缺失本回灌时
+                    // 外壳会永久停留隐藏态（"解锁后装饰消失、resize 手柄不可触达"真根因）。
+                    // 首次观察只记录不回灌（避免任务初始化抖动误隐藏）；同值去重防抖。
+                    val visible = info.isVisible
+                    val last = lastVisibleState.put(info.taskId, visible)
+                    if (last != null && last != visible) {
+                        SmoothWindowBackend.notifyTaskVisible(info.taskId, visible)
+                    }
                 }
             }
             // 全局回调（系统按"最后注册的 organizer"= peekLast 派发）：原样转交系统壳。
@@ -580,7 +602,10 @@ object SmoothTaskOrganizer {
             // task.updateTaskOrganizerState → setTaskOrganizer → sendTaskAppeared（onTaskAppeared），
             // 因此必须先把 taskId 登记为 adopted 并写好逻辑 bounds，回调才能命中并保存 leash。
             adoptedTasks.add(taskId)
+            // 会话起点：虚拟尺寸 = 全屏占位（等待宿主首帧结算塑形为"屏短边 × 窗口比例"的虚拟尺寸）
             logicalBounds[taskId] = bounds
+            shapedTasks.remove(taskId)
+            lastVisibleState.remove(taskId)
 
             try {
                 // A17 的 sanitizeTransaction 会静默剥掉一切指向"未 organized"容器的 WCT 操作
@@ -760,6 +785,8 @@ object SmoothTaskOrganizer {
                 leashes.remove(taskId)?.let { releaseQuietly(it) }
                 adoptedTasks.remove(taskId)
                 logicalBounds.remove(taskId)
+                shapedTasks.remove(taskId)
+                lastVisibleState.remove(taskId)
                 originalParentTokens.remove(taskId)
                 updateRootVisibility()
                 log(TAG, "releaseTask task=$taskId")
@@ -815,8 +842,9 @@ object SmoothTaskOrganizer {
     ): Boolean {
         if (logical.width() <= 0 || logical.height() <= 0) return false
         if (physical.width() <= 0 || physical.height() <= 0) return false
-        // 非等比缩放：应用按窗口比例拉伸铺满（用户裁定“不需要保持宽高比”）。
-        // 旧实现为等比 contain（min 比例）——窗口比例≠应用比例时会产生黑边，已废弃。
+        // 缩放系数：策略层（MiniPolicy/ResizePolicy）保证目标宽高比与虚拟尺寸一致 ⇒
+        // 两轴系数相等（纯等比、不变形——ColorOS 缩放逻辑）；实现保留逐轴计算以兜底
+        // 任意过渡帧，并把表面居中到目标矩形（亚像素取整误差不产生可见偏移）。
         val scaleX = physical.width().toFloat() / logical.width()
         val scaleY = physical.height().toFloat() / logical.height()
         if (scaleX <= 0f || scaleY <= 0f) return false
@@ -844,61 +872,91 @@ object SmoothTaskOrganizer {
     }
 
     /**
-     * 静止态：任务真实 bounds = 窗口矩形 —— WCT setBounds（应用按窗口尺寸自适应重排，
-     * 不拉伸快照），并把 leash 复位为"表面 = bounds"（矩阵单位/位置=原点/裁切清除/圆角 0）。
-     * 之后 applyLeash 的缩放以新 logical（本 bounds 尺寸）为基准；两者互斥使用。
+     * 静止结算（ColorOS 16 缩放逻辑 / 澎湃OS3 小窗观感）：
+     * - **首次结算**：把任务真实 bounds 固定为**虚拟尺寸 = 屏幕短边 × 窗口宽高比**——近全屏宽，
+     *   应用按全屏宽度布局**一次**，窗口显示其**等比缩小视图**（UI 元素 = 全屏版的缩放、
+     *   内容更密——对标 ColorOS `OplusZoomDisplay`：虚拟宽 = min(screenW,screenH)，
+     *   显示 scale = 可见宽/虚拟宽）；leash 以 [SurfaceControl.Transaction] 与 bounds 变更
+     *   **原子同步**写入缩放态。
+     * - **此后一切尺寸/位置变化**（缩放 / mini 还原 / 移动）：只做**表面等比缩放**
+     *   （leash 变换；任务 bounds 不再改动）——应用零重排，即"无损放大缩小"的落地点。
+     * - 尺寸与位置都回到任务 bounds 本身：leash 恒等复位（历史兜底路径，幂等）。
      */
-    fun applyRealBounds(taskId: Int, physical: Rect): Boolean {
+    fun settleGeometry(taskId: Int, physical: Rect): Boolean {
         val task = FreeformBackend.taskById(taskId) ?: run {
-            log(TAG, "applyRealBounds: task not found task=$taskId")
+            log(TAG, "settleGeometry: task not found task=$taskId")
             return false
         }
+        if (physical.width() <= 0 || physical.height() <= 0) return false
         return runCatching {
-            // ⚠ WindowContainerToken 必须取自 RunningTaskInfo.token：
-            // 服务端 Task#getToken() 恒为 null（仅远端镜像持有 mRemoteToken）——
-            // 曾致本方法全程静默 return false、真实重排从未生效（真机 logcat 实证）。
-            val info = taskInfoById(taskId) ?: run {
-                log(TAG, "applyRealBounds: no taskInfo task=$taskId")
-                return false
-            }
-            val token = XposedHelpers.getObjectField(info, "token") ?: run {
-                log(TAG, "applyRealBounds: no token task=$taskId")
-                return false
-            }
             val current = runCatching { XposedHelpers.callMethod(task, "getBounds") as? Rect }.getOrNull()
-            logicalBounds[taskId] = Rect(0, 0, physical.width(), physical.height())
 
-            if (current == physical) {
-                // 任务 bounds 已就位：只需普通事务把 leash 从缩放态复位（幂等，无中间帧）
-                resetLeashToBounds(taskId, physical)
+            if (!shapedTasks.contains(taskId)) {
+                // ——— 首次塑形：虚拟尺寸 = 屏幕短边 × 窗口宽高比（应用按全屏布局一次）———
+                // 观感依据（用户裁定）：应用内 UI 元素应为全屏版的等比缩小（澎湃OS3/ColorOS），
+                // 而非按小窗宽度重排的"大元素"版本。
+                // ⚠ WindowContainerToken 必须取自 RunningTaskInfo.token：
+                // 服务端 Task#getToken() 恒为 null（仅远端镜像持有 mRemoteToken）——
+                // 曾致本方法全程静默 return false、真实重排从未生效（真机 logcat 实证）。
+                val info = taskInfoById(taskId) ?: run {
+                    log(TAG, "settleGeometry: no taskInfo task=$taskId")
+                    return false
+                }
+                val token = XposedHelpers.getObjectField(info, "token") ?: run {
+                    log(TAG, "settleGeometry: no token task=$taskId")
+                    return false
+                }
+
+                val dm = Instances.systemContext.resources.displayMetrics
+                val shortSide = minOf(dm.widthPixels, dm.heightPixels)
+                val virtual = Rect(
+                    0,
+                    0,
+                    shortSide,
+                    Math.round(shortSide.toFloat() * physical.height() / physical.width())
+                )
+                logicalBounds[taskId] = virtual
+
+                if (current == virtual) {
+                    // bounds 已就位：只把 leash 写到缩放态（幂等路径）
+                    shapedTasks.add(taskId)
+                    applyLeash(taskId, physical)
+                    return true
+                }
+
+                val leash = leashes[taskId]
+                val wct = newWct()
+                if (leash != null) {
+                    // ⚠ 关键（LoS 24.0 源码对齐）：leash 变换必须与 bounds 变更**原子同步**应用。
+                    // WindowContainerTransaction#setBoundsChangeTransaction 语义："the server will
+                    // apply [the transaction] in sync with the next bounds change"（见 WOC
+                    // applyChanges → tr.setMainWindowSizeChangeTransaction）。
+                    // 否则（WCT 异步落 bounds + 立即普通事务）会出现中间帧："全屏表面 + 尚未
+                    // 缩放" = 全屏闪帧（真机"拉伸↔全屏横跳"根因同源）。
+                    val tx = SurfaceControl.Transaction()
+                    if (!writeLeashTransform(tx, taskId, leash, virtual, physical)) {
+                        log(TAG, "settleGeometry: writeLeashTransform failed task=$taskId")
+                    }
+                    XposedHelpers.callMethod(wct, "setBoundsChangeTransaction", token, tx)
+                }
+                XposedHelpers.callMethod(wct, "setBounds", token, virtual)
+                applyWct(wct)
+                shapedTasks.add(taskId)
+                // 虚拟尺寸落点：无任何密度覆盖——应用密度恒为默认显示器值（小窗不改应用 DPI）。
+                log(TAG, "shape virtual bounds task=$taskId virtual=$virtual visible=$physical")
                 return true
             }
 
-            val leash = leashes[taskId]
-            val wct = newWct()
-            if (leash != null) {
-                // ⚠ 关键（LoS 24.0 源码对齐）：复位必须与 bounds 变更**原子同步**应用。
-                // WindowContainerTransaction#setBoundsChangeTransaction 语义："the server will
-                // apply [the transaction] in sync with the next bounds change"（见 WOC
-                // applyChanges → tr.setMainWindowSizeChangeTransaction）。
-                // 旧实现（WCT 异步落 bounds + 立即普通事务复位）会产生中间帧：
-                // "全屏表面 + 已复位变换" = 全屏闪帧，随后跳回窗口 —— 真机"拉伸↔全屏横跳"根因。
-                val reset = SurfaceControl.Transaction()
-                XposedHelpers.callMethod(reset, "setMatrix", leash, 1f, 0f, 0f, 1f)
-                XposedHelpers.callMethod(reset, "setPosition", leash, physical.left.toFloat(), physical.top.toFloat())
-                XposedHelpers.callMethod(
-                    reset, "setWindowCrop",
-                    arrayOf<Class<*>>(SurfaceControl::class.java, Rect::class.java), leash, null
-                )
-                XposedHelpers.callMethod(reset, "setCornerRadius", leash, 0f)
-                XposedHelpers.callMethod(wct, "setBoundsChangeTransaction", token, reset)
+            // ——— 已塑形：虚拟尺寸恒定，尺寸/位置变化 = 纯表面缩放（应用零重排）———
+            if (current != null && current == physical) {
+                // 回到虚拟几何本身：恒等复位（幂等兜底）
+                resetLeashToBounds(taskId, physical)
+            } else {
+                // 缩放/移动：leash 承载（等比；策略层已保证宽高比与虚拟尺寸一致）
+                applyLeash(taskId, physical)
             }
-            XposedHelpers.callMethod(wct, "setBounds", token, physical)
-            applyWct(wct)
-            // bounds 落点：无任何密度覆盖——应用密度恒为默认显示器值（小窗不改应用 DPI）。
-            log(TAG, "real bounds task=$taskId rect=$physical (no density override)")
             true
-        }.onFailure { log(TAG, "applyRealBounds failed task=$taskId rect=$physical", it) }
+        }.onFailure { log(TAG, "settleGeometry failed task=$taskId rect=$physical", it) }
             .getOrDefault(false)
     }
 
@@ -910,7 +968,11 @@ object SmoothTaskOrganizer {
         runningTasks.find { XposedHelpers.getIntField(it, "taskId") == taskId }
     }.getOrNull()
 
-    /** leash 复位到静止态：表面即 bounds（幂等；过渡收尾亦可重申）。 */
+    /**
+     * leash 恒等复位（矩阵单位/位置=物理原点/裁切清除/圆角 0）。
+     * 仅用于"回到虚拟几何本身"与释放兜底等历史路径；正常缩放模型下静止态走
+     * [applyLeash]（保持缩放），不得误用本方法把缩放态复位掉。
+     */
     fun resetLeashToBounds(taskId: Int, physical: Rect) {
         val leash = leashes[taskId] ?: return
         runCatching {
@@ -994,6 +1056,8 @@ object SmoothTaskOrganizer {
         adoptedTasks.remove(taskId)
         leashes.remove(taskId)?.let { releaseQuietly(it) }
         logicalBounds.remove(taskId)
+        shapedTasks.remove(taskId)
+        lastVisibleState.remove(taskId)
         originalParentTokens.remove(taskId)
     }
 

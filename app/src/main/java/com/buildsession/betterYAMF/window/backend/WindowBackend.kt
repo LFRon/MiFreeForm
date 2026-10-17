@@ -45,10 +45,14 @@ interface WindowBackend {
     fun applyGeometry(taskId: Int, physicalBounds: Rect)
 
     /**
-     * 静止态几何 = 真实窗口 bounds：应用按窗口尺寸自行重排（不缩放快照、不拉伸）。
-     * 与 [applyGeometry]（动画/mini 的缩放态）成对使用：静止用本方法、过渡用前者。
+     * 静止结算：把窗口静止几何（内容盒，屏幕坐标）交给后端落地。
+     * 实现语义（ColorOS 16 缩放逻辑 / 澎湃OS3 观感）：**首次结算**塑形任务**虚拟尺寸**——
+     * 近全屏宽（屏幕短边）× 窗口宽高比，应用按全屏布局一次、窗口显示其**等比缩小视图**
+     *（UI 元素为全屏版的缩放、内容更密）；**此后同一任务的尺寸变化一律以纯表面缩放落地**
+     *（虚拟尺寸恒定、任务 bounds 不再改动、应用零重排）——无损放大缩小的前提。
+     * 与 [applyGeometry]（动画/mini 的过渡缩放态）成对使用：过渡用前者、静止用本方法。
      */
-    fun applyRealBounds(taskId: Int, bounds: Rect)
+    fun settleGeometry(taskId: Int, bounds: Rect)
 
     /** 稳态重施加（过渡结束后防系统重置冲掉变换；几何未就绪时 no-op）。 */
     fun reapplyGeometry(taskId: Int)
@@ -132,4 +136,11 @@ interface WindowBackendCallbacks {
 
     /** 任务已消失／被系统回收（宿主应销毁对应外壳）。 */
     fun onTaskVanished(taskId: Int)
+
+    /**
+     * 任务可见性翻转（熄屏/亮屏、锁屏解锁、后台往返等**不产生"置前"事件**的场景）。
+     * 宿主据此显示/收起外壳；缺失本回灌的后果（真机实证）：熄屏后外壳永久停留隐藏态，
+     * 表现为"解锁后小窗装饰消失、resize 手柄不可触达"。
+     */
+    fun onTaskVisibleChanged(taskId: Int, visible: Boolean)
 }
