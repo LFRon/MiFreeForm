@@ -184,15 +184,19 @@
         </com.google.android.material.card.MaterialCardView>
     </com.google.android.material.card.MaterialCardView>
 
+    <!--
+      右下角缩放柄：锚定窗口右下角（bottom/end of root）。
+      有效触区 = 手柄 ∩（窗口 − 内容洞）≈ 角块 x[776..930]×y[1197..1288]（154×91px @3.22）；
+      内容区内的那部分仍直通应用（洞语义不变）。旧实现悬在底条上沿（一半落进内容洞、
+      有效区只剩几十像素的角落 L 形）→ 用户按角常常摸不到（真机实证）。
+    -->
     <ImageButton
         android:id="@+id/ibRightResize"
-        android:layout_width="30dp"
-        android:layout_height="30dp"
+        android:layout_width="48dp"
+        android:layout_height="48dp"
         android:background="@android:color/transparent"
         android:contentDescription="@string/resize_desc"
         android:elevation="10dp"
-        android:layout_marginStart="-20dp"
-        android:layout_marginBottom="-15dp"
-        app:layout_constraintBottom_toTopOf="@+id/rlBarControllerBottom"
-        app:layout_constraintStart_toStartOf="@+id/rlBarControllerSide" />
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintEnd_toEndOf="parent" />
 </androidx.constraintlayout.widget.ConstraintLayout>
