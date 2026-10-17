@@ -185,7 +185,8 @@ class MiniPolicyTest {
             originalHeight = origH,
             screenWidth = screenW,
             screenHeight = screenH,
-            marginPx = margin
+            marginPx = margin,
+            topInsetPx = topInset
         )
         // left=-50→8（下界）；top=3000→772（上界 screenH-origH-margin）
         assertEquals(WindowRect(8, 772, 8 + origW, 772 + origH), out)
@@ -200,21 +201,50 @@ class MiniPolicyTest {
             originalHeight = origH,
             screenWidth = screenW,
             screenHeight = screenH,
-            marginPx = margin
+            marginPx = margin,
+            topInsetPx = topInset
         )
-        // cx=666,cy=433 → left=166（有效）、top=-567→8（下界）
-        assertEquals(WindowRect(166, 8, 1166, 2008), out)
+        // cx=666,cy=433 → left=166（有效）、top=-567→140（顶部安全带下界）
+        assertEquals(WindowRect(166, 140, 1166, 2140), out)
     }
 
     @Test
     fun clampToScreenKeepsInsideBand() {
+        // 顶边 100 < 安全带 140 → 拉到安全带下界；左界不受影响
         assertEquals(
-            WindowRect(100, 100, 300, 400),
-            MiniPolicy.clampToScreen(100, 100, 200, 300, screenW, screenH, margin)
+            WindowRect(100, 140, 300, 440),
+            MiniPolicy.clampToScreen(100, 100, 200, 300, screenW, screenH, margin, topInset)
         )
         assertEquals(
             WindowRect(1056, 2472, 1256, 2772),
-            MiniPolicy.clampToScreen(99999, 99999, 200, 300, screenW, screenH, margin)
+            MiniPolicy.clampToScreen(99999, 99999, 200, 300, screenW, screenH, margin, topInset)
         )
+    }
+
+    @Test
+    fun clampToScreenPullsStatusBarOverlapDownToSafeInset() {
+        // 真机实锤回归：顶边 104（拖拽未夹取位置）必须拉到安全带 140（不得压状态栏 130）
+        assertEquals(
+            WindowRect(50, topInset, 1050, topInset + origH),
+            MiniPolicy.clampToScreen(50, 104, origW, origH, screenW, screenH, margin, topInset)
+        )
+    }
+
+    @Test
+    fun exitRestoresStatusBarOverlappingMemoryToSafeInset() {
+        // 真机实锤 bug 回归：拖拽到上方角落 mini 时记忆了未夹取的顶边（104 < 安全带 140），
+        // 展开回位必须拉到安全带之下（旧实现只夹 margin=8 → 展开后小窗压上状态栏）
+        // left=100 在右界内（不触发水平夹取），隔离顶边安全带行为
+        val out = MiniPolicy.exitTarget(
+            remembered = WindowRect(100, 104, 100 + origW, 104 + origH),
+            current = WindowRect(880, 165, 1239, 632),
+            originalWidth = origW,
+            originalHeight = origH,
+            screenWidth = screenW,
+            screenHeight = screenH,
+            marginPx = margin,
+            topInsetPx = topInset
+        )
+        assertEquals(WindowRect(100, topInset, 100 + origW, topInset + origH), out)
     }
 }

@@ -82,7 +82,12 @@ object MiniPolicy {
         }
     }
 
-    /** 退出 mini 的目标：记忆矩形优先；无记忆则围绕当前中心展开；两者都经安全边距夹取。 */
+    /**
+     * 退出 mini 的目标：记忆矩形优先；无记忆则围绕当前中心展开；两者都经安全边距 +
+     * 顶部安全带（[topInsetPx]）夹取——拖拽到上方角落 mini 化时记忆/中心展开的顶边
+     * 可能落在状态栏区域内（拖拽本身不夹取），回位必须拉到安全带之下（真机实锤 bug：
+     * 旧实现只夹 [marginPx]，展开后小窗压上状态栏）。
+     */
     fun exitTarget(
         remembered: WindowRect?,
         current: WindowRect,
@@ -90,13 +95,14 @@ object MiniPolicy {
         originalHeight: Int,
         screenWidth: Int,
         screenHeight: Int,
-        marginPx: Int
+        marginPx: Int,
+        topInsetPx: Int
     ): WindowRect {
         return if (remembered != null) {
             clampToScreen(
                 remembered.left, remembered.top,
                 originalWidth, originalHeight,
-                screenWidth, screenHeight, marginPx
+                screenWidth, screenHeight, marginPx, topInsetPx
             )
         } else {
             val cx = (current.left + current.right) / 2
@@ -104,14 +110,16 @@ object MiniPolicy {
             clampToScreen(
                 cx - originalWidth / 2, cy - originalHeight / 2,
                 originalWidth, originalHeight,
-                screenWidth, screenHeight, marginPx
+                screenWidth, screenHeight, marginPx, topInsetPx
             )
         }
     }
 
     /**
-     * 屏内夹取（安全边距）：任何"自动定位"都必须保证窗口四边可见——
-     * 贴屏会让圆角/边框/阴影被屏幕边界裁掉。窄屏时下界取 [marginPx]。
+     * 屏内夹取（安全边距 + 顶部安全带）：任何"自动定位"都必须保证窗口四边可见——
+     * 贴屏会让圆角/边框/阴影被屏幕边界裁掉。窄屏时下界取 [marginPx]；
+     * 顶边下界 = max([marginPx], [topInsetPx])（状态栏安全带不得被压，
+     * 与 mini 触点/投放起点同一安全带语义）。
      */
     fun clampToScreen(
         leftIn: Int,
@@ -120,12 +128,14 @@ object MiniPolicy {
         height: Int,
         screenWidth: Int,
         screenHeight: Int,
-        marginPx: Int
+        marginPx: Int,
+        topInsetPx: Int
     ): WindowRect {
+        val minTop = topInsetPx.coerceAtLeast(marginPx)
         val maxLeft = (screenWidth - width - marginPx).coerceAtLeast(marginPx)
-        val maxTop = (screenHeight - height - marginPx).coerceAtLeast(marginPx)
+        val maxTop = (screenHeight - height - marginPx).coerceAtLeast(minTop)
         val left = leftIn.coerceIn(marginPx, maxLeft)
-        val top = topIn.coerceIn(marginPx, maxTop)
+        val top = topIn.coerceIn(minTop, maxTop)
         return WindowRect(left, top, left + width, top + height)
     }
 
