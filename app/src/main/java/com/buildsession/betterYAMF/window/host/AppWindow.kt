@@ -2000,7 +2000,8 @@ class AppWindow(
             originalHeight = originalHeight,
             screenWidth = dm.widthPixels,
             screenHeight = dm.heightPixels,
-            marginPx = 8.dpToPx().toInt()
+            marginPx = 8.dpToPx().toInt(),
+            topInsetPx = topSafeInsetPx()
         ).toAndroidRect()
         val toInsets = normalInsets()
         // 顶栏渐显：快速点亮（覆盖"边距+条高"条带，避免动画期间透出壁纸/时钟 = 错位感）
