@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 小窗顶部三点手势提示（对齐澎湃 OS3：点径 4dp、中心距 8dp、半透明黑随底显色） -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="20dp"
+    android:height="4dp"
+    android:viewportWidth="200"
+    android:viewportHeight="40">
+  <path
+      android:pathData="M0,20 a20,20 0 1,0 40,0 a20,20 0 1,0 -40,0 z"
+      android:fillColor="#80000000" />
+  <path
+      android:pathData="M80,20 a20,20 0 1,0 40,0 a20,20 0 1,0 -40,0 z"
+      android:fillColor="#80000000" />
+  <path
+      android:pathData="M160,20 a20,20 0 1,0 40,0 a20,20 0 1,0 -40,0 z"
+      android:fillColor="#80000000" />
+</vector>

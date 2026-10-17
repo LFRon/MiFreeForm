@@ -43,7 +43,7 @@
 
             <View
                 android:id="@+id/cvBarLine"
-                android:layout_width="100dp"
+                android:layout_width="62dp"
                 android:layout_height="4dp"
                 android:layout_gravity="center"
                 android:background="@drawable/bg_handle_line" />
@@ -137,12 +137,11 @@
                     app:layout_constraintTop_toTopOf="parent">
 
                     <ImageView
-                        android:layout_width="16dp"
-                        android:layout_height="16dp"
+                        android:layout_width="20dp"
+                        android:layout_height="4dp"
                         android:layout_gravity="center"
                         android:importantForAccessibility="no"
-                        android:src="@drawable/three_dot_horiz"
-                        android:tint="@color/window_handle_gray" />
+                        android:src="@drawable/three_dot_handle" />
                 </FrameLayout>
 
                 <RelativeLayout
