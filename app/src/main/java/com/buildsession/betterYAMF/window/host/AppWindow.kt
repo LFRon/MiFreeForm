@@ -72,6 +72,7 @@ import com.buildsession.betterYAMF.window.core.WindowShellController
 import com.buildsession.betterYAMF.window.core.WindowShellRegistry
 import com.buildsession.betterYAMF.window.session.WindowSessions
 import com.buildsession.betterYAMF.common.model.resolveWindowSizePx
+import com.buildsession.betterYAMF.xposed.hook.system.SystemBarMetrics
 import com.buildsession.betterYAMF.xposed.hook.system.ViewSurfaceOps
 import com.buildsession.betterYAMF.xposed.services.YAMFManager
 import com.buildsession.betterYAMF.xposed.services.YAMFManager.config
@@ -811,6 +812,20 @@ class AppWindow(
             }
         }
     }
+
+    /**
+     * 顶部安全带（px）= 当前真实状态栏高度（适配器动态读取，随旋转/异形屏自适应；不写死）。
+     * 适配器全线失败时退回本窗口实测帧偏移（同源观测量：NO_LIMITS 覆盖窗帘的 frame 偏移
+     * 即状态栏高度）；再失败按 0（核心策略自动退化为仅 margin 夹取）。
+     */
+    private fun topSafeInsetPx(): Int =
+        SystemBarMetrics.statusBarHeightPx().takeIf { it > 0 }
+            ?: frameOffsetY.takeIf { it > 0 }
+            ?: 0
+
+    /** 底部安全带（px）= 当前真实导航栏高度（同上，动态读取；不写死）。 */
+    private fun bottomSafeInsetPx(): Int =
+        SystemBarMetrics.navigationBarHeightPx().takeIf { it > 0 } ?: 0
 
     private fun updateSmoothBounds() {
         if (isDestroyed || currentTaskId == -1) return
@@ -1849,6 +1864,9 @@ class AppWindow(
         WindowSessions.chromeTouchHoles.remove(windowId)
 
         val dm = context.resources.displayMetrics
+        // 安全带 = 当前真实系统栏高度（适配器动态读取；顶=状态栏，底=导航栏）
+        val topInsetPx = topSafeInsetPx()
+        val bottomInsetPx = bottomSafeInsetPx()
         val centered = currentContentRect()
         // 位置记忆：记住进 mini 前的（默认居中）位置（重复进入不覆盖；退出 mini 回此位置）
         miniMemory.rememberIfAbsent(centered?.toWindowRect())
@@ -1874,8 +1892,8 @@ class AppWindow(
             screenWidth = dm.widthPixels,
             screenHeight = dm.heightPixels,
             marginPx = 8.dpToPx().toInt(),
-            topInsetPx = 140,
-            bottomInsetPx = 120,
+            topInsetPx = topInsetPx,
+            bottomInsetPx = bottomInsetPx,
             currentTop = centered?.top,
             contentWidth = fromContentW,
             contentHeight = fromContentH,
@@ -1903,8 +1921,8 @@ class AppWindow(
             target = to.toWindowRect(),
             screenHeight = dm.heightPixels,
             marginPx = 8.dpToPx().toInt(),
-            topInsetPx = 140,
-            bottomInsetPx = 120
+            topInsetPx = topInsetPx,
+            bottomInsetPx = bottomInsetPx
         ).toAndroidRect()
         // 首帧占位：用最近任务里该应用的快照直接拉伸铺满起始卡片（杜绝"黑屏开场"）
         showDropSnapshotOverlay()
