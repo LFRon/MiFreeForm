@@ -17,15 +17,7 @@ data class Config(
     var barRoundedCorner: Int = 12,
     var sidebarPosition: Boolean = false,
     var animationSpeed: Float = 5100f,
-    var forcePreventRelaunch: Boolean = false,
-
-    /**
-     * 会话承载实现选择（实现层开关）：
-     * true/缺省 = 虚拟显示器承载（应用全屏运行在专属会话屏上，壳为视口）；
-     * false = 原生自由窗口承载（承载根 + leash，回退路径）。
-     * 旧配置文件无此键时反序列化为 null → 视为默认启用显示器承载。
-     */
-    var useVirtualDisplay: Boolean? = null
+    var forcePreventRelaunch: Boolean = false
 ) {
     data class HookLauncher(
         var hookRecents: Boolean = true,

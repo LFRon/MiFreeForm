@@ -49,8 +49,6 @@ object YAMFManager : IYAMFManager.Stub() {
     private val activeWindows = mutableMapOf<Int, WindowHost>()
     val pendingSmoothFreeformApps = mutableMapOf<ComponentName, WindowHost>()
 
-    /** "重启进入会话"防重入：组件 → 上次重启时间（uptimeMillis）；5s 节流防启动失败循环。 */
-    private val sessionRestartAtMs = java.util.concurrent.ConcurrentHashMap<ComponentName, Long>()
     lateinit var config: Config
     val configFile = File("/data/system/BetterYAMF.json")
 
@@ -86,15 +84,13 @@ object YAMFManager : IYAMFManager.Stub() {
                         }
 
                         // 若首帧时任务已是 FREEFORM 的任务尚未登记（例如从菜单直启），补登记并立即套用缩放链路；
-                        // 切回 FULLSCREEN 的任务则移出登记。会话显示器承载的任务（普通全屏）
-                        // 与容器承载共用同一"补登记"语义（isTaskInSessionDisplay 对无会话实现恒 false，
-                        // 不影响容器路径）。
+                        // 切回 FULLSCREEN 的任务则移出登记。
                         val windowingMode = windowBackend.windowingModeOf(taskInfo)
-                        if (windowingMode == WINDOWING_MODE_FREEFORM || windowBackend.isTaskInSessionDisplay(taskInfo)) {
+                        if (windowingMode == WINDOWING_MODE_FREEFORM) {
                             val topActivity = taskInfo.topActivity
                             if (topActivity != null) {
-                                // 认领匹配：组件精确匹配优先；未命中按包名兜底——无杀迁移后任务顶层不变，
-                                // 与待认领登记的应用入口组件可能不同（应用已导航至内部页面等）。
+                                // 认领匹配：组件精确匹配优先；未命中按包名兜底——任务顶层可能与
+                                // 待认领登记的应用入口组件不同（应用已导航至内部页面等）。
                                 val pendingEntry = pendingSmoothFreeformApps.entries.firstOrNull {
                                     it.key == topActivity
                                 } ?: pendingSmoothFreeformApps.entries.firstOrNull {
@@ -102,33 +98,14 @@ object YAMFManager : IYAMFManager.Stub() {
                                 }
                                 val pendingWindow = pendingEntry?.value
                                 if (pendingWindow != null) {
-                                    val inSessionRoot = windowBackend.isTaskInSessionRoot(taskInfo)
-                                    val restartThrottleOk =
-                                        SystemClock.uptimeMillis() - (sessionRestartAtMs[topActivity] ?: 0L) > 5000L
-                                    if (!inSessionRoot && restartThrottleOk) {
-                                        // 陈旧待认领命中了外部（桌面等）启动的任务：就地迁移进会话屏
-                                        // （**无杀进程、不改 DPI**）：任务身份保留、进程存活；
-                                        // 失败才退回冷启动。5s 节流防启动失败循环。
-                                        log("reYAMF_debug", "claim move-into-session task=${taskInfo.taskId} activity=$topActivity (not in session root)")
-                                        sessionRestartAtMs[topActivity] = SystemClock.uptimeMillis()
-                                        val moved = windowBackend.moveTaskToSession(taskInfo.taskId, pendingWindow.windowId)
-                                        if (!moved) {
-                                            val userId = XposedHelpers.getIntField(taskInfo, "userId")
-                                            windowBackend.launchAppForSession(topActivity, userId, pendingWindow.windowId)
-                                        }
-                                    } else {
-                                        if (!inSessionRoot) {
-                                            log("reYAMF_debug", "claim fallback-adopt task=${taskInfo.taskId} (restart throttled)")
-                                        }
-                                        log("reYAMF_debug", "claim task=${taskInfo.taskId} activity=$topActivity")
-                                        WindowSessions.hostedTasks.add(taskInfo.taskId)
-                                        pendingSmoothFreeformApps.remove(pendingEntry.key)
-                                        sessionRestartAtMs.remove(topActivity)
-                                        // Trigger a config change to apply spoofing/scaling immediately
-                                        switchToSmoothFreeform(taskInfo.taskId)
-                                        pendingWindow.currentTaskId = taskInfo.taskId
-                                        pendingWindow.onTaskMovedToFront(taskInfo)
-                                    }
+                                    // 就地认领入承载根（出生即入根的任务同样经此绑定；幂等）。
+                                    log("reYAMF_debug", "claim task=${taskInfo.taskId} activity=$topActivity")
+                                    WindowSessions.hostedTasks.add(taskInfo.taskId)
+                                    pendingSmoothFreeformApps.remove(pendingEntry.key)
+                                    // Trigger a config change to apply spoofing/scaling immediately
+                                    switchToSmoothFreeform(taskInfo.taskId)
+                                    pendingWindow.currentTaskId = taskInfo.taskId
+                                    pendingWindow.onTaskMovedToFront(taskInfo)
                                 }
                             }
                         } else if (windowingMode == WINDOWING_MODE_FULLSCREEN) {
@@ -210,7 +187,7 @@ object YAMFManager : IYAMFManager.Stub() {
                 if (info == null) {
                     // 承载任务已不存在：任务被系统内部移除（如 top-resumed 超时强停）不会回调
                     // onTaskRemovalStarted（真机实证：任务 9 消失后无任何 stack 事件）——
-                    // 旧行为 not-found 默认 visible=true，会让死任务窗口常驻且显示空白会话屏
+                    // 旧行为 not-found 默认 visible=true，会让死任务窗口常驻且显示空白小窗
                     // （真机实证：窗口 2373055 在任务 9 消失 20 分钟后仍可见）。改：二次确认后拆除。
                     if (w.currentTaskId > 0) {
                         val miss = (missingTaskChecks[w.windowId] ?: 0) + 1
@@ -227,31 +204,6 @@ object YAMFManager : IYAMFManager.Stub() {
                     return@forEach
                 }
                 missingTaskChecks.remove(w.windowId)
-                // 会话窗口的宿主任务被外部拉回普通显示器（桌面图标重启 = 平台复用任务重挂回默认屏）：
-                // 窗口已失去承载对象（会话屏不再包含该任务），旧行为会留下一个冻结在最后一帧的
-                // 幽灵小窗（真机实证：任务 9 被拉回桌面后窗口 2373055 的会话视口定格在 QQ 最后一帧）。
-                // 待认领（pendingSmoothFreeformApps 仍挂在本窗口）= 打开流程进行中（迁移可能被
-                // 过渡闸门推迟），不得误杀。二次确认后拆除。
-                if (w.isSessionHosted) {
-                    val onSession = runCatching {
-                        windowBackend.isTaskInSessionDisplay(info as android.app.ActivityManager.RunningTaskInfo)
-                    }.getOrDefault(true)
-                    val awaitingClaim = pendingSmoothFreeformApps.values.any { it === w }
-                    if (!onSession && !awaitingClaim) {
-                        val miss = (staleHostChecks[w.windowId] ?: 0) + 1
-                        staleHostChecks[w.windowId] = miss
-                        if (BuildConfig.DEBUG) {
-                            log("reYAMF_debug", "session host stale window=${w.windowId} task=${w.currentTaskId} miss=$miss")
-                        }
-                        if (miss >= 2) {
-                            staleHostChecks.remove(w.windowId)
-                            log("reYAMF_debug", "session task left session display; destroy window=${w.windowId} task=${w.currentTaskId}")
-                            runCatching { w.onDestroy(releaseTask = false) }
-                        }
-                        return@forEach
-                    }
-                    staleHostChecks.remove(w.windowId)
-                }
                 val visible = XposedHelpers.getBooleanField(info, "isVisible")
                 if (BuildConfig.DEBUG) {
                     log("reYAMF_debug", "visibility task=${w.currentTaskId} found=true visible=$visible")
@@ -264,20 +216,16 @@ object YAMFManager : IYAMFManager.Stub() {
     /** 任务消失确认计数（防任务列表瞬时抖动误杀窗口）。 */
     private val missingTaskChecks = mutableMapOf<Int, Int>()
 
-    /** 宿主任务离开会话屏确认计数（防迁移/过渡期间误杀）。 */
-    private val staleHostChecks = mutableMapOf<Int, Int>()
-
     /** 进行中的可见性复核任务集（防重复调度）。 */
     private val visibilityRechecks = mutableSetOf<Int>()
 
     /**
      * 可见性通知统一入口：false 时附带一次延迟复核。
      *
-     * 背景（真机实证）：任务刚迁移进新建会话屏的瞬间 `isVisible` 会瞬时为 false
-     * （显示器点亮/恢复尚未完成），旧实现据此把窗口置 INVISIBLE 后没有任何事件回灌
-     * （onTaskInfoChanged 不再触发，onTaskStackChanged 被 700ms 节流且 home 顶置分支不再评估）
-     * ——窗口滞留隐藏（真机实证：窗口 1f9ab5d 打开后一直不可见）。
-     * 复核按真实状态纠正，幂等且最多两轮。
+     * 背景（真机实证）：任务在承载根内重挂/过渡的瞬间 `isVisible` 会瞬时为 false，
+     * 旧实现据此把窗口置 INVISIBLE 后没有任何事件回灌（onTaskStackChanged 被 700ms
+     * 节流且 home 顶置分支不再评估）——窗口滞留隐藏（真机实证：窗口 1f9ab5d 打开后
+     * 一直不可见）。复核按真实状态纠正，幂等且最多两轮。
      */
     private fun notifyTaskVisible(w: WindowHost, visible: Boolean) {
         w.onTaskVisibilityChanged(visible)
@@ -449,41 +397,19 @@ object YAMFManager : IYAMFManager.Stub() {
             }
 
             if (taskId != -1) {
-                // 用户从最近任务/回收区开小窗：既有任务**就地迁移进入会话屏**（无杀进程）——
+                // 用户从最近任务/回收区开小窗：既有任务**就地认领入承载根**（无杀进程）——
                 // 应用进程存活、任务身份保留（最近任务不消失、状态不重置）；小窗不改应用 DPI。
-                // 迁移失败（任务不可迁移等）才退回冷启动。
-                val info = taskInfoById(taskId)
-                val component = info?.topActivity ?: info?.baseActivity
-                if (info != null && component != null && !windowBackend.isTaskInSessionRoot(info)) {
-                    log("reYAMF_debug", "reopen-as-session task=$taskId component=$component (in-place move)")
-                    pendingSmoothFreeformApps[component] = window
-                    val moved = windowBackend.moveTaskToSession(taskId, window.windowId)
-                    if (!moved) {
-                        log("reYAMF_debug", "reopen-as-session move failed task=$taskId; fallback cold launch")
-                        windowBackend.launchAppForSession(component, XposedHelpers.getIntField(info, "userId"), window.windowId)
-                    }
-                } else {
-                    WindowSessions.hostedTasks.add(taskId)
-                    switchToSmoothFreeform(taskId)
-                    window.currentTaskId = taskId
-                }
+                WindowSessions.hostedTasks.add(taskId)
+                switchToSmoothFreeform(taskId)
+                window.currentTaskId = taskId
             } else if (startCmd?.componentName != null) {
                 pendingSmoothFreeformApps[startCmd.componentName] = window
-                // 意图级调用：以"小窗会话"语义进入会话——迁移/启动等执行细节全部由实现层负责：
-                // 同包既有任务就地迁移（无杀进程）；无既有任务时冷启动到会话屏。小窗不改应用 DPI。
+                // 意图级调用：以"小窗会话"语义启动——freeform 目标、启动即入根等执行细节
+                // 全部由实现层负责；小窗不改应用 DPI。
                 windowBackend.launchAppForSession(startCmd.componentName, startCmd.userId ?: 0, window.windowId)
             }
         }
     }
-
-    /** 按 taskId 查询 RunningTaskInfo（流程书用的任务快照；失败返回 null）。 */
-    private fun taskInfoById(taskId: Int): android.app.ActivityManager.RunningTaskInfo? = runCatching {
-        val runningTasks = XposedHelpers.callMethod(
-            Instances.activityTaskManager, "getTasks", Int.MAX_VALUE, false, false, -1
-        ) as? List<*> ?: return null
-        runningTasks.filterIsInstance<android.app.ActivityManager.RunningTaskInfo>()
-            .find { it.taskId == taskId }
-    }.getOrNull()
 
     /** organizer 路径：任务的 leash 已就绪，让宿主按当前物理矩形摆放 */
     fun onOrganizerTaskAppeared(taskId: Int) {
@@ -555,17 +481,13 @@ object YAMFManager : IYAMFManager.Stub() {
      * 释放平滑任务回全屏。
      * [toFront]：true=置顶回前（下拉全屏路径）；false=沉到原父级栈底（关闭小窗：
      * 任务转后台、留在最近任务，不抢当前前台）。
-     * [sessionWindowId]：会话窗口宿主的显式声明（透传至实现层）——会话回收不依赖
-     * 可失败的任务 displayId 反射查询，且在宿主绑定的 taskId 失配（应用自建新任务）时
-     * 按"该会话显示器上的顶层任务"兜底（真机实锤两轮：判定失败/任务失配都会导致
-     * 回收被跳过 → 会话屏随窗口释放后应用消失）。
      */
-    fun switchTaskToFullscreen(taskId: Int, toFront: Boolean = true, sessionWindowId: Int = -1): Boolean {
+    fun switchTaskToFullscreen(taskId: Int, toFront: Boolean = true): Boolean {
         WindowSessions.hostedTasks.remove(taskId)
         WindowSessions.taskActivities.remove(taskId)
 
         // 系统窗口后端：释放（organizer 优先，未接管任务走旧 WCT 回全屏兜底）
-        val released = windowBackend.releaseTask(taskId, toFront, sessionWindowId)
+        val released = windowBackend.releaseTask(taskId, toFront)
         // 流程层负责把最新受管集合同步给 Launcher（手势目标豁免；M6 批次2）
         broadcastManagedTaskIds()
         return released
