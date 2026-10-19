@@ -9,13 +9,9 @@ import android.content.ComponentName
 import android.content.Intent
 import android.content.res.Resources
 import android.graphics.Color
-import android.graphics.DashPathEffect
-import android.graphics.Paint
 import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.graphics.RectF
-import android.graphics.drawable.ShapeDrawable
-import android.graphics.drawable.shapes.RoundRectShape
 import android.graphics.drawable.Icon
 import android.os.Handler
 import android.os.Looper
@@ -26,7 +22,6 @@ import android.view.View
 import android.view.WindowManager
 import android.widget.ImageView
 import android.widget.TextView
-import android.widget.Toast
 import androidx.core.graphics.drawable.toBitmap
 import com.github.kyuubiran.ezxhelper.init.EzXHelperInit
 import com.github.kyuubiran.ezxhelper.init.InitFields.moduleRes
@@ -52,6 +47,9 @@ import com.github.kyuubiran.ezxhelper.utils.paramCount
 import com.buildsession.betterYAMF.R
 import com.buildsession.betterYAMF.xposed.hook.launcher.LauncherInputAnchors
 import com.buildsession.betterYAMF.xposed.hook.launcher.ManagedTaskFilter
+import com.buildsession.betterYAMF.xposed.hook.launcher.RecentsDropHandoff
+import com.buildsession.betterYAMF.xposed.hook.launcher.RecentsDropZoneView
+import com.buildsession.betterYAMF.xposed.hook.launcher.RecentsEntryCapture
 import com.buildsession.betterYAMF.common.ipc.Protocol
 import com.buildsession.betterYAMF.xposed.utils.log
 import com.buildsession.betterYAMF.xposed.utils.registerReceiver
@@ -72,7 +70,7 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
 
     private var isRegistered = false
 
-    private var mDropZoneView: View? = null
+    private var mDropZoneView: RecentsDropZoneView? = null
     private val mDropZoneRect = Rect()
     private val mMainHandler: Handler by lazy { Handler(Looper.getMainLooper()) }
     private var mScreenHeight = 0
@@ -143,6 +141,7 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
             findMethod(tisClass) { name == "onCreate" }.hookAfter { param ->
                 // log(TAG, "TouchInteractionService#onCreate hooked in ${lpparam.packageName}")
                 val context = param.thisObject as android.app.Service
+                RecentsDropHandoff.install(context)
 
                 // M6 批次2：委托独立组件（接收器注册 + 主动查询当前受管任务集合）
                 ManagedTaskFilter.ensureReceiverRegistered(context)
@@ -155,13 +154,8 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                         val zoneHeight = mDropZoneRect.height()
 
                         if (mDropZoneView == null) {
-                            mDropZoneView = TextView(context).apply {
+                            mDropZoneView = RecentsDropZoneView(context).apply {
                                 visibility = View.GONE
-                                gravity = Gravity.CENTER
-                                text = "Drag here to open in window"
-                                setTextColor(Color.WHITE)
-                                textSize = 16f
-                                setPadding(20, 20, 20, 20)
                             }
                             updateDropZoneColor(false)
 
@@ -194,7 +188,7 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
 
             val inputAnchor = LauncherInputAnchors.resolve(lpparam.classLoader)
             if (inputAnchor != null) {
-            log(TAG, "Launcher input anchor: ${inputAnchor.displayName}")
+            log(TAG) { "Launcher input anchor: ${inputAnchor.displayName}" }
             val inputClass = lpparam.classLoader.loadClass(inputAnchor.className)
             XposedBridge.hookAllMethods(inputClass, "onInputEvent", object : XC_MethodHook() {
                 override fun beforeHookedMethod(param: MethodHookParam) {
@@ -249,6 +243,7 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
 
                     when (action) {
                         MotionEvent.ACTION_DOWN -> {
+                            RecentsDropHandoff.onGestureStarted(XposedHelpers.callMethod(event, "getDisplayId") as Int)
                             mStartY = correctedY
                             mIsShowingZone = false
                             mCurrentTaskId = -1
@@ -298,7 +293,7 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                                                     }
                                                 }.getOrDefault(false)
 
-                                                if (isLauncherActive) {
+                                                if (isLauncherActive || RecentsDropHandoff.isSourceVisible(gestureState)) {
                                                     capturedTaskId = taskId
                                                 }
                                             }
@@ -308,10 +303,17 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                                     if (capturedTaskId != -1) {
                                         mCurrentTaskId = capturedTaskId
                                         mIsShowingZone = true
-                                        mMainHandler.post {
-                                            mDropZoneView?.visibility = View.VISIBLE
+                                        val swipe = runCatching {
+                                            val consumer = inputAnchor.inputConsumerOf(param.thisObject, event)
+                                            val active = XposedHelpers.callMethod(consumer, "getActiveConsumerInHierarchy") ?: consumer
+                                            XposedHelpers.getObjectField(active, "mInteractionHandler")
+                                        }.getOrNull()
+                                        val targetId = capturedTaskId
+                                        mDropZoneView?.sourcePose = swipe?.let { handler ->
+                                            { RecentsEntryCapture.peekPose(handler, targetId) }
                                         }
-                                        log(TAG, "Swipe up threshold reached with taskId $mCurrentTaskId")
+                                        mDropZoneView?.visibility = View.VISIBLE
+                                        log(TAG) { "Swipe up threshold reached with taskId $mCurrentTaskId" }
                                     } else {
                                         // 如果不是有效的任务（例如在桌面），则不再处理后续 MOVE
                                         mIsPotentialSwipeUp = false
@@ -336,7 +338,7 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                                     mSuppressArmed = false
                                     suppressRecentsGesture(450L)
                                 }
-                                log(TAG, "ACTION_UP at ($correctedX, $correctedY), isInZone=$isInZone, isShowing=$mIsShowingZone, taskId=$mCurrentTaskId")
+                                log(TAG) { "ACTION_UP at ($correctedX, $correctedY), isInZone=$isInZone, isShowing=$mIsShowingZone, taskId=$mCurrentTaskId" }
                                 if (mIsShowingZone && isInZone && mCurrentTaskId != -1) {
                                     val intent = Intent(Protocol.ACTION_OPEN_IN_YAMF).apply {
                                         setPackage("android")
@@ -347,21 +349,14 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                                         putExtra(Protocol.EXTRA_DROP_X, correctedX.toInt())
                                         putExtra(Protocol.EXTRA_DROP_Y, correctedY.toInt())
                                     }
-                                    AndroidAppHelper.currentApplication().sendBroadcast(intent)
-                                    log(TAG, "Sent broadcast to open task $mCurrentTaskId in YAMF")
-
-                                    val shownTaskId = mCurrentTaskId
-                                    mMainHandler.post {
-                                        Toast.makeText(
-                                            mDropZoneView?.context ?: AndroidAppHelper.currentApplication(),
-                                            "Task $shownTaskId windowed!",
-                                            Toast.LENGTH_SHORT
-                                        ).show()
+                                    val handoff = RecentsDropHandoff.prepare(inputAnchor, param.thisObject, event, mCurrentTaskId)
+                                    if (handoff?.begin(AndroidAppHelper.currentApplication(), intent) != true) {
+                                        // Preserve normal UP cleanup before the legacy HOME fallback.
+                                        mMainHandler.post { AndroidAppHelper.currentApplication().sendBroadcast(intent) }
                                     }
                                 }
-                                mMainHandler.post {
-                                    mDropZoneView?.visibility = View.GONE
-                                }
+                                mDropZoneView?.visibility = View.GONE
+                                mDropZoneView?.sourcePose = null
                                 mIsShowingZone = false
                                 mCurrentTaskId = -1
                             }
@@ -372,19 +367,20 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                                     suppressRecentsGesture(450L)
                                 }
                                 // log(TAG, "ACTION_CANCEL")
-                                mMainHandler.post {
-                                    mDropZoneView?.visibility = View.GONE
-                                }
+                                mDropZoneView?.visibility = View.GONE
+                                mDropZoneView?.sourcePose = null
                                 mIsShowingZone = false
                             }
                         }
                 }
+
             })
             } else {
-                log(TAG, "No launcher input anchor available")
+                log(TAG) { "No launcher input anchor available" }
             }
 
             findMethod(tisClass) { name == "onDestroy" }.hookBefore {
+                RecentsDropHandoff.dispose()
                 // log(TAG, "TouchInteractionService#onDestroy hooked")
                 mMainHandler.post {
                     val context = it.thisObject as android.app.Service
@@ -559,22 +555,7 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
     }
 
     private fun updateDropZoneColor(isInZone: Boolean) {
-        mMainHandler.post {
-            mDropZoneView?.let { view ->
-                val baseColor = if (isInZone) Color.parseColor("#8061d4ff") else Color.parseColor("#30FFFFFF")
-                val shape = ShapeDrawable(RoundRectShape(floatArrayOf(40f, 40f, 40f, 40f, 40f, 40f, 40f, 40f), null, null))
-                shape.paint.apply {
-                    color = baseColor
-                    style = Paint.Style.FILL_AND_STROKE
-                    strokeWidth = 8f
-                    pathEffect = DashPathEffect(floatArrayOf(20f, 15f), 0f)
-                }
-                view.background = shape
-                if (view is TextView) {
-                    view.alpha = if (isInZone) 1.0f else 0.8f
-                }
-            }
-        }
+        mDropZoneView?.setActive(isInZone)
     }
 
     private fun extractComponentInfo(input: String): ComponentName? {

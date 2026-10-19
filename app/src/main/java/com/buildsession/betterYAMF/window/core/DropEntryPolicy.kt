@@ -1,53 +1,46 @@
 package com.buildsession.betterYAMF.window.core
 
-import kotlin.math.PI
-import kotlin.math.sin
-
 /**
- * 回收区投放登场的纯策略（零平台依赖；宿主只传值并执行）：
- * 起点大卡片的几何与飞行观感参数（时长 / 曲线 / 景深 / 淡入）——"观感参数在逻辑层"。
+ * 回收区投放登场的纯策略（零平台依赖；宿主只传值并执行）。
  *
- * 轨迹（对齐"米窗示范"视频逐帧量化）：一条从大到小的连续强减速飞行，
- * 右缘锚定槽位右上角、圆角/描边随飞行渐成，落点即 mini，全程无"可点击中间态"。
+ * 形态（对齐 ColorOS FlexibleFloatHandleAnimationSpec 的 minimize 家族）：
+ * 从**松手点**弹出一张"种子卡片"（目标卡片等比放大 [START_SCALE]），随后由弹簧
+ * （[MiniAnimPolicy] DROP_ENTRY 族）收缩入 mini 槽位——一条短程弹簧飞行，
+ * 起手即近终态大小，不再出现"整屏大卡片收缩"的抽象轨迹（本轮视频逐帧实锤问题）。
+ *
+ * 旧实现（START_SCALE=3.0、500ms 强减速曲线、160ms 淡入）已废弃：起点近全屏，
+ * 视觉上等同"全屏应用塌缩进角落"，与本模块"松手点弹出"的语义不符。
  */
 object DropEntryPolicy {
 
-    /** 起点大卡片 = 目标卡片的放大倍数。 */
-    const val START_SCALE = 3.0f
-
-    /** 飞行时长基准（毫秒；经开发者动画缩放与模块动画速度配置折减，见 [AnimTimingPolicy]）。 */
-    const val DURATION_BASE_MS = 500L
-
-    /** 起飞淡入时长（毫秒；避免起点帧闪现）。 */
-    const val START_FADE_MS = 160L
-
-    /** 飞行插值曲线控制点（起步即高速、长尾收束；宿主以此构造 PathInterpolator）。 */
-    const val CURVE_X1 = 0.05f
-    const val CURVE_Y1 = 0f
-    const val CURVE_X2 = 0.12f
-    const val CURVE_Y2 = 1f
+    /** 种子卡片 = 目标卡片的等比放大倍数。 */
+    const val START_SCALE = 1.25f
 
     /**
-     * 起点矩形：右缘锚定 [target] 右缘（轨迹的右缘直线），顶边夹在
-     * [topInsetPx, 屏高 - bottomInsetPx - 起点高] 安全带内；左界不小于 [marginPx]。
+     * 起点矩形（回收区投放登场）：以松手点 [dropX]/[dropY] 为中心、目标等比放大
+     * [START_SCALE]，四边夹取到安全区（顶 = 状态栏安全带、底 = 导航栏安全带、左右 = [marginPx]）。
+     * 松手点未知（< 0，如调试命令未携带）时退回目标中心原地弹出。
      */
     fun startRect(
         target: WindowRect,
+        dropX: Int,
+        dropY: Int,
+        screenWidth: Int,
         screenHeight: Int,
         marginPx: Int,
         topInsetPx: Int,
         bottomInsetPx: Int
     ): WindowRect {
-        val startW = (target.width * START_SCALE).toInt()
-        val startH = (target.height * START_SCALE).toInt()
-        val startLeft = (target.right - startW).coerceAtLeast(marginPx)
-        val startTop = target.top.coerceIn(
-            topInsetPx,
-            (screenHeight - bottomInsetPx - startH).coerceAtLeast(topInsetPx)
-        )
-        return WindowRect(startLeft, startTop, startLeft + startW, startTop + startH)
+        val w = (target.width * START_SCALE).toInt().coerceAtLeast(1)
+        val h = (target.height * START_SCALE).toInt().coerceAtLeast(1)
+        val cx = if (dropX >= 0) dropX else (target.left + target.right) / 2
+        val cy = if (dropY >= 0) dropY else (target.top + target.bottom) / 2
+        val minLeft = marginPx
+        val maxLeft = (screenWidth - w - marginPx).coerceAtLeast(minLeft)
+        val minTop = topInsetPx.coerceAtLeast(marginPx)
+        val maxTop = (screenHeight - bottomInsetPx - h - marginPx).coerceAtLeast(minTop)
+        val left = (cx - w / 2).coerceIn(minLeft, maxLeft)
+        val top = (cy - h / 2).coerceIn(minTop, maxTop)
+        return WindowRect(left, top, left + w, top + h)
     }
-
-    /** 内容景深回缩系数（视口缩放乘数）：sin 峰 3%，首末帧归 1。 */
-    fun dipAt(f: Float): Float = 1f - 0.03f * sin((PI * f).toFloat())
 }

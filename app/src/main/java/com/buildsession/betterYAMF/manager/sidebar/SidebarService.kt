@@ -10,7 +10,7 @@ import android.hardware.display.DisplayManager
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
-import android.util.Log
+import com.buildsession.betterYAMF.common.logging.AppLog
 import android.view.Display
 import android.view.Gravity
 import android.view.LayoutInflater
@@ -20,7 +20,6 @@ import android.view.WindowManager
 import androidx.appcompat.view.ContextThemeWrapper
 import androidx.core.app.NotificationCompat
 import androidx.core.graphics.toColorInt
-import com.buildsession.betterYAMF.BuildConfig
 import com.buildsession.betterYAMF.R
 import com.buildsession.betterYAMF.common.ui.vibratePhone
 import com.buildsession.betterYAMF.databinding.SidebarLayoutBinding
@@ -257,7 +256,7 @@ class SidebarService : Service() {
         try {
             windowManager.removeView(binding.root)
         } catch (e: Exception) {
-            if (BuildConfig.DEBUG) Log.d("reYAMF", "Sidebar killed")
+            AppLog.debug("reYAMF") { "Sidebar killed" }
         }
         runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
         stopSelf()

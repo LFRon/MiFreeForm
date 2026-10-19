@@ -3,9 +3,16 @@ package com.buildsession.betterYAMF.window.backend
 import android.app.ActivityManager
 import android.content.ComponentName
 import android.graphics.Rect
+import com.buildsession.betterYAMF.window.core.CommandStatus
+
+/** Cancels an outstanding command; its callback still completes once with SUPERSEDED. */
+fun interface WindowOperation {
+    fun cancel()
+}
 
 /**
- * 系统窗口后端端口：宿主/流程 ↔ 系统侧"任务级窗口语义"的唯一入口。
+ * Android 内部后端接口：宿主/流程 ↔ 系统侧任务与表面机制。
+ * 本接口允许平台类型，不属于纯 CORE 的事件/场景契约。
  *
  * 设计边界（与 `window/core` 的 M1 抽象对应）：
  * - 核心（window/core）：只认抽象输入 → 抽象命令，零平台依赖；
@@ -19,6 +26,8 @@ import android.graphics.Rect
  * WindowOrganizerController / Task / SurfaceControl 等系统细节。**
  */
 interface WindowBackend {
+    /** Can retain source pixels while preparing an initially hidden live task. */
+    val supportsRetainedEntry: Boolean get() = false
 
     /** 注册回灌回调并完成系统侧初始化（幂等）。 */
     fun initialize(callbacks: WindowBackendCallbacks)
@@ -27,7 +36,7 @@ interface WindowBackend {
      * 打开：把任务认领为平滑窗口（freeform + 承载根 + 变换接管），
      * 置前并恢复可聚焦。返回是否成功认领。
      */
-    fun openTask(taskId: Int): Boolean
+    fun openTask(taskId: Int, initialBounds: Rect? = null): Boolean
 
     /**
      * 关闭/释放：任务回到全屏并交还系统管理（含表面变换复位与焦点恢复）。
@@ -43,6 +52,55 @@ interface WindowBackend {
      * 实现自行选择承载方式（leash 变换 / 兼容路径），调用方不感知。
      */
     fun applyGeometry(taskId: Int, physicalBounds: Rect)
+
+    /**
+     * Prepare the fixed app viewport while invisible. Completion acknowledges the bounds/buffer
+     * transaction; a visible animation must not start before it. Every outcome is reported once.
+     * Cancelling/releasing the session invalidates its outstanding callbacks before another session
+     * can use the same task identity.
+     */
+    fun preparePresentation(taskId: Int, normalBounds: Rect, onComplete: (CommandStatus) -> Unit): WindowOperation
+
+    /**
+     * Write a complete presentation into the frame transaction without applying it.
+     * Guarantees: uniform content scale, crop filling the visible rectangle, visual-pixel corner
+     * radius and common opacity. Subsequent frames never resize the app's logical viewport.
+     * Returns false if these guarantees cannot be supplied; no independent fallback transaction.
+     */
+    fun writePresentationInto(
+        tx: android.view.SurfaceControl.Transaction,
+        taskId: Int,
+        physicalBounds: Rect,
+        cornerRadiusPx: Float,
+        alpha: Float
+    ): Boolean
+
+    /**
+     * 把该任务的 leash 结算变换**写入调用者提供的事务**（不 apply；语义与 [applyGeometry] 同源）。
+     * 单写者模型（对齐 ColorOS `FlexibleFloatHandleAnimationSpec#applySpringTransform`）：
+     * 宿主把外壳容器的表面写入与内容 leash 的写入合并进**同一个**
+     * [android.view.SurfaceControl.Transaction] 再统一 apply —— 两者在 SurfaceFlinger
+     * **同一帧原子落地**，帧级脱节在结构上不可能发生。
+     * 实现须与 [applyGeometry] 一样更新实现内的几何缓存（重施加/重断言以缓存为真源）。
+     */
+    fun writeGeometryInto(
+        tx: android.view.SurfaceControl.Transaction,
+        taskId: Int,
+        physicalBounds: Rect
+    )
+
+    /**
+     * 为任务创建**壳容器**表面（ColorOS `FlexibleTaskAttachBlurManager` 同型）：与任务 leash
+     * 同层、相对层序紧贴其上 —— 壳的几何从此由容器表面事务承担，WMS 不再参与。返回句柄；
+     * 不可用（任务/leash/父层缺失）返回 null，宿主回落 WMS 窗口路径。
+     */
+    fun createShellContainer(taskId: Int, name: String): android.view.SurfaceControl?
+
+    /** 重断言壳容器层级（回置顶等场景：相对任务 leash 重新压上）。 */
+    fun raiseShellContainer(taskId: Int, container: android.view.SurfaceControl)
+
+    /** 释放壳容器表面（幂等）。 */
+    fun destroyShellContainer(container: android.view.SurfaceControl)
 
     /**
      * 静止结算：把窗口静止几何（内容盒，屏幕坐标）交给后端落地。
@@ -122,6 +180,13 @@ interface WindowBackend {
     /** 抑制最近任务手势（Launcher 协作信号；由系统侧接收器转发）。 */
     fun suppressRecentsGestureFor(durationMs: Long)
 
+    /**
+     * 任务表面是否已"静止"（无系统转场/表面动画在写它的 leash）。
+     * 投放登场"起跑闸"用：Launcher 手势提交触发的系统退场转场读完后我们才可接管，
+     * 否则两边逐帧抢写同一张表面 = "上下横跳"。实现侧能力探测，缺失时恒 true。
+     */
+    fun isTaskSurfaceStable(taskId: Int): Boolean
+
     /** 最近任务手势抑制截止时间戳（uptimeMillis；0 = 未抑制）。 */
     fun recentsGestureSuppressUntilMs(): Long
 
@@ -129,8 +194,13 @@ interface WindowBackend {
     fun injectHomeKey(): Boolean
 }
 
-/** 后端 → 宿主的回灌事件。 */
+/**
+ * 后端 → 宿主的回灌事件。后端须离开 WM/原生调用栈，在主线程校验会话归属后交付。
+ * 释放或替换会话使其排队中的旧事件失效；宿主不得再无归属地二次异步转发。
+ */
 interface WindowBackendCallbacks {
+    /** A platform reset requires the current authoritative scene to be presented again. */
+    fun onPresentationInvalidated(taskId: Int)
     /** 任务已被接管且承载句柄就绪（宿主可摆位）。 */
     fun onTaskAdopted(taskId: Int)
 

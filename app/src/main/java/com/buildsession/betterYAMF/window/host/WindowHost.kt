@@ -16,7 +16,20 @@ interface WindowHost {
     var currentTaskId: Int
 
     /** 「打开即 mini」：任务就绪后由宿主请求进入角落 mini。 */
-    fun markOpenAsMini(dropX: Int = -1, dropY: Int = -1)
+    fun markOpenAsMini(
+        dropX: Int = -1, dropY: Int = -1,
+        sourceBounds: android.graphics.Rect? = null, awaitSourceRelease: Boolean = false,
+        sourcePackage: String? = null, handoffId: Long = 0L,
+        entrySnapshot: com.buildsession.betterYAMF.common.model.EntrySnapshot? = null
+    )
+
+    /** Adopt using the core's normal viewport; a staged source is displayed before this call. */
+    fun openTask(): Boolean
+    fun onEntryCancelled(handoffId: Long)
+
+    /** The source has relinquished its visible card after our first frame was committed. */
+    fun onSourceReleased(handoffId: Long)
+    fun onPresentationInvalidated()
 
     /** organizer 路径：任务 leash 已就绪，按当前几何摆放。 */
     fun onOrganizerLeash()

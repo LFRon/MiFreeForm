@@ -24,9 +24,25 @@ object WindowBackends {
 
 private object NoopWindowBackend : WindowBackend {
     override fun initialize(callbacks: WindowBackendCallbacks) {}
-    override fun openTask(taskId: Int): Boolean = false
+    override fun openTask(taskId: Int, initialBounds: Rect?): Boolean = false
     override fun releaseTask(taskId: Int, toFront: Boolean): Boolean = false
     override fun applyGeometry(taskId: Int, physicalBounds: Rect) {}
+    override fun preparePresentation(taskId: Int, normalBounds: Rect, onComplete: (com.buildsession.betterYAMF.window.core.CommandStatus) -> Unit): WindowOperation {
+        onComplete(com.buildsession.betterYAMF.window.core.CommandStatus.FAILED)
+        return WindowOperation {}
+    }
+    override fun writePresentationInto(
+        tx: android.view.SurfaceControl.Transaction, taskId: Int, physicalBounds: Rect,
+        cornerRadiusPx: Float, alpha: Float
+    ): Boolean = false
+    override fun writeGeometryInto(
+        tx: android.view.SurfaceControl.Transaction,
+        taskId: Int,
+        physicalBounds: Rect
+    ) {}
+    override fun createShellContainer(taskId: Int, name: String): android.view.SurfaceControl? = null
+    override fun raiseShellContainer(taskId: Int, container: android.view.SurfaceControl) {}
+    override fun destroyShellContainer(container: android.view.SurfaceControl) {}
     override fun settleGeometry(taskId: Int, bounds: Rect) {}
     override fun reapplyGeometry(taskId: Int) {}
     override fun ensureTaskVisible(taskId: Int) {}
@@ -42,6 +58,7 @@ private object NoopWindowBackend : WindowBackend {
     override fun isHomeTask(taskInfo: ActivityManager.RunningTaskInfo): Boolean = false
     override fun isTouchActive(): Boolean = false
     override fun suppressRecentsGestureFor(durationMs: Long) {}
+    override fun isTaskSurfaceStable(taskId: Int): Boolean = true
     override fun recentsGestureSuppressUntilMs(): Long = 0L
     override fun injectHomeKey(): Boolean = false
 

@@ -22,7 +22,7 @@ class CoreBoundaryTest {
         val dir = candidates.firstOrNull { it.isDirectory }
             ?: error("无法定位 window/core 源码目录（cwd=${File(".").absolutePath}）")
 
-        val forbidden = Regex("\\b(android|androidx|de\\.robv|com\\.android)\\.")
+        val forbidden = Regex("\\b(android|androidx|de\\.robv|com\\.android|io\\.github\\.libxposed)\\.")
         val violations = mutableListOf<String>()
         dir.walkTopDown()
             .filter { it.isFile && it.name.endsWith(".kt") }

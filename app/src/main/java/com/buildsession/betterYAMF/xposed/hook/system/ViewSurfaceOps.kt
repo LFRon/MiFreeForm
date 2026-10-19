@@ -6,7 +6,7 @@ import de.robv.android.xposed.XposedHelpers
 
 /**
  * 视图表面控制适配器（反射细节收口点）：
- * 应用所在窗口 SurfaceControl 的帧率票（SF 层刷新率提升）。
+ * 应用所在窗口 SurfaceControl 的帧率票（SF 层刷新率提升）与窗口表面句柄获取。
  *
  * 分层边界：本类属适配器层（唯一允许反射 ViewRootImpl/SurfaceControl 的地方）；
  * 宿主（AppWindow）只经本入口调用，不直接持有反射细节。
@@ -20,19 +20,31 @@ object ViewSurfaceOps {
 
     /** 为 [view] 所在窗口表面设置/撤销帧率票；表面未就绪等返回 false（静默降级）。 */
     fun setViewSurfaceFrameRate(view: View, hz: Float, enable: Boolean): Boolean = runCatching {
-        val viewRootImpl = XposedHelpers.callMethod(view, "getViewRootImpl")
-        val surfaceControl = viewRootImpl?.let {
-            XposedHelpers.callMethod(it, "getSurfaceControl") as? android.view.SurfaceControl
-        }
-        if (viewRootImpl == null || surfaceControl == null) return@runCatching false
+        val surfaceControl = windowSurface(view) ?: return@runCatching false
         val tx = android.view.SurfaceControl.Transaction()
-        if (enable) {
-            tx.setFrameRate(surfaceControl, hz, Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE)
-        } else {
-            tx.clearFrameRate(surfaceControl)
+        try {
+            if (enable) {
+                tx.setFrameRate(surfaceControl, hz, Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE)
+            } else {
+                // LoS SurfaceControl:4796 defines clearFrameRate as this exact call. The
+                // equivalent API is also available on our API 33 minimum platform.
+                tx.setFrameRate(surfaceControl, 0f, Surface.FRAME_RATE_COMPATIBILITY_DEFAULT,
+                    Surface.CHANGE_FRAME_RATE_ALWAYS)
+            }
+            tx.apply()
+        } finally {
+            tx.close()
         }
-        tx.apply()
-        tx.close()
         true
     }.getOrDefault(false)
+
+    /**
+     * 取视图所在窗口的窗口表面句柄（动画快照/帧率等适配用）。
+     * **只读语义**：调用方不得 release（生命周期归 ViewRootImpl）。
+     */
+    fun windowSurface(view: View): android.view.SurfaceControl? = runCatching {
+        val viewRootImpl = XposedHelpers.callMethod(view, "getViewRootImpl")
+        (XposedHelpers.callMethod(viewRootImpl, "getSurfaceControl") as? android.view.SurfaceControl)
+            ?.takeIf { it.isValid }
+    }.getOrNull()
 }

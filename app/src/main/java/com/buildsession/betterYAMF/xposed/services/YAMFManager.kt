@@ -33,6 +33,8 @@ import com.buildsession.betterYAMF.xposed.utils.Instances.systemUiContext
 import com.buildsession.betterYAMF.xposed.utils.createContext
 import com.buildsession.betterYAMF.xposed.utils.getTopRootTask
 import com.buildsession.betterYAMF.xposed.utils.log
+import com.buildsession.betterYAMF.xposed.utils.logWarning
+import com.buildsession.betterYAMF.xposed.utils.logError
 import com.buildsession.betterYAMF.xposed.utils.registerReceiver
 import com.qauxv.ui.CommonContextWrapper
 import de.robv.android.xposed.XposedHelpers
@@ -61,13 +63,16 @@ object YAMFManager : IYAMFManager.Stub() {
 
     private const val WINDOWING_MODE_FULLSCREEN = 1
     private const val WINDOWING_MODE_FREEFORM = 5
-    private const val HOME_INJECT_DELAY_MS = 700L
+
+    /** 投放起跑闸：轮询节拍 / 等待上限（超时放行并留证，主线程 Handler）。 */
+    private const val DROP_GATE_POLL_MS = 32L
+    private const val DROP_GATE_TIMEOUT_MS = 1200L
 
     private val taskStackListener by lazy {
         android.app.ITaskStackListenerProxy.newInstance(Instances.systemContext.classLoader) { args, method ->
             runMain {
                 if (BuildConfig.DEBUG) {
-                    log("reYAMF_debug", "stackEvent ${method.name}")
+                    log("reYAMF_debug") { "stackEvent ${method.name}" }
                 }
                 runCatching {
                     when (method.name) {
@@ -79,7 +84,10 @@ object YAMFManager : IYAMFManager.Stub() {
                         activeWindows.values.forEach { it.onTaskMovedToFront(taskInfo) }
                         activeWindows.values.forEach { w ->
                             if (w.currentTaskId == taskInfo.taskId) {
-                                notifyTaskVisible(w, taskInfo.isVisible)
+                                // Task-moved-to-front carries a snapshot taken before visibility
+                                // settles (LoS TaskChangeNotificationController:418). Organized
+                                // tasks receive visibility exclusively from their organizer.
+                                if (!windowBackend.isTaskManaged(taskInfo.taskId)) notifyTaskVisible(w, taskInfo.isVisible)
                             }
                         }
 
@@ -99,12 +107,14 @@ object YAMFManager : IYAMFManager.Stub() {
                                 val pendingWindow = pendingEntry?.value
                                 if (pendingWindow != null) {
                                     // 就地认领入承载根（出生即入根的任务同样经此绑定；幂等）。
-                                    log("reYAMF_debug", "claim task=${taskInfo.taskId} activity=$topActivity")
+                                    log("reYAMF_debug") { "claim task=${taskInfo.taskId} activity=$topActivity" }
                                     WindowSessions.hostedTasks.add(taskInfo.taskId)
                                     pendingSmoothFreeformApps.remove(pendingEntry.key)
                                     // Trigger a config change to apply spoofing/scaling immediately
-                                    switchToSmoothFreeform(taskInfo.taskId)
+                                    // ⚠ 次序铁律（同 createWindow）：currentTaskId 先于同步认领赋值，
+                                    // 否则 adoptTask 的同步回灌会被 onOrganizerTaskAppeared 过滤跳过。
                                     pendingWindow.currentTaskId = taskInfo.taskId
+                                    activateWindowTask(pendingWindow)
                                     pendingWindow.onTaskMovedToFront(taskInfo)
                                 }
                             }
@@ -173,7 +183,7 @@ object YAMFManager : IYAMFManager.Stub() {
             (XposedHelpers.callMethod(windowConfig, "getActivityType") as Int) == 2
         }.getOrDefault(false)
         if (BuildConfig.DEBUG) {
-            log("reYAMF_debug", "stackChanged topId=$topTaskId pkg=$topPkg isHome=$topIsHome windows=${activeWindows.size}")
+            log("reYAMF_debug") { "stackChanged topId=$topTaskId pkg=$topPkg isHome=$topIsHome windows=${activeWindows.size}" }
         }
         val windows = activeWindows.values.toList()
         if (windows.isEmpty()) return
@@ -181,6 +191,7 @@ object YAMFManager : IYAMFManager.Stub() {
             windows.forEach { it.onHomeTop() }
         } else {
             windows.forEach { w ->
+                if (windowBackend.isTaskManaged(w.currentTaskId)) return@forEach
                 val info = tasks.find {
                     XposedHelpers.getIntField(it, "taskId") == w.currentTaskId
                 }
@@ -193,11 +204,11 @@ object YAMFManager : IYAMFManager.Stub() {
                         val miss = (missingTaskChecks[w.windowId] ?: 0) + 1
                         missingTaskChecks[w.windowId] = miss
                         if (BuildConfig.DEBUG) {
-                            log("reYAMF_debug", "visibility task=${w.currentTaskId} found=false miss=$miss")
+                            log("reYAMF_debug") { "visibility task=${w.currentTaskId} found=false miss=$miss" }
                         }
                         if (miss >= 2) {
                             missingTaskChecks.remove(w.windowId)
-                            log("reYAMF_debug", "host task gone; destroy window=${w.windowId} task=${w.currentTaskId}")
+                            log("reYAMF_debug") { "host task gone; destroy window=${w.windowId} task=${w.currentTaskId}" }
                             runCatching { w.onDestroy(releaseTask = false) }
                         }
                     }
@@ -206,7 +217,7 @@ object YAMFManager : IYAMFManager.Stub() {
                 missingTaskChecks.remove(w.windowId)
                 val visible = XposedHelpers.getBooleanField(info, "isVisible")
                 if (BuildConfig.DEBUG) {
-                    log("reYAMF_debug", "visibility task=${w.currentTaskId} found=true visible=$visible")
+                    log("reYAMF_debug") { "visibility task=${w.currentTaskId} found=true visible=$visible" }
                 }
                 notifyTaskVisible(w, visible)
             }
@@ -229,7 +240,7 @@ object YAMFManager : IYAMFManager.Stub() {
      */
     private fun notifyTaskVisible(w: WindowHost, visible: Boolean) {
         w.onTaskVisibilityChanged(visible)
-        if (!visible) scheduleVisibilityRecheck(w.windowId, 0)
+        if (!visible && !windowBackend.isTaskManaged(w.currentTaskId)) scheduleVisibilityRecheck(w.windowId, 0)
     }
 
     private fun scheduleVisibilityRecheck(windowId: Int, attempt: Int) {
@@ -240,6 +251,7 @@ object YAMFManager : IYAMFManager.Stub() {
             visibilityRechecks.remove(key)
             val w = activeWindows[windowId] ?: return@runMain
             if (w.currentTaskId <= 0) return@runMain
+            if (windowBackend.isTaskManaged(w.currentTaskId)) return@runMain
             val tasks = runCatching {
                 XposedHelpers.callMethod(
                     Instances.activityTaskManager, "getTasks", Int.MAX_VALUE, false, false, -1
@@ -250,7 +262,7 @@ object YAMFManager : IYAMFManager.Stub() {
             } ?: return@runMain
             val visible = XposedHelpers.getBooleanField(info, "isVisible")
             if (BuildConfig.DEBUG) {
-                log("reYAMF_debug", "visibility recheck window=$windowId task=${w.currentTaskId} visible=$visible")
+                log("reYAMF_debug") { "visibility recheck window=$windowId task=${w.currentTaskId} visible=$visible" }
             }
             w.onTaskVisibilityChanged(visible)
             if (!visible && attempt == 0) scheduleVisibilityRecheck(windowId, 1)
@@ -264,6 +276,12 @@ object YAMFManager : IYAMFManager.Stub() {
         runCatching {
             WindowBackends.install(SmoothWindowBackend)
             WindowBackends.current().initialize(object : WindowBackendCallbacks {
+                override fun onPresentationInvalidated(taskId: Int) {
+                    // Backend callbacks already leave WM's stack and validate their session on
+                    // main. Another unowned dispatch here could target a replacement host.
+                    activeWindows.values.firstOrNull { it.currentTaskId == taskId }?.onPresentationInvalidated()
+                }
+
                 override fun onTaskAdopted(taskId: Int) {
                     onOrganizerTaskAppeared(taskId)
                 }
@@ -275,19 +293,33 @@ object YAMFManager : IYAMFManager.Stub() {
                 override fun onTaskVisibleChanged(taskId: Int, visible: Boolean) {
                     // 可见性翻转路由到宿主窗口（与 onTaskMovedToFront 的可见性回灌同一条路）：
                     // 熄屏/解锁等无"置前"事件的场景，外壳据此恢复/收起，不再永久卡在隐藏态。
-                    runMain {
-                        activeWindows.values.firstOrNull { it.currentTaskId == taskId }
-                            ?.let { notifyTaskVisible(it, visible) }
-                    }
+                    activeWindows.values.firstOrNull { it.currentTaskId == taskId }
+                        ?.let { notifyTaskVisible(it, visible) }
                 }
             })
         }.onFailure { log("reYAMF_debug", "window backend init failed", it) }
         systemContext.registerReceiver(Protocol.ACTION_OPEN_IN_YAMF, OpenInYAMFBroadcastReceiver)
+        systemContext.registerReceiver(Protocol.ACTION_SOURCE_RELEASED) { _, intent ->
+            val taskId = intent.getIntExtra(Protocol.EXTRA_TASK_ID, -1)
+            val handoffId = intent.getLongExtra(Protocol.EXTRA_HANDOFF_ID, 0L)
+            runMain { activeWindows.values.firstOrNull { it.currentTaskId == taskId }?.onSourceReleased(handoffId) }
+        }
+        systemContext.registerReceiver(Protocol.ACTION_CANCEL_RECENTS_ENTRY) { _, intent ->
+            val taskId = intent.getIntExtra(Protocol.EXTRA_TASK_ID, -1)
+            val handoffId = intent.getLongExtra(Protocol.EXTRA_HANDOFF_ID, 0L)
+            runMain { activeWindows.values.firstOrNull { it.currentTaskId == taskId }?.onEntryCancelled(handoffId) }
+        }
+        systemContext.registerReceiver(Protocol.ACTION_QUERY_ENTRY_CAPABILITIES) { _, intent ->
+            val sourcePackage = intent.getStringExtra(Protocol.EXTRA_SOURCE_PACKAGE) ?: return@registerReceiver
+            systemContext.sendBroadcast(Intent(Protocol.ACTION_ENTRY_CAPABILITIES).setPackage(sourcePackage)
+                .putExtra(Protocol.EXTRA_ENTRY_PROTOCOL, if (windowBackend.supportsRetainedEntry) Protocol.ENTRY_PROTOCOL else 0))
+            log("reYAMF_EntryV2") { "capabilities retained=${windowBackend.supportsRetainedEntry} loadedBuild=${com.buildsession.betterYAMF.BuildConfig.BUILD_TIME}" }
+        }
         systemContext.registerReceiver(Protocol.ACTION_RECENTS_GESTURE) { _, intent ->
             val suppressMs = intent.getLongExtra(Protocol.EXTRA_SUPPRESS_MS, 0L)
             windowBackend.suppressRecentsGestureFor(suppressMs)
             if (BuildConfig.DEBUG) {
-                log("reYAMF_debug", "recents gesture suppress ${suppressMs}ms")
+                log("reYAMF_debug") { "recents gesture suppress ${suppressMs}ms" }
             }
         }
         systemContext.registerReceiver(Protocol.ACTION_QUERY_MANAGED_TASKS) { _, _ ->
@@ -334,7 +366,7 @@ object YAMFManager : IYAMFManager.Stub() {
             runCatching {
                 Instances.activityTaskManager.registerTaskStackListener(taskStackListener)
                 isTaskStackListenerRegistered = true
-                log("reYAMF_debug", "taskStackListener registered")
+                log("reYAMF_debug") { "taskStackListener registered" }
             }.onFailure {
                 log("reYAMF_debug", "registerTaskStackListener failed", it)
             }
@@ -348,7 +380,7 @@ object YAMFManager : IYAMFManager.Stub() {
      * 并递减打开计数同步 UI。几何释放（releaseTask）由调用方在销毁前完成，此处幂等兜底。
      */
     fun unregisterHost(host: WindowHost) {
-        activeWindows.remove(host.windowId)
+        if (activeWindows.remove(host.windowId) == null) return
         pendingSmoothFreeformApps.entries.removeAll { it.value === host }
         WindowSessions.chromeTouchHoles.remove(host.windowId)
         val taskId = host.currentTaskId
@@ -389,35 +421,71 @@ object YAMFManager : IYAMFManager.Stub() {
             // 同一任务已在小窗中：静默销毁旧壳（不释放任务），避免双壳互抢
             activeWindows.values.toList().forEach { w ->
                 if (w.currentTaskId == taskId) {
-                    log("reYAMF_debug", "dedupe old shell window=${w.windowId} task=$taskId")
+                    log("reYAMF_debug") { "dedupe old shell window=${w.windowId} task=$taskId" }
                     runCatching { w.onDestroy(releaseTask = false) }
                 }
             }
-            WindowSessions.hostedTasks.add(taskId)
+            if (startCmd?.entrySnapshot == null) WindowSessions.hostedTasks.add(taskId)
         }
 
+        var initialized = false
         AppWindow(
             CommonContextWrapper.createAppCompatContext(systemUiContext.createContext())
         ) { window, _ ->
             addWindow(window)
+            if (taskId != -1) window.currentTaskId = taskId
+            initialized = true
 
             if (startCmd?.openAsMini == true) {
-                window.markOpenAsMini(startCmd.dropX, startCmd.dropY)
+                window.markOpenAsMini(startCmd.dropX, startCmd.dropY, startCmd.sourceBounds,
+                    startCmd.awaitSourceRelease, startCmd.sourcePackage, startCmd.handoffId, startCmd.entrySnapshot)
             }
 
             if (taskId != -1) {
+                if (startCmd?.entrySnapshot != null) return@AppWindow
                 // 用户从最近任务/回收区开小窗：既有任务**就地认领入承载根**（无杀进程）——
                 // 应用进程存活、任务身份保留（最近任务不消失、状态不重置）；小窗不改应用 DPI。
                 WindowSessions.hostedTasks.add(taskId)
-                switchToSmoothFreeform(taskId)
+                // ⚠ 次序铁律：currentTaskId 必须先赋值。认领链路是**同步**的——
+                // switchToSmoothFreeform → openTask → adoptTask → notifyTaskAdopted →
+                // onOrganizerTaskAppeared 以 `w.currentTaskId == taskId` 过滤宿主并点火
+                // onOrganizerLeash（托管/回退/淡入的唯一触发点）。反序会让回灌被过滤跳过，
+                // 壳既不托管也不回退（真机实证：壳完全消失、内容不落变换）。
                 window.currentTaskId = taskId
+                activateWindowTask(window)
             } else if (startCmd?.componentName != null) {
-                pendingSmoothFreeformApps[startCmd.componentName] = window
+                // A replaced or rejected launch must not leave an unclaimable transparent host.
+                pendingSmoothFreeformApps.put(startCmd.componentName, window)
+                    ?.onDestroy(releaseTask = false)
                 // 意图级调用：以"小窗会话"语义启动——freeform 目标、启动即入根等执行细节
                 // 全部由实现层负责；小窗不改应用 DPI。
-                windowBackend.launchAppForSession(startCmd.componentName, startCmd.userId ?: 0, window.windowId)
+                if (!windowBackend.launchAppForSession(startCmd.componentName, startCmd.userId ?: 0, window.windowId)) {
+                    window.onDestroy(releaseTask = false)
+                }
             }
         }
+        if (!initialized) {
+            WindowSessions.hostedTasks.remove(taskId)
+            if (windowBackend.isTaskManaged(taskId)) windowBackend.releaseTask(taskId, true)
+            rejectEntry(startCmd)
+        }
+    }
+
+    private fun rejectEntry(startCmd: StartCmd?) {
+        startCmd?.entrySnapshot?.close()
+        startCmd?.sourcePackage?.let { destination ->
+            systemContext.sendBroadcast(Intent(Protocol.ACTION_WINDOW_PRESENTED).setPackage(destination)
+                .putExtra(Protocol.EXTRA_TASK_ID, startCmd.taskId ?: -1)
+                .putExtra(Protocol.EXTRA_HANDOFF_ID, startCmd.handoffId)
+                .putExtra(Protocol.EXTRA_COMMAND_STATUS, com.buildsession.betterYAMF.window.core.CommandStatus.FAILED.name))
+        }
+    }
+
+    /** Native source completion activates exactly the still-owned destination host. */
+    fun activateWindowTask(window: WindowHost): Boolean {
+        if (activeWindows[window.windowId] !== window || window.currentTaskId <= 0) return false
+        WindowSessions.hostedTasks.add(window.currentTaskId)
+        return window.openTask()
     }
 
     /** organizer 路径：任务的 leash 已就绪，让宿主按当前物理矩形摆放 */
@@ -457,23 +525,23 @@ object YAMFManager : IYAMFManager.Stub() {
                 .putExtra(Protocol.EXTRA_MANAGED_TASK_IDS, ids)
             systemContext.sendBroadcast(intent)
             if (BuildConfig.DEBUG) {
-                log("reYAMF_debug", "managed tasks -> launcher: [${ids.joinToString()}]")
+                log("reYAMF_debug") { "managed tasks -> launcher: [${ids.joinToString()}]" }
             }
         }.onFailure {
             log("reYAMF_debug", "broadcast managed tasks failed", it)
         }
     }
 
-    fun switchToSmoothFreeform(taskId: Int) {
-        log("reYAMF_debug", "switchToSmoothFreeform task=$taskId")
+    fun switchToSmoothFreeform(taskId: Int, initialBounds: android.graphics.Rect? = null): Boolean {
+        log("reYAMF_debug") { "switchToSmoothFreeform task=$taskId" }
         WindowSessions.hostedTasks.add(taskId)
 
         val runningTasks = XposedHelpers.callMethod(Instances.activityTaskManager, "getTasks", Int.MAX_VALUE, false, false, -1) as List<*>
         val taskInfo = runningTasks.find {
             XposedHelpers.getIntField(it, "taskId") == taskId
         } ?: run {
-            log("reYAMF_debug", "switchToSmoothFreeform task=$taskId NOT FOUND in tasks")
-            return
+            logWarning("reYAMF_debug", "switchToSmoothFreeform task=$taskId NOT FOUND in tasks")
+            return false
         }
         runCatching {
             XposedHelpers.getObjectField(taskInfo, "topActivity") as? ComponentName
@@ -481,9 +549,11 @@ object YAMFManager : IYAMFManager.Stub() {
 
         // 系统窗口后端：认领（organizer/leash）+ 置前 + 恢复可聚焦；小窗不改应用 DPI，
         // 不施加任何密度覆盖。只走后端路径，失败大声报错，不再悄悄回退旧行为
-        if (!windowBackend.openTask(taskId)) {
-            log("reYAMF_debug", "ERROR organizer adopt failed task=$taskId (no fallback)")
+        val opened = windowBackend.openTask(taskId, initialBounds)
+        if (!opened) {
+            logError("reYAMF_debug", "ERROR organizer adopt failed task=$taskId (no fallback)")
         }
+        return opened
     }
 
     /**
@@ -541,17 +611,21 @@ object YAMFManager : IYAMFManager.Stub() {
     }
 
     override fun registerOpenCountListener(iOpenCountListener: IOpenCountListener) {
-        iOpenCountListenerSet.add(iOpenCountListener)
-        iOpenCountListener.onUpdate(openWindowCount)
+        runMain {
+            iOpenCountListenerSet.add(iOpenCountListener)
+            runCatching { iOpenCountListener.onUpdate(openWindowCount) }
+                .onFailure { iOpenCountListenerSet.remove(iOpenCountListener) }
+        }
     }
 
     override fun unregisterOpenCountListener(iOpenCountListener: IOpenCountListener?) {
-        iOpenCountListenerSet.remove(iOpenCountListener)
+        runMain { iOpenCountListenerSet.remove(iOpenCountListener) }
     }
 
     override fun currentToWindow() {
         runMain {
-            val task = getTopRootTask(0) ?: return@runMain
+            // The always-on-top presentation root is visible too; it is never an app candidate.
+            val task = getTopRootTask(0, windowBackend.managedTaskIds().toSet()) ?: return@runMain
             if (task.baseActivity?.packageName != "com.android.launcher3") {
                 createWindow(StartCmd(taskId = task.taskId))
             }
@@ -561,7 +635,7 @@ object YAMFManager : IYAMFManager.Stub() {
     override fun resetAllWindow() {
         runMain {
             Instances.iStatusBarService.collapsePanels()
-            systemContext.sendBroadcast(Intent(Protocol.ACTION_RESET_ALL_WINDOW))
+            systemContext.sendBroadcast(Intent(Protocol.ACTION_RESET_ALL_WINDOW).setPackage(systemContext.packageName))
         }
     }
 
@@ -589,7 +663,7 @@ object YAMFManager : IYAMFManager.Stub() {
     }
 
     private val OpenInYAMFBroadcastReceiver: BroadcastReceiver.(Context, Intent) -> Unit =
-        { _: Context, intent: Intent ->
+        entryReceiver@ { _: Context, intent: Intent ->
             val taskId = intent.getIntExtra(Protocol.EXTRA_TASK_ID, 0)
             val componentName =
                 intent.getParcelableExtra(Protocol.EXTRA_COMPONENT_NAME, ComponentName::class.java)
@@ -598,14 +672,69 @@ object YAMFManager : IYAMFManager.Stub() {
             val fromDropZone = intent.getBooleanExtra(Protocol.EXTRA_FROM_DROP_ZONE, false)
             val dropX = intent.getIntExtra(Protocol.EXTRA_DROP_X, -1)
             val dropY = intent.getIntExtra(Protocol.EXTRA_DROP_Y, -1)
-            log("reYAMF_debug", "openInYAMF task=$taskId source=$source fromZone=$fromDropZone drop=($dropX,$dropY) component=$componentName")
-            createWindow(StartCmd(componentName, userId, taskId, openAsMini = fromDropZone, dropX = dropX, dropY = dropY))
-
-            // TODO: better way to close recents
-            if (source == Protocol.SOURCE_RECENT) {
-                android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-                    runCatching { windowBackend.injectHomeKey() }
-                }, HOME_INJECT_DELAY_MS)
+            val handoffComplete = intent.getBooleanExtra(Protocol.EXTRA_RECENTS_HANDOFF_COMPLETE, false)
+            val sourceBounds = intent.getParcelableExtra(Protocol.EXTRA_SOURCE_BOUNDS, android.graphics.Rect::class.java)
+            val sourcePackage = intent.getStringExtra(Protocol.EXTRA_SOURCE_PACKAGE)
+            val handoffId = intent.getLongExtra(Protocol.EXTRA_HANDOFF_ID, 0L)
+            val entrySnapshot = runCatching { com.buildsession.betterYAMF.xposed.hook.system.EntrySnapshotTransport.read(intent) }
+                .onFailure { log("reYAMF_EntryV2", "snapshot transfer failed task=$taskId handoff=$handoffId", it) }.getOrNull()
+            if (intent.hasExtra(Protocol.EXTRA_ENTRY_SNAPSHOT_TOKEN) &&
+                (entrySnapshot == null || !fromDropZone || taskId <= 0 || handoffId == 0L || sourcePackage == null ||
+                    !windowBackend.supportsRetainedEntry ||
+                    intent.getIntExtra(Protocol.EXTRA_ENTRY_PROTOCOL, 0) != Protocol.ENTRY_PROTOCOL)) {
+                entrySnapshot?.close()
+                logWarning("reYAMF_EntryV2", "reject entry buffer task=$taskId handoff=$handoffId")
+                if (sourcePackage != null) systemContext.sendBroadcast(Intent(Protocol.ACTION_WINDOW_PRESENTED)
+                    .setPackage(sourcePackage).putExtra(Protocol.EXTRA_TASK_ID, taskId)
+                    .putExtra(Protocol.EXTRA_HANDOFF_ID, handoffId)
+                    .putExtra(Protocol.EXTRA_COMMAND_STATUS, com.buildsession.betterYAMF.window.core.CommandStatus.FAILED.name))
+                return@entryReceiver
+            }
+            log("reYAMF_debug") { "openInYAMF task=$taskId source=$source fromZone=$fromDropZone drop=($dropX,$dropY) component=$componentName" }
+            val startCmd = StartCmd(componentName, userId, taskId, openAsMini = fromDropZone,
+                dropX = dropX, dropY = dropY, sourceBounds = sourceBounds,
+                awaitSourceRelease = fromDropZone && (handoffComplete || entrySnapshot != null),
+                sourcePackage = sourcePackage, handoffId = handoffId, entrySnapshot = entrySnapshot)
+            val proceed = {
+                runCatching { createWindow(startCmd) }.onFailure {
+                    log("reYAMF_EntryV2", "window creation failed task=$taskId handoff=$handoffId", it)
+                    rejectEntry(startCmd)
+                }
+            }
+            if (source == Protocol.SOURCE_RECENT && !handoffComplete && entrySnapshot == null) {
+                // Capability fallback / legacy menu entry: close the source BEFORE adoption,
+                // and observe its transition. Never inject HOME after our animation has begun.
+                windowBackend.injectHomeKey()
+                awaitTaskSurfaceStable(taskId) { stable ->
+                    if (stable) proceed()
+                    else logWarning("reYAMF_debug", "cancel recents entry: task=$taskId still belongs to a system transition")
+                }
+            } else {
+                proceed()
             }
         }
+
+    /**
+     * 等待任务表面静止（投放登场起跑闸）。
+     * 轮询 32ms、上限 [DROP_GATE_TIMEOUT_MS]：超时保留原任务，不在转场未结束时强行认领。
+     */
+    private fun awaitTaskSurfaceStable(
+        taskId: Int,
+        timeoutMs: Long = DROP_GATE_TIMEOUT_MS,
+        onReady: (Boolean) -> Unit
+    ) {
+        val handler = android.os.Handler(android.os.Looper.getMainLooper())
+        val startAt = android.os.SystemClock.uptimeMillis()
+        fun poll() {
+            val stable = runCatching { windowBackend.isTaskSurfaceStable(taskId) }.getOrDefault(true)
+            val elapsed = android.os.SystemClock.uptimeMillis() - startAt
+            if (stable || elapsed >= timeoutMs) {
+                log("reYAMF_debug") { "drop gate: task=$taskId stable=$stable waited=${elapsed}ms" }
+                onReady(stable)
+            } else {
+                handler.postDelayed({ poll() }, DROP_GATE_POLL_MS)
+            }
+        }
+        handler.post { poll() }
+    }
 }

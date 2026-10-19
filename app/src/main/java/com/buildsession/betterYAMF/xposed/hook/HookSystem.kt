@@ -2,7 +2,6 @@ package com.buildsession.betterYAMF.xposed.hook
 
 import android.content.Intent
 import android.content.pm.IPackageManager
-import android.util.Log
 import com.github.kyuubiran.ezxhelper.init.EzXHelperInit
 import com.github.kyuubiran.ezxhelper.utils.findMethod
 import com.github.kyuubiran.ezxhelper.utils.hookAfter
@@ -17,7 +16,6 @@ import com.qauxv.util.Initiator
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.IXposedHookZygoteInit
 import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 import kotlin.concurrent.thread
 
@@ -69,9 +67,7 @@ class HookSystem : IXposedHookZygoteInit, IXposedHookLoadPackage {
             activityManagerServiceSystemReadyHook?.unhook()
             YAMFManager.activityManagerService = it.thisObject
             YAMFManager.systemReady()
-            if (BuildConfig.DEBUG) {
-                XposedBridge.log("$TAG: System ready, reYAMF services initialized.")
-            }
+            log(TAG) { "System ready, reYAMF services initialized." }
             // log(TAG, "system ready")
         }
         // 注：LoS 24 的 checkBroadcastFromSystem 只存在于 BroadcastController（AMS 无此方法，
@@ -85,7 +81,7 @@ class HookSystem : IXposedHookZygoteInit, IXposedHookLoadPackage {
                     it.result = Unit
             }
         }.onFailure {
-            log(TAG, "BroadcastController checkBroadcastFromSystem fail")
+            log(TAG, "BroadcastController checkBroadcastFromSystem failed", it)
         }
     }
 }

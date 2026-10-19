@@ -1,10 +1,13 @@
 package com.buildsession.betterYAMF.xposed.hook.organizer
 
+import android.annotation.SuppressLint
 import android.app.ActivityManager
 import android.content.ComponentName
 import android.content.Intent
 import android.graphics.Rect
 import com.buildsession.betterYAMF.window.backend.WindowBackend
+import com.buildsession.betterYAMF.window.backend.WindowOperation
+import com.buildsession.betterYAMF.window.core.CommandStatus
 import com.buildsession.betterYAMF.window.backend.WindowBackendCallbacks
 import com.buildsession.betterYAMF.xposed.hook.freeform.FreeformBackend
 import com.buildsession.betterYAMF.xposed.hook.system.SystemSignals
@@ -12,6 +15,8 @@ import com.buildsession.betterYAMF.xposed.hook.system.TaskSystemOps
 import com.buildsession.betterYAMF.xposed.services.YAMFManager
 import com.buildsession.betterYAMF.xposed.utils.Instances
 import com.buildsession.betterYAMF.xposed.utils.log
+import com.buildsession.betterYAMF.xposed.utils.logError
+import com.buildsession.betterYAMF.xposed.utils.logWarning
 import de.robv.android.xposed.XposedHelpers
 import java.util.concurrent.ConcurrentHashMap
 
@@ -37,12 +42,50 @@ object SmoothWindowBackend : WindowBackend {
     /** 会话几何缓存：唯一写入者 = 本后端（applyGeometry/settleGeometry 写、release/forget 清）。 */
     private val geometryByTask = ConcurrentHashMap<Int, Rect>()
 
+    /** Reconstructible presentation cache. Transition reassertions must preserve opacity/corners. */
+    data class Appearance(val cornerRadiusPx: Float = 0f, val alpha: Float = 1f)
+    private val appearanceByTask = ConcurrentHashMap<Int, Appearance>()
+    fun appearanceOf(taskId: Int): Appearance = appearanceByTask[taskId] ?: Appearance()
+    private val frameSynchronizedTasks = ConcurrentHashMap.newKeySet<Int>()
+    private val invalidatedPresentations = ConcurrentHashMap.newKeySet<Int>()
+    private val preparations = ConcurrentHashMap<Int, Preparation>()
+    private val mainHandler by lazy { android.os.Handler(android.os.Looper.getMainLooper()) }
+    private val taskCallbacks = TaskCallbackDispatcher { work -> mainHandler.post { work() } }
+    private val visibilityRefresh by lazy {
+        val main = android.os.Handler(android.os.Looper.getMainLooper())
+        TaskVisibilityRefresh({ work -> main.post { work() } }, SmoothTaskOrganizer::currentTaskVisibility) { taskId, visible ->
+            // Visibility callbacks alone are delivered on main and consumed in this same turn.
+            callbacks?.onTaskVisibleChanged(taskId, visible)
+        }
+    }
+    override val supportsRetainedEntry: Boolean
+        get() = SmoothTaskOrganizer.registered && SmoothTaskOrganizer.canStageInitialPresentation &&
+            SmoothTaskOrganizer.launchRootToken() != null
+    fun hasSynchronizedPresentation(taskId: Int): Boolean = frameSynchronizedTasks.contains(taskId)
+
+    /** Coalesced signal, never an independent geometry write beside a View buffer. */
+    fun requestSynchronizedReassert(taskId: Int): Boolean {
+        if (!hasSynchronizedPresentation(taskId)) return false
+        if (invalidatedPresentations.add(taskId)) {
+            taskCallbacks.dispatch(taskId) { callbacks?.onPresentationInvalidated(taskId) }
+        }
+        return true
+    }
+
     /** 供实现层（SmoothTaskOrganizer / FreeformBackend）读取的几何访问器。 */
     fun geometryOf(taskId: Int): Rect? = geometryByTask[taskId]
 
     /** 供实现层清理的几何访问器（任务消失等；幂等）。 */
     fun forgetGeometry(taskId: Int) {
+        taskCallbacks.forget(taskId)
+        FreeformBackend.forgetPresentation(taskId)
+        visibilityRefresh.forget(taskId)
+        SmoothTaskOrganizer.cancelInitialPresentation(taskId)
+        preparations.remove(taskId)?.cancel()
         geometryByTask.remove(taskId)
+        appearanceByTask.remove(taskId)
+        frameSynchronizedTasks.remove(taskId)
+        invalidatedPresentations.remove(taskId)
     }
 
     override fun initialize(callbacks: WindowBackendCallbacks) {
@@ -51,17 +94,39 @@ object SmoothWindowBackend : WindowBackend {
         SmoothTaskOrganizer.init()
     }
 
-    override fun openTask(taskId: Int): Boolean {
+    // Installed exclusively by YAMFManager.systemReady in system_server, using its system-UID
+    // ActivityManager instance; permissions belong to that process, not the module APK manifest.
+    @SuppressLint("MissingPermission")
+    override fun openTask(taskId: Int, initialBounds: Rect?): Boolean {
+        if (taskId <= 0 || SmoothTaskOrganizer.isFloatingRootTask(taskId)) {
+            logWarning(TAG, "refuse application adoption for internal/invalid task=$taskId")
+            return false
+        }
+        taskCallbacks.begin(taskId)
         // 认领 + 置前；不施加任何密度覆盖——小窗不改应用 DPI。
-        val adopted = SmoothTaskOrganizer.adoptTask(taskId)
-        val moveResult = runCatching { Instances.activityManager.moveTaskToFront(taskId, 0) }
-        log(TAG, "openTask task=$taskId adopted=$adopted moveToFront=$moveResult")
+        if (initialBounds != null) {
+            geometryByTask[taskId] = Rect(initialBounds)
+            appearanceByTask[taskId] = Appearance(alpha = 0f)
+        }
+        setTaskFocusable(taskId, true)
+        val adopted = SmoothTaskOrganizer.adoptTask(taskId, initialBounds)
+        // reparent(onTop) + reorder(root,onTop) already resumes the task. A second moveTaskToFront
+        // starts an unrelated TO_FRONT/snapshot transition after recents has just finished.
+        val moved = if (adopted && initialBounds == null) runCatching {
+            Instances.activityManager.moveTaskToFront(taskId, 0)
+        }.isSuccess else adopted
+        log(TAG) { "openTask task=$taskId adopted=$adopted staged=${initialBounds != null} moved=$moved" }
         // 用户主动开窗：恢复可聚焦（可交互）
         setTaskFocusable(taskId, true)
         return adopted
     }
 
     override fun releaseTask(taskId: Int, toFront: Boolean): Boolean {
+        // An invalid request must not turn our shared presentation root into fullscreen.
+        if (taskId <= 0 || SmoothTaskOrganizer.isFloatingRootTask(taskId)) {
+            logWarning(TAG, "refuse application release for internal/invalid task=$taskId")
+            return false
+        }
         // 会话几何先清：无论走 organizer 释放还是旧路径兜底，几何缓存都不应残留
         forgetGeometry(taskId)
 
@@ -93,16 +158,13 @@ object SmoothWindowBackend : WindowBackend {
             // 复位浮窗焦点开关
             setTaskFocusable(taskId, true)
 
-            // 已是全屏的任务（如全屏按钮路径的二次调用）不再重发事务
-            if (TaskSystemOps.windowingMode(taskInfo) == WINDOWING_MODE_FULLSCREEN) {
-                return true
-            }
-
             val classLoader = Instances.systemContext.classLoader
             val wctClass = classLoader.loadClass("android.window.WindowContainerTransaction")
             val wct = XposedHelpers.newInstance(wctClass)
             val token = XposedHelpers.getObjectField(taskInfo, "token")
             XposedHelpers.callMethod(wct, "setWindowingMode", token, WINDOWING_MODE_FULLSCREEN)
+            // Clear the session override even if an external launch already selected fullscreen.
+            XposedHelpers.callMethod(wct, "setBounds", token, Rect())
 
             val windowOrganizerController =
                 XposedHelpers.callMethod(Instances.activityTaskManager, "getWindowOrganizerController")
@@ -122,6 +184,126 @@ object SmoothWindowBackend : WindowBackend {
         }
     }
 
+    override fun preparePresentation(
+        taskId: Int, normalBounds: Rect, onComplete: (CommandStatus) -> Unit
+    ): WindowOperation {
+        val operation = Preparation(taskId, Rect(normalBounds), onComplete)
+        preparations.put(taskId, operation)?.cancel()
+        operation.start()
+        return operation
+    }
+
+    /** Platform waiters belong to one invocation, never merely to a reusable task id. */
+    private class Preparation(
+        private val taskId: Int,
+        private val bounds: Rect,
+        private val onComplete: (CommandStatus) -> Unit
+    ) : WindowOperation {
+        private val handler = android.os.Handler(android.os.Looper.getMainLooper())
+        private var completed = false
+        private var stage = "viewport commit"
+        private var frameCallback: android.view.Choreographer.FrameCallback? = null
+        private val timeout = Runnable {
+            if (!completed) {
+                logError(TAG, "prepare timeout task=$taskId stage=$stage")
+                finish(CommandStatus.FAILED)
+            }
+        }
+
+        fun start() {
+            if (!SmoothTaskOrganizer.isLeashManaged(taskId)) {
+                finish(CommandStatus.FAILED)
+                return
+            }
+            geometryByTask[taskId] = Rect(bounds)
+            appearanceByTask[taskId] = Appearance(alpha = 0f)
+            SmoothTaskOrganizer.applyLeash(taskId, bounds)
+            // LoS BLASTSyncEngine's default sync timeout is a failure bound, never a start delay.
+            handler.postDelayed(timeout, 5000L)
+            if (!SmoothTaskOrganizer.settleGeometry(taskId, bounds) {
+                    handler.post { awaitStableSurface() }
+                }) finish(CommandStatus.FAILED)
+        }
+
+        private fun awaitStableSurface() {
+            if (completed || preparations[taskId] !== this) return
+            stage = "system transition"
+            if (!SmoothTaskOrganizer.isLeashManaged(taskId)) finish(CommandStatus.FAILED)
+            else if (SmoothTaskOrganizer.isTaskSurfaceStable(taskId)) finish(CommandStatus.DONE)
+            else {
+                val callback = android.view.Choreographer.FrameCallback {
+                    frameCallback = null
+                    awaitStableSurface()
+                }
+                frameCallback = callback
+                android.view.Choreographer.getInstance().postFrameCallback(callback)
+            }
+        }
+
+        private fun finish(status: CommandStatus) {
+            if (completed) return
+            completed = true
+            handler.removeCallbacksAndMessages(null)
+            frameCallback?.let { android.view.Choreographer.getInstance().removeFrameCallback(it) }
+            frameCallback = null
+            val owned = preparations.remove(taskId, this)
+            val result = if (!owned) CommandStatus.SUPERSEDED
+                else if (status == CommandStatus.DONE &&
+                    (!SmoothTaskOrganizer.isLeashManaged(taskId) || !geometryByTask.containsKey(taskId))) CommandStatus.FAILED
+                else status
+            if (result == CommandStatus.DONE) {
+                SmoothTaskOrganizer.cancelInitialPresentation(taskId)
+                frameSynchronizedTasks.add(taskId)
+            }
+            // Report outside an organizer call or the native commit callback's stack.
+            handler.post { onComplete(result) }
+        }
+
+        override fun cancel() {
+            if (android.os.Looper.myLooper() == handler.looper) finish(CommandStatus.SUPERSEDED)
+            else handler.post { finish(CommandStatus.SUPERSEDED) }
+        }
+    }
+
+    override fun writePresentationInto(
+        tx: android.view.SurfaceControl.Transaction,
+        taskId: Int,
+        physicalBounds: Rect,
+        cornerRadiusPx: Float,
+        alpha: Float
+    ): Boolean {
+        if (!SmoothTaskOrganizer.isLeashManaged(taskId)) return false
+        invalidatedPresentations.remove(taskId)
+        geometryByTask[taskId] = Rect(physicalBounds)
+        appearanceByTask[taskId] = Appearance(cornerRadiusPx, alpha.coerceIn(0f, 1f))
+        return SmoothTaskOrganizer.writeLeashTransformInto(tx, taskId, physicalBounds)
+    }
+
+    override fun writeGeometryInto(
+        tx: android.view.SurfaceControl.Transaction,
+        taskId: Int,
+        physicalBounds: Rect
+    ) {
+        geometryByTask[taskId] = physicalBounds
+        if (SmoothTaskOrganizer.isLeashManaged(taskId)) {
+            SmoothTaskOrganizer.writeLeashTransformInto(tx, taskId, physicalBounds)
+        } else {
+            // 降级（未接管任务）：与 applyGeometry 同语义，兼容路径自行落一次变换
+            FreeformBackend.reassertTaskById(taskId)
+        }
+    }
+
+    override fun createShellContainer(taskId: Int, name: String): android.view.SurfaceControl? =
+        SmoothTaskOrganizer.createShellContainer(taskId, name)
+
+    override fun raiseShellContainer(taskId: Int, container: android.view.SurfaceControl) {
+        SmoothTaskOrganizer.raiseShellContainer(taskId, container)
+    }
+
+    override fun destroyShellContainer(container: android.view.SurfaceControl) {
+        SmoothTaskOrganizer.destroyShellContainer(container)
+    }
+
     override fun settleGeometry(taskId: Int, contentBox: Rect) {
         geometryByTask[taskId] = contentBox
         if (SmoothTaskOrganizer.isLeashManaged(taskId)) {
@@ -135,6 +317,7 @@ object SmoothWindowBackend : WindowBackend {
     }
 
     override fun reapplyGeometry(taskId: Int) {
+        if (requestSynchronizedReassert(taskId)) return
         val bounds = geometryByTask[taskId] ?: return
         applyGeometry(taskId, bounds)
     }
@@ -148,17 +331,20 @@ object SmoothWindowBackend : WindowBackend {
             // 缓存可能已被释放路径清空（releaseTaskTransforms 会移除弱引用）→ 现场解析兜底，
             // 否则焦点恢复会静默跳过（曾导致"回全屏后 launcher 抢前台"）。
             val task = FreeformBackend.taskById(taskId) ?: resolveTaskObject(taskId) ?: return
-            if (focusable) {
-                XposedHelpers.callMethod(task, "setFocusable", true)
-            } else {
-                val wasFocused = runCatching { XposedHelpers.callMethod(task, "isFocused") as? Boolean }
-                    .getOrNull() ?: false
-                XposedHelpers.callMethod(task, "setFocusable", false)
-                if (wasFocused) {
-                    runCatching {
-                        XposedHelpers.callMethod(task, "adjustFocusToNextFocusableTask", "betterYAMF-float")
+            val wm = XposedHelpers.getObjectField(task, "mWmService")
+            synchronized(XposedHelpers.getObjectField(wm, "mGlobalLock")) {
+                if (focusable) {
+                    XposedHelpers.callMethod(task, "setFocusable", true)
+                } else {
+                    val wasFocused = runCatching { XposedHelpers.callMethod(task, "isFocused") as? Boolean }
+                        .getOrNull() ?: false
+                    XposedHelpers.callMethod(task, "setFocusable", false)
+                    if (wasFocused) {
+                        runCatching {
+                            XposedHelpers.callMethod(task, "adjustFocusToNextFocusableTask", "betterYAMF-float")
+                        }
+                        log(TAG) { "task=$taskId demoted focus (float on top)" }
                     }
-                    log(TAG, "task=$taskId demoted focus (float on top)")
                 }
             }
         }.onFailure {
@@ -183,6 +369,7 @@ object SmoothWindowBackend : WindowBackend {
         XposedHelpers.callMethod(wc, "asTask")
     }.getOrNull()
 
+    @SuppressLint("MissingPermission") // Same system_server-only execution boundary as openTask.
     override fun bringTaskToFront(taskId: Int): Boolean {
         // 被接管的窗口任务位于悬浮根内部：置前 = 根内子任务顺序 + 承载根 reorder 到显示最上层。
         // 只对子任务 moveTaskToFront 不会把根抬到 home/其他应用之上（实测 HOME 后"内容消失"的根因）。
@@ -273,6 +460,9 @@ object SmoothWindowBackend : WindowBackend {
         SystemSignals.suppressRecentsGestureFor(durationMs)
     }
 
+    override fun isTaskSurfaceStable(taskId: Int): Boolean =
+        SmoothTaskOrganizer.isTaskSurfaceStable(taskId)
+
     override fun recentsGestureSuppressUntilMs(): Long = SystemSignals.recentsGestureSuppressUntilMs
 
     override fun injectHomeKey(): Boolean = TaskSystemOps.injectHomeKey()
@@ -280,15 +470,17 @@ object SmoothWindowBackend : WindowBackend {
     // === 后端 → 宿主回灌（由 SmoothTaskOrganizer 在系统回调内调用） ===
 
     fun notifyTaskAdopted(taskId: Int) {
-        callbacks?.onTaskAdopted(taskId)
+        taskCallbacks.dispatch(taskId) {
+            if (SmoothTaskOrganizer.isLeashManaged(taskId)) callbacks?.onTaskAdopted(taskId)
+        }
     }
 
     fun notifyTaskVanished(taskId: Int) {
-        callbacks?.onTaskVanished(taskId)
+        taskCallbacks.dispatch(taskId) { callbacks?.onTaskVanished(taskId) }
     }
 
     /** 任务可见性翻转回灌（组织者 onTaskInfoChanged 驱动；见接口注释）。 */
     fun notifyTaskVisible(taskId: Int, visible: Boolean) {
-        callbacks?.onTaskVisibleChanged(taskId, visible)
+        visibilityRefresh.request(taskId)
     }
 }

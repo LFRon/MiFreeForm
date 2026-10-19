@@ -234,25 +234,55 @@ class WindowShellControllerTest {
     }
 
     @Test
-    fun barCancelBehavesLikeUpButNeverRaises() {
+    fun barCancelRestoresPreviewWithoutClosingOrRaising() {
         val c = controller(top = false)
         c.feed(press(RegionId.BAR_BOTTOM, 500f, 1900f))
         c.feed(move(RegionId.BAR_BOTTOM, 500f, 1738f))
         assertEquals(
-            listOf(WindowCommand.RequestClose(1, CloseOrigin.DRAG_UP_BAR)),
+            listOf(WindowCommand.ClearVerticalDragPreview(1)),
             c.feed(cancel(RegionId.BAR_BOTTOM, 500f, 1738f))
         )
+        assertFalse(c.snapshot().dragging)
     }
 
     @Test
-    fun bodyCancelBehavesLikeUpButNeverRaises() {
+    fun bodyCancelDiscardsHoveredMiniTargetWithoutRaising() {
         val c = controller(top = false)
         c.feed(press(RegionId.BODY_MASK, 10f, 10f))
         c.feed(move(RegionId.BODY_MASK, 10f, 10f))
         val released = c.feed(cancel(RegionId.BODY_MASK, 10f, 10f))
-        assertEquals(DropKind.CORNER_TL, released.filterIsInstance<WindowCommand.EnterMini>().single().corner)
-        assertEquals(WindowCommand.DropZoneHide(1), released.last())
-        assertEquals(ShellMode.MINI, c.snapshot().mode)
+        assertEquals(listOf(WindowCommand.ClampToScreen(1, true), WindowCommand.DropZoneHide(1)), released)
+        assertEquals(ShellMode.NORMAL, c.snapshot().mode)
+        assertFalse(c.snapshot().dragging)
+    }
+
+    @Test
+    fun downwardBarCancelDoesNotEnterFullscreen() {
+        val c = controller()
+        c.feed(press(RegionId.BAR_BOTTOM, 500f, 1900f))
+        c.feed(move(RegionId.BAR_BOTTOM, 500f, 2200f))
+        assertEquals(listOf(WindowCommand.ClearVerticalDragPreview(1)),
+            c.feed(cancel(RegionId.BAR_BOTTOM, 500f, 2200f)))
+    }
+
+    @Test
+    fun cancellationBreaksAnEarlierDoubleTapCandidate() {
+        val c = controller()
+        c.feed(press(RegionId.BAR_BOTTOM, 500f, 1900f, timeMs = 1000L))
+        c.feed(up(RegionId.BAR_BOTTOM, 500f, 1900f, timeMs = 1010L))
+        c.feed(press(RegionId.BAR_BOTTOM, 500f, 1900f, timeMs = 1100L))
+        c.feed(cancel(RegionId.BAR_BOTTOM, 500f, 1900f, timeMs = 1110L))
+        c.feed(press(RegionId.BAR_BOTTOM, 500f, 1900f, timeMs = 1200L))
+        assertEquals(listOf(WindowCommand.ClearVerticalDragPreview(1)),
+            c.feed(up(RegionId.BAR_BOTTOM, 500f, 1900f, timeMs = 1210L)))
+    }
+
+    @Test
+    fun firstBarTapNearClockOriginIsNotADoubleTap() {
+        val c = controller()
+        c.feed(press(RegionId.BAR_BOTTOM, 500f, 1900f, timeMs = 10L))
+        assertEquals(listOf(WindowCommand.ClearVerticalDragPreview(1)),
+            c.feed(up(RegionId.BAR_BOTTOM, 500f, 1900f, timeMs = 20L)))
     }
 
     @Test

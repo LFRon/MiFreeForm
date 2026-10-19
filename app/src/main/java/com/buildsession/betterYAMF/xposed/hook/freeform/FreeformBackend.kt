@@ -9,9 +9,11 @@ import com.buildsession.betterYAMF.BuildConfig
 import com.buildsession.betterYAMF.common.ipc.Protocol
 import com.buildsession.betterYAMF.xposed.services.YAMFManager
 import com.buildsession.betterYAMF.xposed.hook.organizer.SmoothWindowBackend
+import com.buildsession.betterYAMF.xposed.hook.organizer.TaskCallbackDispatcher
 import com.buildsession.betterYAMF.xposed.hook.system.SystemSignals
 import com.buildsession.betterYAMF.xposed.utils.Instances
 import com.buildsession.betterYAMF.xposed.utils.log
+import com.buildsession.betterYAMF.xposed.utils.logWarning
 import com.buildsession.betterYAMF.window.session.WindowSessions
 import com.github.kyuubiran.ezxhelper.utils.*
 import de.robv.android.xposed.XC_MethodHook
@@ -24,6 +26,7 @@ object FreeformBackend {
     private const val WINDOWING_MODE_FREEFORM = 5
 
     private val diagnostics = BuildConfig.DEBUG
+    private val platformPolicy by lazy { FreeformPolicies.forSdk(Build.VERSION.SDK_INT) }
     private val lastLogByTask = ConcurrentHashMap<Int, String>()
     private val snapshotLogged =
         java.util.Collections.newSetFromMap(ConcurrentHashMap<Int, Boolean>())
@@ -34,7 +37,7 @@ object FreeformBackend {
 
     fun reassertTaskById(taskId: Int) {
         val task = taskRefs[taskId]?.get() ?: return
-        val policy = FreeformPolicies.forSdk(Build.VERSION.SDK_INT)
+        val policy = platformPolicy
         applyTaskTransform(task, policy.clearTaskCrop)
     }
 
@@ -78,6 +81,9 @@ object FreeformBackend {
     // 过渡/重排期间的变换跳过会留下“欠账”：过渡没有可靠的结束锚点，
     // 这里自调度到主线程重试，直到稳态（尺寸一致）真实施加一次为止。
     private val reassertHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val reassertCallbacks = TaskCallbackDispatcher { work ->
+        reassertHandler.postDelayed({ work() }, REASSERT_DELAY_MS)
+    }
     private val pendingReassertTasks = ConcurrentHashMap<Int, Any>()
     private val pendingReassertAttempts = ConcurrentHashMap<Int, Int>()
     private const val REASSERT_DELAY_MS = 250L
@@ -88,12 +94,21 @@ object FreeformBackend {
         if (taskId < 0) return
         if (pendingReassertTasks.putIfAbsent(taskId, task) != null) return
         pendingReassertAttempts[taskId] = 0
-        reassertHandler.postDelayed({ runPendingReassert(taskId) }, REASSERT_DELAY_MS)
+        reassertCallbacks.begin(taskId)
+        reassertCallbacks.dispatch(taskId) { runPendingReassert(taskId) }
     }
 
     private fun clearPendingReassert(taskId: Int) {
+        reassertCallbacks.forget(taskId)
         pendingReassertTasks.remove(taskId)
         pendingReassertAttempts.remove(taskId)
+    }
+
+    /** A released presentation cannot leave delayed work targeting a later session. */
+    fun forgetPresentation(taskId: Int) {
+        clearPendingReassert(taskId)
+        lastLogByTask.remove(taskId)
+        snapshotLogged.remove(taskId)
     }
 
     private fun runPendingReassert(taskId: Int) {
@@ -104,19 +119,19 @@ object FreeformBackend {
         }
         val attempts = (pendingReassertAttempts[taskId] ?: 0) + 1
         if (attempts > REASSERT_MAX_ATTEMPTS) {
-            logOnce(taskId, "reassert give-up task=$taskId attempts=$attempts")
+            logWarning(TAG, "reassert give-up task=$taskId attempts=$attempts")
             clearPendingReassert(taskId)
             return
         }
         pendingReassertAttempts[taskId] = attempts
         if (isTaskAnimating(task)) {
-            reassertHandler.postDelayed({ runPendingReassert(taskId) }, REASSERT_DELAY_MS)
+            reassertCallbacks.dispatch(taskId) { runPendingReassert(taskId) }
             return
         }
-        val policy = FreeformPolicies.forSdk(Build.VERSION.SDK_INT)
+        val policy = platformPolicy
         applyTaskTransform(task, policy.clearTaskCrop)
         if (pendingReassertTasks.containsKey(taskId)) {
-            reassertHandler.postDelayed({ runPendingReassert(taskId) }, REASSERT_DELAY_MS)
+            reassertCallbacks.dispatch(taskId) { runPendingReassert(taskId) }
         }
     }
 
@@ -137,6 +152,14 @@ object FreeformBackend {
         runCatching { XposedHelpers.callMethod(task, "isAnimating") as Boolean }.getOrDefault(false)
 
     private fun reassertTaskTransform(task: Any, clearCrop: Boolean, source: String) {
+        val taskId = runCatching { XposedHelpers.getIntField(task, "mTaskId") }.getOrDefault(-1)
+        if (SmoothWindowBackend.hasSynchronizedPresentation(taskId)) {
+            // prepareSurfaces is called for every traversal. It must neither write ahead of the
+            // shell buffer nor create an endless invalidate -> draw -> prepareSurfaces loop.
+            if (source != "prepareSurfaces") SmoothWindowBackend.requestSynchronizedReassert(taskId)
+            clearPendingReassert(taskId)
+            return
+        }
         if (isTaskAnimating(task)) {
             schedulePendingReassert(task)
             logOnceTask(task, "transform skip source=$source reason=animating")
@@ -146,9 +169,9 @@ object FreeformBackend {
     }
 
     fun init(classLoader: ClassLoader) {
-        val policy = FreeformPolicies.forSdk(Build.VERSION.SDK_INT)
+        val policy = platformPolicy
         if (diagnostics) {
-            log(TAG, "init with policy: ${policy.displayName}")
+            log(TAG) { "init with policy: ${policy.displayName}" }
         }
         runCatching { hookRelaunch(classLoader) }.onFailure { log(TAG, "hookRelaunch failed", it) }
         runCatching { hookAdditionalRelaunchPoints(classLoader) }.onFailure { log(TAG, "hookAdditionalRelaunchPoints failed", it) }
@@ -178,7 +201,7 @@ object FreeformBackend {
         )
         val cls = candidates.firstNotNullOfOrNull { runCatching { classLoader.loadClass(it) }.getOrNull() }
         if (cls == null) {
-            log(TAG, "PointerEventDispatcher not found, skip touch tracker")
+            logWarning(TAG, "PointerEventDispatcher not found, skip touch tracker")
             return
         }
         // ⚠ 历史 bug：旧实现钩 `onPointerEvent`——该名字是**监听器接口**的方法（由 dispatcher
@@ -200,7 +223,7 @@ object FreeformBackend {
             }
         }
         if (diagnostics) {
-            log(TAG, "global touch tracker installed on ${cls.name}")
+            log(TAG) { "global touch tracker installed on ${cls.name}" }
         }
     }
 
@@ -215,7 +238,7 @@ object FreeformBackend {
         val sinkClass = runCatching {
             classLoader.loadClass("com.android.server.wm.ActivityRecordInputSink")
         }.getOrNull() ?: run {
-            log(TAG, "ActivityRecordInputSink class missing, skip sink defang hook")
+            logWarning(TAG, "ActivityRecordInputSink class missing, skip sink defang hook")
             return
         }
         val notTouchable = runCatching {
@@ -246,7 +269,7 @@ object FreeformBackend {
             }
         }
         if (diagnostics) {
-            log(TAG, "input sink defang installed (getInputWindowHandleWrapper, NOT_TOUCHABLE=$notTouchable)")
+            log(TAG) { "input sink defang installed (getInputWindowHandleWrapper, NOT_TOUCHABLE=$notTouchable)" }
         }
     }
 
@@ -258,7 +281,7 @@ object FreeformBackend {
      */
     private fun hookTransitionParticipation(classLoader: ClassLoader) {
         val transitionClass = runCatching { classLoader.loadClass("com.android.server.wm.Transition") }.getOrNull() ?: run {
-            log(TAG, "Transition class missing, skip participation hook")
+            logWarning(TAG, "Transition class missing, skip participation hook")
             return
         }
         findMethod(transitionClass) {
@@ -267,7 +290,7 @@ object FreeformBackend {
             runCatching {
                 val transaction = param.args[1] as? SurfaceControl.Transaction ?: return@runCatching
                 val participants = XposedHelpers.getObjectField(param.thisObject, "mParticipants") as? Collection<*> ?: return@runCatching
-                val policy = FreeformPolicies.forSdk(Build.VERSION.SDK_INT)
+                val policy = platformPolicy
                 participants.forEach { wc ->
                     if (wc == null) return@forEach
                     val task = runCatching { XposedHelpers.callMethod(wc, "asTask") }.getOrNull() ?: return@forEach
@@ -341,7 +364,7 @@ object FreeformBackend {
             }
         }
         if (diagnostics) {
-            log(TAG, "transition participation installed (onTransactionReady/finish)")
+            log(TAG) { "transition participation installed (onTransactionReady/finish)" }
         }
     }
 
@@ -446,7 +469,7 @@ object FreeformBackend {
                     XposedBridge.hookMethod(method, object : XC_MethodHook() {
                         override fun beforeHookedMethod(param: MethodHookParam) {
                             if (shouldForcePreventRelaunch(param.thisObject)) {
-                                log(TAG, "Suppressing relaunchActivityLocked for ${param.thisObject}")
+                                log(TAG) { "Suppressing relaunchActivityLocked for ${param.thisObject}" }
                                 param.result = null // Skip original method
                             }
                         }
@@ -494,7 +517,7 @@ object FreeformBackend {
         }
 
         if (diagnostics) {
-            log(TAG, "reassert anchors installed (clearCrop=${policy.clearTaskCrop}, file=Task)")
+            log(TAG) { "reassert anchors installed (clearCrop=${policy.clearTaskCrop}, file=Task)" }
         }
     }
 
@@ -503,6 +526,7 @@ object FreeformBackend {
         if (taskId >= 0 &&
             com.buildsession.betterYAMF.xposed.hook.organizer.SmoothTaskOrganizer.isLeashManaged(taskId)
         ) {
+            clearPendingReassert(taskId)
             // leash 归 organizer：稳态锚点（配置变更/表面重置等）只重施加 leash 变换；
             // 动画进行中跳过（过渡结束有专门的 finish 钩子做权威重施加）。
             if (!isTaskAnimating(task)) {
@@ -569,7 +593,7 @@ object FreeformBackend {
             val requested = runCatching {
                 XposedHelpers.callMethod(task, "getRequestedOverrideBounds") as Rect
             }.getOrNull()
-            log(TAG, "transform context task=$taskId configBounds=$spoofedBounds requested=$requested physical=$physicalBounds")
+            log(TAG) { "transform context task=$taskId configBounds=$spoofedBounds requested=$requested physical=$physicalBounds" }
         }
         logOnce(taskId, "transform task=$taskId scale=(${transform.scaleX},${transform.scaleY}) spoofed=$spoofedBounds physical=$physicalBounds")
 
@@ -707,7 +731,7 @@ object FreeformBackend {
             log(TAG, "defang input sink failed for $component", it)
         }
         if (defangedSinks.add(component)) {
-            log(TAG, "defanged input sink for $component")
+            log(TAG) { "defanged input sink for $component" }
         }
         return true
     }

@@ -21,6 +21,14 @@ object Protocol {
     const val ACTION_QUERY_MANAGED_TASKS = "com.buildsession.betterYAMF.action.QUERY_MANAGED_TASKS"
     const val ACTION_DUMP_GEOMETRY = "com.buildsession.betterYAMF.action.DUMP_GEOMETRY"
     const val ACTION_RESET_ALL_WINDOW = "com.buildsession.betterYAMF.ui.window.action.ACTION_RESET_ALL_WINDOW"
+    const val ACTION_WINDOW_PRESENTED = "com.buildsession.betterYAMF.action.WINDOW_PRESENTED"
+    const val ACTION_SOURCE_RELEASED = "com.buildsession.betterYAMF.action.SOURCE_RELEASED"
+    const val ACTION_CANCEL_RECENTS_ENTRY = "com.buildsession.betterYAMF.action.CANCEL_RECENTS_ENTRY"
+    const val ACTION_QUERY_ENTRY_CAPABILITIES = "com.buildsession.betterYAMF.action.QUERY_ENTRY_CAPABILITIES"
+    const val ACTION_ENTRY_CAPABILITIES = "com.buildsession.betterYAMF.action.ENTRY_CAPABILITIES"
+    const val EXTRA_ENTRY_PROTOCOL = "entryProtocol"
+    const val EXTRA_ENTRY_SNAPSHOT_TOKEN = "entrySnapshotToken"
+    const val ENTRY_PROTOCOL = 2
 
     // —— extras ——
     const val EXTRA_COMPONENT_NAME = "componentName"
@@ -31,6 +39,11 @@ object Protocol {
     const val EXTRA_FROM_DROP_ZONE = "fromDropZone"
     const val EXTRA_DROP_X = "dropX"
     const val EXTRA_DROP_Y = "dropY"
+    const val EXTRA_SOURCE_BOUNDS = "sourceBounds"
+    const val EXTRA_RECENTS_HANDOFF_COMPLETE = "recentsHandoffComplete"
+    const val EXTRA_SOURCE_PACKAGE = "sourcePackage"
+    const val EXTRA_HANDOFF_ID = "handoffId"
+    const val EXTRA_COMMAND_STATUS = "commandStatus"
     const val EXTRA_MANAGED_TASK_IDS = "managedTaskIds"
     const val EXTRA_HOOK_RECENT = "hookRecent"
     const val EXTRA_HOOK_TASKBAR = "hookTaskbar"

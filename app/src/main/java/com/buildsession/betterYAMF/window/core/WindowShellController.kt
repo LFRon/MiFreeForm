@@ -17,7 +17,7 @@ class WindowShellController(
     private var pressX = 0f
     private var pressY = 0f
     private var dropActive: DropKind? = null
-    private var lastBarTapMs = 0L
+    private var lastBarTapMs: Long? = null
     /** 闭环（不变量 2）：模式迁移命令的指令计数与未决登记。 */
     private var nextCommandId = 1L
     private var pendingMiniCommandId = 0L
@@ -154,7 +154,7 @@ class WindowShellController(
         raiseIfNeeded(out)
         when (event.region) {
             RegionId.BODY_MASK, RegionId.HANDLE -> decideDrop(out)
-            RegionId.BAR_BOTTOM, RegionId.BAR_SIDE -> decideBarRelease(out, event, tapEligible = true)
+            RegionId.BAR_BOTTOM, RegionId.BAR_SIDE -> decideBarRelease(out, event)
             RegionId.RESIZE_HANDLE -> {
                 out += WindowCommand.ResizePreviewCommit(windowId)
                 pressedRegion = null
@@ -166,17 +166,20 @@ class WindowShellController(
 
     private fun onCancel(event: WindowInputEvent.Cancel): List<WindowCommand> {
         if (event.region != pressedRegion) return emptyList()
-        val out = mutableListOf<WindowCommand>()
-        when (event.region) {
-            RegionId.BODY_MASK, RegionId.HANDLE -> decideDrop(out)
-            RegionId.BAR_BOTTOM, RegionId.BAR_SIDE -> decideBarRelease(out, event, tapEligible = false)
-            RegionId.RESIZE_HANDLE -> {
-                out += WindowCommand.ResizePreviewCommit(windowId)
-                pressedRegion = null
-            }
-            else -> pressedRegion = null
+        // LoS MotionEvent ACTION_CANCEL aborts the gesture; it must not commit close/fullscreen
+        // or a hovered mini target. Keep already-visible drag/resize geometry safely in bounds.
+        pressedRegion = null
+        dropActive = null
+        lastBarTapMs = null
+        return when (event.region) {
+            RegionId.BODY_MASK, RegionId.HANDLE -> listOf(
+                WindowCommand.ClampToScreen(windowId, animated = true),
+                WindowCommand.DropZoneHide(windowId)
+            )
+            RegionId.BAR_BOTTOM, RegionId.BAR_SIDE -> listOf(WindowCommand.ClearVerticalDragPreview(windowId))
+            RegionId.RESIZE_HANDLE -> listOf(WindowCommand.ResizePreviewCommit(windowId))
+            else -> emptyList()
         }
-        return out
     }
 
     private fun decideDrop(out: MutableList<WindowCommand>) {
@@ -193,14 +196,13 @@ class WindowShellController(
     }
 
     /**
-     * 栏释放判定。[tapEligible]=false（Cancel 打断）绝不计数点按。
+     * 栏正常释放判定；Cancel 由 onCancel 单独恢复预览，不进入提交路径。
      * 栏点按（双击关闭）由 Press→Up 位移判定：宿主点击回调被 OnTouchListener 吞掉
      * （View.dispatchTouchEvent 语义），判定收归核心；跨栏共享计时。
      */
     private fun decideBarRelease(
         out: MutableList<WindowCommand>,
-        event: WindowInputEvent.Pointer,
-        tapEligible: Boolean
+        event: WindowInputEvent.Pointer
     ) {
         val threshold = config.verticalDragThresholdDp * registration.density
         val slop = config.barTapSlopDp * registration.density
@@ -211,8 +213,10 @@ class WindowShellController(
             diffY > threshold -> out += WindowCommand.RequestFullscreen(windowId, FullscreenOrigin.DRAG_DOWN_BAR)
             else -> {
                 out += WindowCommand.ClearVerticalDragPreview(windowId)
-                if (tapEligible && abs(diffY) <= slop && abs(diffX) <= slop) {
-                    if (event.timeMs - lastBarTapMs < config.doubleTapTimeoutMs) {
+                if (abs(diffY) <= slop && abs(diffX) <= slop) {
+                    val previous = lastBarTapMs
+                    if (previous != null && event.timeMs >= previous &&
+                        event.timeMs - previous < config.doubleTapTimeoutMs) {
                         out += WindowCommand.RequestClose(windowId, CloseOrigin.DOUBLE_TAP_BAR)
                     }
                     lastBarTapMs = event.timeMs

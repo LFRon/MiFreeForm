@@ -23,8 +23,8 @@ class AnimTimingPolicyTest {
     }
 
     @Test
-    fun `基准可覆盖_投放登场用 500ms`() {
-        assertEquals(500L, AnimTimingPolicy.resolveDuration(5100f, 1f, baseMs = DropEntryPolicy.DURATION_BASE_MS))
+    fun `基准可覆盖_自定义基准优先于默认`() {
+        assertEquals(500L, AnimTimingPolicy.resolveDuration(5100f, 1f, baseMs = 500L))
     }
 
     @Test

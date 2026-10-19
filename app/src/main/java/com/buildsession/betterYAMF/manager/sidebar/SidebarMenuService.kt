@@ -7,8 +7,7 @@ import android.graphics.Color
 import android.graphics.PixelFormat
 import android.hardware.display.DisplayManager
 import android.os.IBinder
-import android.util.Log
-import com.buildsession.betterYAMF.BuildConfig
+import com.buildsession.betterYAMF.common.logging.AppLog
 import android.view.Display
 import android.view.Gravity
 import android.view.LayoutInflater
@@ -193,7 +192,7 @@ class SidebarMenuService() : LifecycleService() {
                 windowManager.removeView(binding.root)
                 stopSelf()
             } catch (e: Exception) {
-                if (BuildConfig.DEBUG) Log.d("reYAMF", "Sidebar killed")
+                AppLog.debug("reYAMF") { "Sidebar killed" }
             }
             setServiceState(this, ServiceState.STOPPED)
         }
@@ -336,7 +335,7 @@ class SidebarMenuService() : LifecycleService() {
             stopSelf()
             SidebarLauncher.start(this)
         } catch (e: Exception) {
-            if (BuildConfig.DEBUG) Log.d("reYAMF", "Sidebar killed")
+            AppLog.debug("reYAMF") { "Sidebar killed" }
         }
         setServiceState(this, ServiceState.STOPPED)
     }

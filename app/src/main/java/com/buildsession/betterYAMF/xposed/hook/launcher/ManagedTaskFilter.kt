@@ -6,6 +6,8 @@ import android.content.Intent
 import android.content.IntentFilter
 import com.buildsession.betterYAMF.common.ipc.Protocol
 import com.buildsession.betterYAMF.xposed.utils.log
+import com.buildsession.betterYAMF.xposed.utils.logWarning
+import com.buildsession.betterYAMF.xposed.utils.TRUSTED_SENDER_PERMISSION
 import com.github.kyuubiran.ezxhelper.utils.findMethod
 import com.github.kyuubiran.ezxhelper.utils.hookAfter
 import com.github.kyuubiran.ezxhelper.utils.hookBefore
@@ -43,7 +45,7 @@ object ManagedTaskFilter {
             val ids = intent.getIntArrayExtra(Protocol.EXTRA_MANAGED_TASK_IDS) ?: return
             managedTaskIds.clear()
             ids.forEach { managedTaskIds.add(it) }
-            log(TAG, "managed tasks updated: [${ids.joinToString()}]")
+            log(TAG) { "managed tasks updated: [${ids.joinToString()}]" }
         }
     }
 
@@ -54,12 +56,14 @@ object ManagedTaskFilter {
                 context.registerReceiver(
                     receiver,
                     IntentFilter(Protocol.ACTION_MANAGED_TASKS),
+                    TRUSTED_SENDER_PERMISSION,
+                    null,
                     Context.RECEIVER_EXPORTED
                 )
                 receiverRegistered = true
             }
             context.sendBroadcast(Intent(Protocol.ACTION_QUERY_MANAGED_TASKS))
-            log(TAG, "managed tasks receiver registered")
+            log(TAG) { "managed tasks receiver registered" }
         }.onFailure { log(TAG, "managed tasks receiver setup failed", it) }
     }
 
@@ -69,7 +73,7 @@ object ManagedTaskFilter {
             classLoader.loadClass("com.android.quickstep.TopTaskTracker")
         }.getOrNull()
         if (trackerClass == null) {
-            log(TAG, "TopTaskTracker not found, top task filter skipped")
+            logWarning(TAG, "TopTaskTracker not found, top task filter skipped")
             return
         }
         runCatching {
@@ -81,7 +85,7 @@ object ManagedTaskFilter {
                 runCatching { rebuildCachedTopTask(param) }
                     .onFailure { log(TAG, "filter cached top task failed", it) }
             }
-            log(TAG, "top task filter installed")
+            log(TAG) { "top task filter installed" }
         }.onFailure { log(TAG, "install top task filter failed", it) }
     }
 
@@ -109,7 +113,7 @@ object ManagedTaskFilter {
         val replacement = java.lang.reflect.Array.newInstance(component, kept.size)
         kept.forEachIndexed { index, group -> java.lang.reflect.Array.set(replacement, index, group) }
         param.args[0] = replacement
-        log(TAG, "filtered ${groups.size - kept.size} managed group(s) from visible tasks")
+        log(TAG) { "filtered ${groups.size - kept.size} managed group(s) from visible tasks" }
     }
 
     /** legacy 路径：顶部任务命中受管任务时，用过滤后的列表重建 CachedTaskInfo。 */
@@ -135,6 +139,6 @@ object ManagedTaskFilter {
         )
         ctor.isAccessible = true
         param.result = ctor.newInstance(filtered, context, displayId, activeDeskId)
-        log(TAG, "rebuilt top task without managed float (top was $topId)")
+        log(TAG) { "rebuilt top task without managed float (top was $topId)" }
     }
 }

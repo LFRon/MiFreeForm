@@ -7,6 +7,7 @@ import android.os.Bundle
 import android.os.ServiceManager
 import com.buildsession.betterYAMF.BuildConfig
 import com.buildsession.betterYAMF.xposed.utils.log
+import com.buildsession.betterYAMF.xposed.utils.logError
 import rikka.hidden.compat.ActivityManagerApis
 import rikka.hidden.compat.adapter.UidObserverAdapter
 
@@ -27,7 +28,7 @@ object UserService {
                     null
                 )
                 if (provider == null) {
-                    log(TAG, "Failed to get content provider")
+                    logError(TAG, "Failed to get content provider")
                     return
                 }
                 val extras = Bundle()
@@ -35,12 +36,12 @@ object UserService {
                 val attr = AttributionSource.Builder(1000).setPackageName("android").build()
                 val reply = provider.call(attr, PROVIDER_AUTHORITY, "", null, extras)
                 if (reply == null) {
-                    log(TAG, "Failed to send binder to app")
+                    logError(TAG, "Failed to send binder to app")
                     return
                 }
                 // log(TAG, "Send binder to app")
             } catch (e: Throwable) {
-                log(TAG, "Failed to send binder to app", e)
+                logError(TAG, "Failed to send binder to app", e)
             }
         }
     }

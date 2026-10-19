@@ -92,7 +92,7 @@ object TaskSystemOps {
             val set = android.util.ArraySet<Any>()
             set.add(task)
             XposedHelpers.callMethod(controller, "snapshotTasks", set)
-            log("reYAMF_debug", "refreshTaskSnapshot task=$taskId ok")
+            log("reYAMF_debug") { "refreshTaskSnapshot task=$taskId ok" }
         }.onFailure {
             log("reYAMF_debug", "refreshTaskSnapshot failed task=$taskId", it)
         }
@@ -123,7 +123,7 @@ object TaskSystemOps {
             }
             val r1 = Instances.inputManager.injectInputEvent(down, 0)
             val r2 = Instances.inputManager.injectInputEvent(up, 0)
-            log("reYAMF_debug", "injectHome done down=$r1 up=$r2")
+            log("reYAMF_debug") { "injectHome done down=$r1 up=$r2" }
             true
         }.onFailure {
             log("reYAMF_debug", "injectHome failed", it)

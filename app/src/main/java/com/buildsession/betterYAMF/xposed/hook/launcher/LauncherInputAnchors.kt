@@ -7,6 +7,8 @@ interface LauncherInputAnchor {
     val displayName: String
     val className: String
     fun gestureStateOf(handler: Any, event: InputEvent): Any?
+    fun inputConsumerOf(handler: Any, event: InputEvent): Any?
+    fun animationControllerOf(handler: Any, displayId: Int): Any?
 }
 
 object LauncherInputAnchors {
@@ -30,6 +32,18 @@ object LauncherInputAnchors {
             val inputResource = XposedHelpers.callMethod(handler, "getInputResource", displayId)
             XposedHelpers.getObjectField(inputResource, "gestureState")
         }.getOrNull()
+
+        override fun inputConsumerOf(handler: Any, event: InputEvent): Any? = runCatching {
+            val displayId = XposedHelpers.callMethod(event, "getDisplayId") as Int
+            val resource = XposedHelpers.callMethod(handler, "getInputResource", displayId)
+            XposedHelpers.getObjectField(resource, "consumer")
+        }.getOrNull()
+
+        override fun animationControllerOf(handler: Any, displayId: Int): Any? = runCatching {
+            val repository = XposedHelpers.getObjectField(handler, "mTaskAnimationManagerRepository")
+            val manager = XposedHelpers.callMethod(repository, "get", displayId)
+            XposedHelpers.getObjectField(manager, "mController")
+        }.getOrNull()
     }
 
     object TouchInteractionServiceAnchor : LauncherInputAnchor {
@@ -38,5 +52,13 @@ object LauncherInputAnchors {
 
         override fun gestureStateOf(handler: Any, event: InputEvent): Any? =
             runCatching { XposedHelpers.getObjectField(handler, "mGestureState") }.getOrNull()
+
+        override fun inputConsumerOf(handler: Any, event: InputEvent): Any? =
+            runCatching { XposedHelpers.getObjectField(handler, "mConsumer") }.getOrNull()
+
+        override fun animationControllerOf(handler: Any, displayId: Int): Any? = runCatching {
+            val manager = XposedHelpers.getObjectField(handler, "mTaskAnimationManager")
+            XposedHelpers.getObjectField(manager, "mController")
+        }.getOrNull()
     }
 }
