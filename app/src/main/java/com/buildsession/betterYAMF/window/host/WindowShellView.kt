@@ -3,15 +3,18 @@ package com.buildsession.betterYAMF.window.host
 import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Bitmap
+import android.graphics.BlendMode
 import android.graphics.Color
+import android.graphics.LinearGradient
+import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.RectF
 import android.graphics.Region
+import android.graphics.Shader
 import android.graphics.drawable.Drawable
 import android.view.MotionEvent
 import android.view.View
-import androidx.core.graphics.withSave
 import com.buildsession.betterYAMF.window.core.SceneStyle
 import com.buildsession.betterYAMF.window.core.WindowSceneFrame
 import kotlin.math.roundToInt
@@ -31,6 +34,10 @@ internal class WindowShellView(context: Context, private val style: SceneStyle) 
     private var drawEntryImage = false
     private val imageClip = Path()
     private val imageBounds = RectF()
+    private val imageMask = LinearGradient(0f, 0f, 0f, 1f,
+        Color.WHITE, Color.TRANSPARENT, Shader.TileMode.CLAMP)
+    private val imageMaskMatrix = Matrix()
+    private val imageMaskPaint = Paint().apply { blendMode = BlendMode.DST_IN; shader = imageMask }
     private val bridgeBounds = RectF()
     private var applicationIcon: Drawable? = null
 
@@ -109,20 +116,33 @@ internal class WindowShellView(context: Context, private val style: SceneStyle) 
             canvas.drawRoundRect(bridgeBounds, radius, radius, paint)
             paint.style = Paint.Style.FILL
         }
-        if (drawEntryImage) entryImage?.let { bitmap ->
-            canvas.withSave {
-                imageClip.rewind()
-                imageClip.addRoundRect(content, f.contentRadius, f.contentRadius, Path.Direction.CW)
-                canvas.clipPath(imageClip)
-                val scale = maxOf(content.width() / bitmap.width, content.height() / bitmap.height)
-                val w = bitmap.width * scale
-                val h = bitmap.height * scale
-                imageBounds.set(content.centerX() - w / 2f, content.centerY() - h / 2f,
-                    content.centerX() + w / 2f, content.centerY() + h / 2f)
-                paint.alpha = (f.alpha * 255f).roundToInt().coerceIn(0, 255)
-                paint.isFilterBitmap = true
-                canvas.drawBitmap(bitmap, null, imageBounds, paint)
+        val image = f.entryImage
+        if (drawEntryImage && image != null) entryImage?.let { bitmap ->
+            val alpha = (f.alpha * 255f).roundToInt().coerceIn(0, 255)
+            // The opaque flight needs only clipping. Allocate a compositing layer only when
+            // masking the replacement edge or applying group opacity.
+            val layer = if (image.featherPx > 0f || alpha < 255) canvas.saveLayerAlpha(content, alpha)
+                else canvas.save()
+            imageClip.rewind()
+            imageClip.addRoundRect(content, f.contentRadius, f.contentRadius, Path.Direction.CW)
+            canvas.clipPath(imageClip)
+            val clip = image.clip
+            canvas.clipRect(clip.left, clip.top, clip.right, clip.bottom)
+            paint.alpha = 255
+            val bounds = image.bounds
+            imageBounds.set(bounds.left, bounds.top, bounds.right, bounds.bottom)
+            // CORE supplies one top-aligned cover projection and an opaque remaining region.
+            // Only the narrow replacement edge can overlap layouts; never fade the whole image.
+            paint.isFilterBitmap = true
+            canvas.drawBitmap(bitmap, null, imageBounds, paint)
+            if (image.featherPx > 0f) {
+                val edgeTop = clip.bottom - image.featherPx
+                imageMaskMatrix.setScale(1f, image.featherPx)
+                imageMaskMatrix.postTranslate(0f, edgeTop)
+                imageMask.setLocalMatrix(imageMaskMatrix)
+                canvas.drawRect(clip.left, edgeTop, clip.right, clip.bottom, imageMaskPaint)
             }
+            canvas.restoreToCount(layer)
         }
         for (i in 0..3) radii[i] = f.outerRadius
         for (i in 4..7) radii[i] = f.outerBottomRadius

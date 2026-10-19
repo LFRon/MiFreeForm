@@ -26,8 +26,9 @@ import java.util.function.Consumer
  * LoS 24 TaskOrganizerController:415 migrates the task SC during release. Resolve the CURRENT
  * main window and SC after release, wait for native motion, then request a fresh draw. LoS
  * WindowState:6133 can finish a draw handler on timeout with a NULL buffer transaction, so neither
- * applyWithNextDraw's callback nor a generic transaction commit alone proves buffer readiness.
- * Observe finishDrawing's non-null transaction + requested sequence and fence its actual commit.
+ * applyWithNextDraw's callback nor a generic transaction commit alone acknowledges that request.
+ * Observe a non-null client finishDrawing transaction with the requested sequence and identity,
+ * then its commit. This is a client redraw acknowledgement, not native buffer inspection.
  */
 internal object FullscreenTaskHandoff {
     private const val TAG = "reYAMF_Fullscreen"
@@ -82,6 +83,8 @@ internal object FullscreenTaskHandoff {
         private var layout: Rect? = null
         private var frameCallback: Choreographer.FrameCallback? = null
         private var stage = "release"
+        private val startedAt = android.os.SystemClock.elapsedRealtime()
+        private var stageAt = startedAt
         private val timeout = Runnable {
             logError(TAG, "fullscreen timeout task=$taskId operation=$id stage=$stage released=$released known=$ownershipKnown")
             finish(CommandStatus.FAILED)
@@ -131,18 +134,18 @@ internal object FullscreenTaskHandoff {
                         clientSurface == null || !clientSurface.isValid) {
                         fence.invalidate()
                         layout = null
-                        stage = "fullscreen layout"
+                        moveStage("fullscreen layout")
                         false
                     } else if (!fence.matches(window, surface, clientSurface) || layout != facts.bounds) {
                         fence.invalidate()
                         layout = null
-                        stage = "native transition"
+                        moveStage("native transition")
                         if (facts.stable && api.windowSyncState.getInt(window) == 0 && !api.inRelayout.getBoolean(window)) {
                             // Empty WM-owned draw handler only requests a new buffer. It cannot
                             // complete this operation (its timeout can execute without a buffer).
                             fence.arm(window, surface, api.requestDraw(task, window), clientSurface)
                             layout = Rect(facts.bounds)
-                            stage = "fullscreen buffer commit"
+                            moveStage("fullscreen redraw commit")
                             log(TAG) { "draw armed task=$taskId operation=$id sequence=${api.sequence(window)} bounds=$layout surface=$surface" }
                         }
                         false
@@ -169,8 +172,8 @@ internal object FullscreenTaskHandoff {
                 val surface = facts.surface ?: return@locked
                 val clientSurface = facts.clientSurface ?: return@locked
                 if (!facts.fullscreen || facts.window !== window || facts.bounds != layout ||
-                    sequence < api.sequence(window)) return@locked
-                val ticket = fence.buffer(window, surface, sequence, hasBuffer = true, clientSurface = clientSurface) ?: return@locked
+                    sequence < api.sequence(window) || !fence.awaitingDraw) return@locked
+                val ticket = fence.drawing(window, surface, sequence, hasTransaction = true, clientSurface = clientSurface) ?: return@locked
                 // Borrowed buffer transaction: add a listener, never apply/close it here.
                 transaction.addTransactionCommittedListener(executor) {
                     if (!completed && active[taskId] === this) {
@@ -189,6 +192,14 @@ internal object FullscreenTaskHandoff {
             }.also { Choreographer.getInstance().postFrameCallback(it) }
         }
 
+        private fun moveStage(next: String) {
+            if (stage == next) return
+            val now = android.os.SystemClock.elapsedRealtime()
+            log(TAG) { "wait task=$taskId operation=$id stage=$stage durationMs=${now - stageAt} next=$next elapsedMs=${now - startedAt}" }
+            stage = next
+            stageAt = now
+        }
+
         private fun finish(status: CommandStatus) {
             if (completed) return
             completed = true
@@ -198,7 +209,7 @@ internal object FullscreenTaskHandoff {
             frameCallback = null
             runCatching { if (api != null && task != null) api.locked(task) { fence.invalidate() } }
                 .onFailure { logWarning(TAG, "draw fence cleanup failed task=$taskId operation=$id", it) }
-            log(TAG) { "result task=$taskId operation=$id status=$status released=$released known=$ownershipKnown stage=$stage" }
+            log(TAG) { "result task=$taskId operation=$id status=$status released=$released known=$ownershipKnown stage=$stage stageMs=${android.os.SystemClock.elapsedRealtime() - stageAt} elapsedMs=${android.os.SystemClock.elapsedRealtime() - startedAt}" }
             onComplete(FullscreenHandoffResult(status, released, ownershipKnown))
         }
 

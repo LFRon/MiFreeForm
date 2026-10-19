@@ -41,7 +41,8 @@ private object NoopWindowBackend : WindowBackend {
     }
     override fun writePresentationInto(
         tx: android.view.SurfaceControl.Transaction, taskId: Int, physicalBounds: Rect,
-        cornerRadiusPx: Float, alpha: Float
+        cornerRadiusPx: Float, alpha: Float,
+        contentAlignment: com.buildsession.betterYAMF.window.core.ContentAlignment
     ): Boolean = false
     override fun writeGeometryInto(
         tx: android.view.SurfaceControl.Transaction,

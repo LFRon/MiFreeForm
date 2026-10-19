@@ -13,6 +13,15 @@ data class SceneRect(val left: Float, val top: Float, val width: Float, val heig
 
 data class SceneMetrics(val width: Int, val height: Int, val topInset: Int, val bottomInset: Int)
 
+/** Uniform cover projection; TOP preserves the header as a viewport changes height. */
+enum class ContentAlignment { CENTER, TOP }
+
+/** Opaque retained pixels above the live task. Only the bottom edge of [clip] is feathered;
+ * the rest is either source or live content, never a translucent overlap of two full layouts.
+ * Coordinates and [featherPx] use display pixels, just like the shared content viewport.
+ */
+data class EntryImageVisual(val bounds: SceneRect, val clip: SceneRect, val featherPx: Float)
+
 /** Visual bridge, in display pixels. Its opacity and geometry are solved by CORE. */
 enum class FullscreenStage { DRAGGING, RETURNING, COVERING, HIDING, EXPANDING, WAITING, REVEALING, FINISHED }
 
@@ -82,8 +91,11 @@ data class WindowSceneFrame(
     val taskAlpha: Float = alpha,
     /** False means this frame contains only the bridge; EXL must stop updating the live task. */
     val presentsLiveContent: Boolean = true,
-    /** Retained entry pixels replace live content until CORE selects the replacement frame. */
-    val showEntryImage: Boolean = false
+    /** Retained pixels stay owned until a visible frame without them has committed. */
+    val showEntryImage: Boolean = false,
+    val entryImage: EntryImageVisual? = null,
+    /** Source and task cover the same content viewport with the same alignment. */
+    val contentAlignment: ContentAlignment = ContentAlignment.CENTER
 ) {
     fun hitTest(x: Float, y: Float, style: SceneStyle): RegionId? {
         if (alpha <= 0f || !outer.contains(x, y)) return null
@@ -113,7 +125,9 @@ sealed interface WindowSceneEvent {
         val source: SceneRect? = null, val dropX: Int = -1, val dropY: Int = -1,
         val awaitSourceRelease: Boolean = false,
         val sourceCornerRadius: Float = 0f,
-        val velocityX: Float = 0f, val velocityY: Float = 0f
+        val velocityX: Float = 0f, val velocityY: Float = 0f,
+        /** Pixel aspect after platform normalization; independent of raster-rounded source bounds. */
+        val sourceImageAspect: Float? = null
     ) : WindowSceneEvent
     /** A retained source image can present and animate before the live task has been prepared. */
     data object VisualAvailable : WindowSceneEvent

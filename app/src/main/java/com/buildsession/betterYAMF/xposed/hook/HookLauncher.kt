@@ -336,7 +336,9 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                                         putExtra(Protocol.EXTRA_DROP_Y, correctedY.toInt())
                                     }
                                     val handoff = RecentsDropHandoff.prepare(inputAnchor, param.thisObject, event, mCurrentTaskId)
-                                    if (handoff?.begin(AndroidAppHelper.currentApplication(), intent) != true) {
+                                    if (handoff?.begin(AndroidAppHelper.currentApplication(), intent) == true) {
+                                        param.setObjectExtra("miwindow.sourceHandoff", handoff)
+                                    } else {
                                         // Preserve normal UP cleanup before the legacy HOME fallback.
                                         mMainHandler.post { AndroidAppHelper.currentApplication().sendBroadcast(intent) }
                                     }
@@ -360,6 +362,10 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                         }
                 }
 
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    (param.getObjectExtra("miwindow.sourceHandoff") as? RecentsDropHandoff.Handoff)
+                        ?.inputFinished(param.throwable)
+                }
             })
             } else {
                 log(TAG) { "No launcher input anchor available" }

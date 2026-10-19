@@ -8,6 +8,7 @@ import android.graphics.Rect
 import com.buildsession.betterYAMF.window.backend.WindowBackend
 import com.buildsession.betterYAMF.window.backend.WindowOperation
 import com.buildsession.betterYAMF.window.core.CommandStatus
+import com.buildsession.betterYAMF.window.core.ContentAlignment
 import com.buildsession.betterYAMF.window.core.FullscreenHandoffResult
 import com.buildsession.betterYAMF.window.backend.WindowBackendCallbacks
 import com.buildsession.betterYAMF.xposed.hook.freeform.FreeformBackend
@@ -44,7 +45,10 @@ object SmoothWindowBackend : WindowBackend {
     private val geometryByTask = ConcurrentHashMap<Int, Rect>()
 
     /** Reconstructible presentation cache. Transition reassertions must preserve opacity/corners. */
-    data class Appearance(val cornerRadiusPx: Float = 0f, val alpha: Float = 1f)
+    data class Appearance(
+        val cornerRadiusPx: Float = 0f, val alpha: Float = 1f,
+        val contentAlignment: ContentAlignment = ContentAlignment.CENTER
+    )
     private val appearanceByTask = ConcurrentHashMap<Int, Appearance>()
     fun appearanceOf(taskId: Int): Appearance = appearanceByTask[taskId] ?: Appearance()
     private val frameSynchronizedTasks = ConcurrentHashMap.newKeySet<Int>()
@@ -293,12 +297,13 @@ object SmoothWindowBackend : WindowBackend {
         taskId: Int,
         physicalBounds: Rect,
         cornerRadiusPx: Float,
-        alpha: Float
+        alpha: Float,
+        contentAlignment: ContentAlignment
     ): Boolean {
         if (!SmoothTaskOrganizer.isLeashManaged(taskId)) return false
         invalidatedPresentations.remove(taskId)
         geometryByTask[taskId] = Rect(physicalBounds)
-        appearanceByTask[taskId] = Appearance(cornerRadiusPx, alpha.coerceIn(0f, 1f))
+        appearanceByTask[taskId] = Appearance(cornerRadiusPx, alpha.coerceIn(0f, 1f), contentAlignment)
         return SmoothTaskOrganizer.writeLeashTransformInto(tx, taskId, physicalBounds)
     }
 

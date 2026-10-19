@@ -4,6 +4,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.graphics.PointF
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
@@ -35,8 +36,10 @@ internal object RecentsDropHandoff {
     private val owners = HandoffOwners<Pending>()
     private val hookedEnds = mutableSetOf<Method>()
 
-    private class Pending(val handoff: Handoff, val context: Context) {
+    private class Pending(val handoff: Handoff, val context: Context, val intent: Intent) {
         val gestureEnd = DeferredGestureEnd()
+        val armedAt = SystemClock.elapsedRealtime()
+        var endReceived = false
         var pixels: EntrySnapshotTransport.Lease? = null
         var nativeFinishRequested = false
         var nativeFinished = false
@@ -48,6 +51,10 @@ internal object RecentsDropHandoff {
     fun install(context: Context) {
         if (installed) return
         application = context.applicationContext
+        // Register before gestures warm up the native producer. UP only uses the cached probe;
+        // it must not be the first occasion on which the transform methods are hooked.
+        runCatching { RecentsSourceFrame.install(context.classLoader) }
+            .onFailure { logWarning(TAG, "native source synchronization capability unavailable", it) }
         context.applicationContext.registerReceiver(object : BroadcastReceiver() {
             override fun onReceive(context: Context, intent: Intent) {
                 if (intent.action == Protocol.ACTION_ENTRY_CAPABILITIES) {
@@ -100,6 +107,7 @@ internal object RecentsDropHandoff {
 
     private fun supersede(pending: Pending, retireBeforeDown: Boolean = false) {
         pending.timeout?.let(handler::removeCallbacks)
+        pending.handoff.source.close()
         pending.pixels?.close()
         pending.pixels = null
         pending.gestureEnd.finish(resume = false)
@@ -125,34 +133,28 @@ internal object RecentsDropHandoff {
         internal val swipeHandler: Any,
         private val activeConsumer: Any,
         private val currentController: () -> Any?,
-        private val snapshot: EntrySnapshot,
-        private val launcherRotation: Int
+        internal val source: RecentsSourceFrame,
+        internal val launcherRotation: Int
     ) {
         internal val id = SystemClock.elapsedRealtimeNanos()
 
         fun begin(context: Context, intent: Intent): Boolean {
             owners.invalidate(displayId)?.let(::supersede)
-            val pending = Pending(this, context.applicationContext)
+            if (!ownsCurrentController()) { source.close(); return false }
+            val pending = Pending(this, context.applicationContext, Intent(intent))
             val owner = owners.register(displayId, pending)
             pending.timeout = Runnable {
-                if (owners.owns(owner)) abortBeforeFinish(owner, "bridge timeout")
+                if (owners.owns(owner)) abortBeforeFinish(owner, "source/bridge timeout")
             }.also { handler.postDelayed(it, FAILURE_TIMEOUT_MS) }
-            return try {
-                pending.pixels = EntrySnapshotTransport.Lease(snapshot)
-                val request = Intent(intent).apply {
-                    putExtra(Protocol.EXTRA_ENTRY_PROTOCOL, Protocol.ENTRY_PROTOCOL)
-                    putExtra(Protocol.EXTRA_SOURCE_PACKAGE, context.packageName)
-                    putExtra(Protocol.EXTRA_HANDOFF_ID, id)
-                    putExtra(Protocol.EXTRA_LAUNCHER_ROTATION, launcherRotation)
-                    pending.pixels!!.attachTo(this)
-                }
-                context.sendBroadcast(request)
-                log(TAG) { "bridge requested task=$taskId handoff=$id source=${snapshot.bounds}" }
-                true
-            } catch (error: Throwable) {
-                abortBeforeFinish(owner, "bridge dispatch failed")
-                log(TAG, "bridge dispatch failed task=$taskId handoff=$id", error)
-                false
+            log(TAG) { "native UP armed task=$taskId handoff=$id" }
+            return true
+        }
+
+        /** Called after original input dispatch, even when native UP takes a cancellation path. */
+        fun inputFinished(error: Throwable?) {
+            val owner = owners.all().firstOrNull { it.value.handoff === this } ?: return
+            if (error != null || !owner.value.endReceived) {
+                abortBeforeFinish(owner, if (error != null) "native input failed" else "native UP did not reach end")
             }
         }
 
@@ -171,6 +173,27 @@ internal object RecentsDropHandoff {
         }.onFailure { log(TAG, "retire source failed task=$taskId handoff=$id", it) }.getOrDefault(CommandStatus.FAILED)
     }
 
+    private fun dispatchBridge(owner: HandoffOwners.Owner<Pending>, snapshot: EntrySnapshot) {
+        val pending = owner.value
+        val handoff = pending.handoff
+        try {
+            pending.pixels = EntrySnapshotTransport.Lease(snapshot)
+            val request = Intent(pending.intent).apply {
+                putExtra(Protocol.EXTRA_ENTRY_PROTOCOL, Protocol.ENTRY_PROTOCOL)
+                putExtra(Protocol.EXTRA_SOURCE_PACKAGE, pending.context.packageName)
+                putExtra(Protocol.EXTRA_HANDOFF_ID, handoff.id)
+                putExtra(Protocol.EXTRA_LAUNCHER_ROTATION, handoff.launcherRotation)
+                pending.pixels!!.attachTo(this)
+            }
+            pending.context.sendBroadcast(request)
+            log(TAG) { "bridge requested after source commit task=${handoff.taskId} handoff=${handoff.id} source=${snapshot.bounds} elapsedMs=${SystemClock.elapsedRealtime() - pending.armedAt}" }
+        } catch (error: Throwable) {
+            if (pending.pixels == null) snapshot.close()
+            abortBeforeFinish(owner, "bridge dispatch failed")
+            log(TAG, "bridge dispatch failed task=${handoff.taskId} handoff=${handoff.id}", error)
+        }
+    }
+
     private fun requestNativeFinish(owner: HandoffOwners.Owner<Pending>) {
         if (!owners.owns(owner) || owner.value.nativeFinishRequested) return
         val pending = owner.value
@@ -181,11 +204,8 @@ internal object RecentsDropHandoff {
         pending.gestureEnd.finish(resume = false)
         pending.timeout = Runnable {
             if (!owners.owns(owner)) return@Runnable
-            pending.cancelDestination = true
-            cancelDestination(pending)
             logError(TAG, "native timeout task=${pending.handoff.taskId}; retry captured controller only")
-            runCatching { pending.handoff.animation.forceFinish(Runnable { handler.post { nativeFinished(owner) } }) }
-                .onFailure { log(TAG, "captured force finish failed", it) }
+            forceNativeFinish(owner)
         }.also { handler.postDelayed(it, FAILURE_TIMEOUT_MS) }
         runCatching {
             // Retain the known-good ordering: finish(true,false) before consumer cleanup. Its own
@@ -198,11 +218,36 @@ internal object RecentsDropHandoff {
             pending.sourceRetired = pending.handoff.retireSource()
         }.onFailure {
             log(TAG, "native finish failed", it)
-            pending.cancelDestination = true
-            cancelDestination(pending)
-            runCatching { pending.handoff.animation.forceFinish(Runnable { handler.post { nativeFinished(owner) } }) }
+            forceNativeFinish(owner)
             pending.handoff.cleanupConsumer()
         }
+    }
+
+    private fun forceNativeFinish(owner: HandoffOwners.Owner<Pending>) {
+        if (!owners.owns(owner)) return
+        val pending = owner.value
+        pending.cancelDestination = true
+        cancelDestination(pending)
+        pending.timeout?.let(handler::removeCallbacks)
+        // The retry also needs a terminal bound: a missing native callback cannot keep this
+        // simulator frozen forever. Abandon only this lease; never fabricate SOURCE_RELEASED.
+        pending.timeout = Runnable { abandonNativeFinish(owner) }
+            .also { handler.postDelayed(it, FAILURE_TIMEOUT_MS) }
+        runCatching { pending.handoff.animation.forceFinish(Runnable { handler.post { nativeFinished(owner) } }) }
+            .onFailure {
+                log(TAG, "captured force finish failed", it)
+                abandonNativeFinish(owner)
+            }
+    }
+
+    private fun abandonNativeFinish(owner: HandoffOwners.Owner<Pending>) {
+        val pending = owners.take(owner) ?: return
+        pending.timeout?.let(handler::removeCallbacks)
+        pending.handoff.source.close()
+        cancelDestination(pending)
+        // UP continuation and snapshot were already discarded when native finish was requested.
+        // Removing the owner rejects late finish/commit callbacks without touching newer UI.
+        logError(TAG, "native finish abandoned task=${pending.handoff.taskId} handoff=${pending.handoff.id}")
     }
 
     private fun nativeFinished(owner: HandoffOwners.Owner<Pending>) {
@@ -210,6 +255,7 @@ internal object RecentsDropHandoff {
         val pending = owners.take(owner) ?: return
         pending.nativeFinished = true
         pending.timeout?.let(handler::removeCallbacks)
+        pending.handoff.source.close()
         val status = pending.sourceRetired ?: pending.handoff.retireSource()
         log(TAG) { "native finished source=$status task=${pending.handoff.taskId} handoff=${pending.handoff.id}" }
         if (pending.cancelDestination || status != CommandStatus.DONE) cancelDestination(pending)
@@ -221,11 +267,13 @@ internal object RecentsDropHandoff {
     private fun abortBeforeFinish(owner: HandoffOwners.Owner<Pending>, reason: String) {
         val pending = owners.take(owner) ?: return
         pending.timeout?.let(handler::removeCallbacks)
+        pending.handoff.source.close()
         pending.pixels?.close()
         pending.pixels = null
         cancelDestination(pending)
-        logWarning(TAG, "$reason task=${pending.handoff.taskId} handoff=${pending.handoff.id}; resume native UP")
-        runCatching { pending.gestureEnd.finish(resume = true) }
+        val resume = pending.handoff.ownsCurrentController()
+        logWarning(TAG, "$reason task=${pending.handoff.taskId} handoff=${pending.handoff.id}; resumeNative=$resume")
+        runCatching { pending.gestureEnd.finish(resume = resume) }
             .onFailure {
                 log(TAG, "resume native UP failed", it)
                 runCatching { pending.handoff.animation.forceFinish(Runnable {}) }
@@ -248,19 +296,46 @@ internal object RecentsDropHandoff {
     private fun installEndGate(swipeHandler: Any): Boolean = runCatching {
         val method = generateSequence(swipeHandler.javaClass as Class<*>?) { it.superclass }
             .flatMap { it.declaredMethods.asSequence() }.first {
-                it.name == "onGestureEnded" && it.parameterCount == 3 &&
-                    it.parameterTypes[0] == Float::class.javaPrimitiveType
+                it.name == "onGestureEnded" && it.returnType == Void.TYPE &&
+                    it.parameterTypes.contentEquals(arrayOf(Float::class.javaPrimitiveType,
+                        PointF::class.java, Boolean::class.javaPrimitiveType))
             }
         if (method !in hookedEnds) {
             XposedBridge.hookMethod(method, object : XC_MethodHook() {
                 override fun beforeHookedMethod(param: MethodHookParam) {
-                    val pending = owners.all().firstOrNull { it.value.handoff.swipeHandler === param.thisObject }?.value ?: return
+                    val owner = owners.all().firstOrNull { it.value.handoff.swipeHandler === param.thisObject } ?: return
+                    val pending = owner.value
                     val originalMethod = param.method
                     val receiver = param.thisObject
                     val arguments = param.args.clone()
+                    val velocity = PointF(param.args[1] as PointF)
+                    arguments[1] = PointF(velocity)
                     if (pending.nativeFinishRequested || pending.gestureEnd.defer { XposedBridge.invokeOriginalMethod(originalMethod, receiver, arguments) }) {
                         log(TAG) { "native UP deferred task=${pending.handoff.taskId} handoff=${pending.handoff.id}" }
                         param.result = null
+                        if (pending.endReceived) return
+                        pending.endReceived = true
+                        // LoS OtherActivityInputConsumer:497 has updated the final UP displacement.
+                        // Its px/ms velocity is copied before cleanupAfterGesture recycles the tracker.
+                        runCatching {
+                            check(pending.handoff.ownsCurrentController())
+                            pending.handoff.source.freeze { frame ->
+                                if (!owners.owns(owner)) return@freeze
+                                if (!pending.handoff.ownsCurrentController()) {
+                                    abortBeforeFinish(owner, "source controller replaced")
+                                    return@freeze
+                                }
+                                val vx = (velocity.x * 1000f).takeIf { it.isFinite() } ?: 0f
+                                val vy = (velocity.y * 1000f).takeIf { it.isFinite() } ?: 0f
+                                val snapshot = RecentsEntryCapture.capture(frame, pending.handoff.taskId, vx, vy)
+                                if (snapshot == null) abortBeforeFinish(owner, "source capture failed")
+                                else dispatchBridge(owner, snapshot)
+                            }
+                            log(TAG) { "source pose frozen task=${pending.handoff.taskId} handoff=${pending.handoff.id}; wait native transform commit" }
+                        }.onFailure {
+                            logWarning(TAG, "final source synchronization failed task=${pending.handoff.taskId}", it)
+                            abortBeforeFinish(owner, "source synchronization failed")
+                        }
                     }
                 }
             })
@@ -290,12 +365,12 @@ internal object RecentsDropHandoff {
         }.onFailure { logWarning(TAG, "Home rotation unavailable task=$taskId", it) }
             .getOrDefault(-1).takeIf { it in 0..3 } ?: -1
         if (!installEndGate(swipe)) return null
-        val snapshot = RecentsEntryCapture.capture(swipe, taskId, active) ?: return null
+        val source = RecentsEntryCapture.source(swipe, taskId) ?: return null
         Handoff(taskId, displayId, animation, retirement, swipe, active, {
             anchor.animationControllerOf(owner, displayId) ?: runCatching {
                 XposedHelpers.callMethod(recentsView, "getRecentsAnimationController")
             }.getOrNull()
-        }, snapshot, launcherRotation)
+        }, source, launcherRotation)
     }.onFailure { logWarning(TAG, "recents bridge unavailable; preserve native gesture", it) }.getOrNull()
 
     fun isSourceVisible(gesture: Any): Boolean = runCatching {

@@ -87,7 +87,8 @@ object SmoothTaskOrganizer {
     private class InitialPresentation(val physical: Rect) {
         @Volatile var surface: SurfaceControl? = null
         @Volatile var fencedSurface: SurfaceControl? = null
-        @Volatile var bufferCommitted = false
+        // WM's resize transaction committed; this is not a native buffer-content probe.
+        @Volatile var resizeCommitted = false
     }
     private val initialPresentations = ConcurrentHashMap<Int, InitialPresentation>()
     @Volatile var canStageInitialPresentation = false
@@ -246,6 +247,10 @@ object SmoothTaskOrganizer {
 
             // 4) 创建专属悬浮根（新 API：createTask(TaskCreationParams)）
             createFloatingRoot(taskOrganizerController)
+            // Staging is a WM capability. system_server cannot execute an APK's JNI library:
+            // LoS private/system_server.te forbids execution from data_file_type and memfd.
+            // Do not make the already supported entry protocol depend on an app-only probe.
+            log("reYAMF_EntryV2") { "entry backend initialized staging=$canStageInitialPresentation rootReady=${launchRootToken() != null} drawSync=wm-resize loadedBuild=${com.buildsession.betterYAMF.BuildConfig.BUILD_TIME}" }
         }.onFailure {
             log(TAG, "init failed", it)
         }
@@ -268,7 +273,7 @@ object SmoothTaskOrganizer {
                     tx.setAlpha(surface, 0f)
                     check(writeLeashTransform(tx, id, surface, logical, stage.physical))
                     stage.surface = surface
-                    stage.bufferCommitted = false
+                    stage.resizeCommitted = false
                     stage.fencedSurface = null
                     android.os.Handler(android.os.Looper.getMainLooper()).post {
                         if (initialPresentations[id] === stage && stage.fencedSurface !== surface) {
@@ -283,8 +288,10 @@ object SmoothTaskOrganizer {
         }.onFailure { log(TAG, "initial surface staging unavailable", it) }
     }
 
-    /** Wait for the application's resized draw on the CURRENT SC. Never close a WM-owned
-     * transaction; this owned transaction stays alive until Task:4688 has merged and committed it.
+    /** Keep the established Task:4664 resize synchronization. Task owns the draw handler and
+     * merges this owned transaction into the redraw transaction; never close WM's transaction.
+     * This acknowledges the resize commit, not inspection of a new client buffer. Preparation
+     * additionally checks the current window's drawn state and native transition completion.
      */
     private fun fenceInitialDraw(taskId: Int, task: Any, stage: InitialPresentation) {
         val wm = XposedHelpers.getObjectField(task, "mWmService")
@@ -296,7 +303,7 @@ object SmoothTaskOrganizer {
             check(writeLeashTransform(wmTx, taskId, surface, logical, stage.physical))
             stage.surface = surface
             stage.fencedSurface = surface
-            stage.bufferCommitted = false
+            stage.resizeCommitted = false
             val tx = SurfaceControl.Transaction()
             var handedToWm = false
             try {
@@ -306,8 +313,8 @@ object SmoothTaskOrganizer {
                 tx.addTransactionCommittedListener(java.util.concurrent.Executor { main.post(it) }) {
                     tx.close()
                     if (initialPresentations[taskId] === stage && stage.surface === surface) {
-                        stage.bufferCommitted = true
-                        log("reYAMF_EntryV2") { "initial app draw committed task=$taskId surface=$surface" }
+                        stage.resizeCommitted = true
+                        log("reYAMF_EntryV2") { "initial resize committed task=$taskId surface=$surface" }
                     }
                 }
                 handedToWm = true
@@ -629,7 +636,7 @@ object SmoothTaskOrganizer {
                 val taskId = info.taskId
                 val wasAdopted = adoptedTasks.remove(taskId)
                 leashes.remove(taskId)?.let(::releaseQuietly)
-                initialPresentations.remove(taskId)
+                cancelInitialPresentation(taskId)
                 logicalBounds.remove(taskId)
                 shapedTasks.remove(taskId)
                 originalParentTokens.remove(taskId)
@@ -966,7 +973,7 @@ object SmoothTaskOrganizer {
         val appearance = SmoothWindowBackend.appearanceOf(taskId)
         val transform = ViewportTransform.compute(
             logical.width(), logical.height(), physical.left, physical.top,
-            physical.width(), physical.height(), appearance.cornerRadiusPx
+            physical.width(), physical.height(), appearance.cornerRadiusPx, appearance.contentAlignment
         ) ?: return false
         XposedHelpers.callMethod(tx, "setMatrix", leash, transform.scale, 0f, 0f, transform.scale)
         tx.setPosition(leash, transform.x, transform.y)
@@ -1131,7 +1138,7 @@ object SmoothTaskOrganizer {
             val wm = XposedHelpers.getObjectField(task, "mWmService")
             synchronized(XposedHelpers.getObjectField(wm, "mGlobalLock")) {
                 initialPresentations[taskId]?.let { stage ->
-                    if (!stage.bufferCommitted) return@runCatching false
+                    if (!stage.resizeCommitted) return@runCatching false
                     val current = XposedHelpers.callMethod(task, "getSurfaceControl")
                     if (current !== stage.surface) return@runCatching false
                     val window = XposedHelpers.callMethod(task, "getTopVisibleAppMainWindow")
@@ -1315,7 +1322,7 @@ object SmoothTaskOrganizer {
     }
 
     fun forgetTask(taskId: Int) {
-        initialPresentations.remove(taskId)
+        cancelInitialPresentation(taskId)
         adoptedTasks.remove(taskId)
         leashes.remove(taskId)?.let { releaseQuietly(it) }
         logicalBounds.remove(taskId)

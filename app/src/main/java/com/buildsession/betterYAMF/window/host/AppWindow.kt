@@ -93,6 +93,7 @@ class AppWindow(
     private var launcherRotation = -1
     private var entryReadyFrame: Choreographer.FrameCallback? = null
     private var entryWaitLogged = false
+    private var entryVisualLogged: String? = null
 
     private val metrics = readMetrics()
     private val style = SceneStyle(
@@ -222,6 +223,17 @@ class AppWindow(
                 preparation.attach(ticket, operation)
             }
             is WindowSceneEffect.Present -> {
+                if (stagedEntry) {
+                    val visual = when {
+                        effect.frame.taskAlpha <= 0f -> "source"
+                        effect.frame.showEntryImage -> "replacing"
+                        else -> "live"
+                    }
+                    if (entryVisualLogged != visual) {
+                        entryVisualLogged = visual
+                        log("reYAMF_EntryV2") { "visual=$visual task=$currentTaskId handoff=$sourceHandoffId frame=${effect.frameId} sourceClip=${effect.frame.entryImage?.clip} viewport=${effect.frame.content} alignment=${effect.frame.contentAlignment}" }
+                    }
+                }
                 val stage = effect.frame.fullscreen?.stage
                 if (stage != loggedFullscreenStage) {
                     loggedFullscreenStage = stage
@@ -232,7 +244,7 @@ class AppWindow(
                     if (!effect.frame.presentsLiveContent || !adoptionRequested && effect.frame.showEntryImage) true
                     else YAMFManager.windowBackend.writePresentationInto(
                         transaction, currentTaskId, effect.frame.content.rounded().toAndroidRect(),
-                        effect.frame.contentRadius, effect.frame.taskAlpha
+                        effect.frame.contentRadius, effect.frame.taskAlpha, effect.frame.contentAlignment
                     )
                 }) { status ->
                     if (destroyed) return@present
@@ -346,10 +358,12 @@ class AppWindow(
         sourceHandoffId = handoffId
         this.launcherRotation = launcherRotation.takeIf { it in 0..3 } ?: -1
         stagedEntry = entrySnapshot != null
+        val image = entrySnapshot?.let(EntrySnapshotTransport::consumeBitmap)
         enqueue(WindowSceneEvent.OpenAsMini(source, dropX, dropY, awaitSourceRelease,
-            entrySnapshot?.cornerRadius ?: 0f, entrySnapshot?.velocityX ?: 0f, entrySnapshot?.velocityY ?: 0f))
-        if (entrySnapshot != null) {
-            view.retainEntryImage(EntrySnapshotTransport.consumeBitmap(entrySnapshot))
+            entrySnapshot?.cornerRadius ?: 0f, entrySnapshot?.velocityX ?: 0f, entrySnapshot?.velocityY ?: 0f,
+            image?.let { it.width.toFloat() / it.height }))
+        if (image != null) {
+            view.retainEntryImage(image)
             enqueue(WindowSceneEvent.VisualAvailable)
         }
     }

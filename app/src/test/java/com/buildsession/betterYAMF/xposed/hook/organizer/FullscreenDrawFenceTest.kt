@@ -4,29 +4,29 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class FullscreenDrawFenceTest {
-    @Test fun aTimeoutOrOldDrawCannotProveTheNewFullscreenBuffer() {
+    @Test fun aTimeoutOrOldDrawCannotAcknowledgeTheFullscreenRedraw() {
         val gate = FullscreenDrawFence()
         val window = Any(); val surface = Any()
         gate.arm(window, surface, 20)
-        assertNull(gate.buffer(window, surface, Int.MAX_VALUE, hasBuffer = false))
-        assertNull(gate.buffer(window, surface, 19, hasBuffer = true))
+        assertNull(gate.drawing(window, surface, Int.MAX_VALUE, hasTransaction = false))
+        assertNull(gate.drawing(window, surface, 19, hasTransaction = true))
         assertFalse(gate.committed)
-        val ticket = gate.buffer(window, surface, 20, hasBuffer = true)!!
+        val ticket = gate.drawing(window, surface, 20, hasTransaction = true)!!
         assertFalse(gate.committed)
         assertTrue(gate.commit(ticket))
         assertTrue(gate.committed)
     }
 
-    @Test fun aMigratedSurfaceRejectsTheOldBuffersLateCommit() {
+    @Test fun aMigratedSurfaceRejectsTheOldDrawsLateCommit() {
         val gate = FullscreenDrawFence()
         val window = Any(); val old = Any(); val replacement = Any()
         gate.arm(window, old, 5)
-        val oldBuffer = gate.buffer(window, old, 5, true)!!
+        val oldDraw = gate.drawing(window, old, 5, true)!!
         gate.arm(window, replacement, 6)
-        assertFalse(gate.commit(oldBuffer))
-        assertNull(gate.buffer(window, old, 50, true))
+        assertFalse(gate.commit(oldDraw))
+        assertNull(gate.drawing(window, old, 50, true))
         assertFalse(gate.committed)
-        val fresh = gate.buffer(window, replacement, 6, true)!!
+        val fresh = gate.drawing(window, replacement, 6, true)!!
         assertTrue(gate.commit(fresh))
     }
 
@@ -34,32 +34,32 @@ class FullscreenDrawFenceTest {
         val gate = FullscreenDrawFence()
         val oldWindow = Any(); val newWindow = Any(); val surface = Any()
         gate.arm(oldWindow, surface, 10)
-        val old = gate.buffer(oldWindow, surface, 10, true)!!
+        val old = gate.drawing(oldWindow, surface, 10, true)!!
         gate.arm(newWindow, surface, 1)
         assertFalse(gate.commit(old))
-        assertNull(gate.buffer(oldWindow, surface, 100, true))
-        assertTrue(gate.commit(gate.buffer(newWindow, surface, 1, true)!!))
+        assertNull(gate.drawing(oldWindow, surface, 100, true))
+        assertTrue(gate.commit(gate.drawing(newWindow, surface, 1, true)!!))
     }
 
     @Test fun replacingOnlyTheClientBufferLayerInvalidatesAnOldCommit() {
         val gate = FullscreenDrawFence()
         val window = Any(); val taskSurface = Any(); val oldClient = Any(); val newClient = Any()
         gate.arm(window, taskSurface, 4, oldClient)
-        val old = gate.buffer(window, taskSurface, 4, true, oldClient)!!
+        val old = gate.drawing(window, taskSurface, 4, true, oldClient)!!
         gate.arm(window, taskSurface, 5, newClient)
         assertFalse(gate.commit(old))
-        assertNull(gate.buffer(window, taskSurface, 9, true, oldClient))
-        assertTrue(gate.commit(gate.buffer(window, taskSurface, 5, true, newClient)!!))
+        assertNull(gate.drawing(window, taskSurface, 9, true, oldClient))
+        assertTrue(gate.commit(gate.drawing(window, taskSurface, 5, true, newClient)!!))
     }
 
     @Test fun newLayoutOnTheSameSurfaceAndCancellationInvalidateOldEvidence() {
         val gate = FullscreenDrawFence()
         val window = Any(); val surface = Any()
         gate.arm(window, surface, 3)
-        val oldLayout = gate.buffer(window, surface, 3, true)!!
+        val oldLayout = gate.drawing(window, surface, 3, true)!!
         gate.arm(window, surface, 4)
         assertFalse(gate.commit(oldLayout))
-        val newLayout = gate.buffer(window, surface, 4, true)!!
+        val newLayout = gate.drawing(window, surface, 4, true)!!
         gate.invalidate()
         assertFalse(gate.commit(newLayout))
         assertFalse(gate.committed)

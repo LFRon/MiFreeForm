@@ -40,9 +40,13 @@ class WindowSceneController(
     private var openAsMini = false
     private var awaitingSourceRelease = false
     private var sourceFrameAcknowledged = false
-    private enum class EntryVisual { SOURCE, REVEALING, LIVE }
+    private enum class EntryVisual { SOURCE, REPLACING, AWAITING_COMMIT, LIVE }
     private var entryVisual = EntryVisual.LIVE
-    private var entryRevealFrameId: Long? = null
+    private val entryReplacementFrames = mutableSetOf<Long>()
+    private var entryFlight = false
+    private var sourceImageAspect = 1f
+    private var entryReplacement: SpringTrack? = null
+    private var entryReplacementTimeMs = -1L
     private var entryLayoutChosen = false
     private var entrySource: SceneRect? = null
     private var entryCornerRadius = 0f
@@ -84,7 +88,8 @@ class WindowSceneController(
     fun shellSnapshot(): ShellSnapshot = shell.snapshot()
     fun normalViewport(): SceneRect = normalContent
     fun isAnimating(): Boolean = !destroyed && (motion != null || pendingCompletion != null ||
-        entryVisual == EntryVisual.REVEALING || fullscreenStage?.let { it != FullscreenStage.DRAGGING } == true)
+        entryVisual == EntryVisual.REPLACING || entryVisual == EntryVisual.AWAITING_COMMIT ||
+        fullscreenStage?.let { it != FullscreenStage.DRAGGING } == true)
     fun prefersHighFrameRate(): Boolean {
         if (destroyed) return false
         val input = shell.snapshot()
@@ -96,10 +101,12 @@ class WindowSceneController(
         if (destroyed) return emptyList()
         when (event) {
             is WindowSceneEvent.Input -> if (ready && taskReady && !awaitingSourceRelease &&
-                entryVisual == EntryVisual.LIVE && permitsInput(event.event)) input(event.event)
+                entryVisual == EntryVisual.LIVE && !entryFlight && permitsInput(event.event)) input(event.event)
             is WindowSceneEvent.OpenAsMini -> {
                 openAsMini = true
                 entrySource = event.source?.takeIf { it.width > 0f && it.height > 0f }
+                sourceImageAspect = event.sourceImageAspect?.takeIf { it.isFinite() && it > 0f }
+                    ?: entrySource?.let { it.width / it.height } ?: 1f
                 entryCornerRadius = event.sourceCornerRadius.takeIf { it.isFinite() }?.coerceAtLeast(0f) ?: 0f
                 entryVelocityX = event.velocityX.takeIf { it.isFinite() } ?: 0f
                 entryVelocityY = event.velocityY.takeIf { it.isFinite() } ?: 0f
@@ -126,7 +133,10 @@ class WindowSceneController(
                 if (ready) enterMini(lastCorner, 0L)
                 effects += WindowSceneEffect.ActivateEntry
             }
-            WindowSceneEvent.PresentationInvalidated -> if (ready) republish()
+            WindowSceneEvent.PresentationInvalidated -> if (ready) {
+                entryReplacementFrames.clear()
+                republish()
+            }
             is WindowSceneEvent.TaskColor -> {
                 val color = if (style.coloredController && event.color != 0) event.color else 0xFFFFFFFF.toInt()
                 if (color != controllerColor) {
@@ -137,6 +147,7 @@ class WindowSceneController(
             WindowSceneEvent.RestorePreview -> returnFromPull()
             WindowSceneEvent.VisualAvailable -> if (!ready && openAsMini && entrySource != null) {
                 entryVisual = EntryVisual.SOURCE
+                entryFlight = true
                 ready = true
                 shell.onInput(WindowInputEvent.RequestMini(windowId, 0L)).forEach(::command)
             }
@@ -182,6 +193,7 @@ class WindowSceneController(
             }
             is WindowSceneEvent.Visibility -> {
                 visible = event.visible
+                entryReplacementFrames.clear()
                 if (ready) {
                     // A hidden window may not draw. Transfer a terminal waiter to the new frame;
                     // an old callback must never finish a newer animation after unlock.
@@ -200,7 +212,8 @@ class WindowSceneController(
                 ready = false
                 taskReady = false
                 visible = false
-                entryRevealFrameId = null
+                entryReplacementFrames.clear()
+                entryReplacement = null
                 fullscreenStage = null
                 previewBase = null
                 fullscreenHint = false
@@ -468,8 +481,14 @@ class WindowSceneController(
     }
 
     private fun tick(event: WindowSceneEvent.Tick) {
-        if (awaitingSourceRelease) return
-        val active = motion?.takeIf { it.generation == event.generation } ?: return
+        if (awaitingSourceRelease || event.generation != generation) return
+        advanceEntryReplacement(event.timeMs)
+        val active = motion
+        if (active == null) {
+            if (entryVisual == EntryVisual.REPLACING || entryVisual == EntryVisual.AWAITING_COMMIT) present()
+            if (entryVisual == EntryVisual.REPLACING) effects += WindowSceneEffect.RequestFrame(generation)
+            return
+        }
         val dt = if (active.previousTimeMs < 0L) 0L else (event.timeMs - active.previousTimeMs).coerceAtLeast(0L)
         active.previousTimeMs = event.timeMs
         active.elapsedMs += dt
@@ -496,10 +515,12 @@ class WindowSceneController(
             pose = pose.copy(alpha = 1f, cover = 1f, outline = 1f)
             motion = null
             presentCompletion(active.completion)
+            if (entryVisual == EntryVisual.REPLACING) effects += WindowSceneEffect.RequestFrame(generation)
         } else if (settled) {
             pose = active.target
             motion = null
             presentCompletion(active.completion)
+            if (entryVisual == EntryVisual.REPLACING) effects += WindowSceneEffect.RequestFrame(generation)
         } else {
             present()
             effects += WindowSceneEffect.RequestFrame(active.generation)
@@ -551,19 +572,34 @@ class WindowSceneController(
     }
 
     private fun present(completion: Completion? = null) {
-        // Source pixels have the old app's aspect. Switch at the settled destination pose,
-        // after both owners are ready, and retain them until this exact replacement commits.
+        // Layout readiness and image replacement do not wait for every position spring to rest.
+        // Replace only a moving edge over a ready task; geometry retains its own velocity.
         if (entryVisual == EntryVisual.SOURCE && taskReady && !awaitingSourceRelease &&
-            motion == null && pendingCompletion == null && completion == null && visible && pose.alpha > 0f) {
-            entryVisual = EntryVisual.REVEALING
+            visible && pose.alpha > 0f && EntryTransitionPolicy.canReveal(pose.content, motion?.target?.content ?: pose.content)) {
+            entryVisual = if (style.timeScale <= 0f) EntryVisual.AWAITING_COMMIT else EntryVisual.REPLACING
+            entryReplacementTimeMs = -1L
+            entryReplacement = if (style.timeScale <= 0f) null else SpringTrack(1f, 0f,
+                EntryTransitionPolicy.replacementSpec(style.timeScale),
+                0.5f / pose.content.height.coerceAtLeast(1f), 0.05f)
+            if (entryReplacement != null) effects += WindowSceneEffect.RequestFrame(generation)
         }
+        if (entryVisual == EntryVisual.LIVE && motion == null && pendingCompletion == null && completion == null) entryFlight = false
         val id = nextId++
         lastFrameId = id
-        if (entryVisual == EntryVisual.REVEALING) {
-            entryRevealFrameId = id.takeIf { visible && pose.alpha > 0f }
-        }
+        if (entryVisual == EntryVisual.AWAITING_COMMIT && visible && pose.alpha > 0f) entryReplacementFrames += id
         if (completion != null) pendingCompletion = id to completion
         effects += WindowSceneEffect.Present(id, frame())
+    }
+
+    private fun advanceEntryReplacement(timeMs: Long) {
+        val replacement = entryReplacement ?: return
+        val dt = if (entryReplacementTimeMs < 0L) 0L else (timeMs - entryReplacementTimeMs).coerceAtLeast(0L)
+        entryReplacementTimeMs = timeMs
+        replacement.step(dt.toFloat())
+        if (replacement.atRest()) {
+            entryReplacement = null
+            entryVisual = EntryVisual.AWAITING_COMMIT
+        }
     }
 
     private fun republish() {
@@ -573,22 +609,22 @@ class WindowSceneController(
     }
 
     private fun frameCommitted(event: WindowSceneEvent.FrameCommitted) {
-        if (entryVisual == EntryVisual.REVEALING && event.frameId == entryRevealFrameId) {
-            entryRevealFrameId = null
+        if (entryVisual == EntryVisual.AWAITING_COMMIT && entryReplacementFrames.remove(event.frameId)) {
             when (event.status) {
                 CommandStatus.DONE -> {
                     entryVisual = EntryVisual.LIVE
+                    entryReplacementFrames.clear()
                     effects += WindowSceneEffect.ReleaseEntryImage
                     present()
                 }
-                CommandStatus.SUPERSEDED -> present() // Coalescing cannot bypass the release fence.
+                CommandStatus.SUPERSEDED -> if (entryReplacementFrames.isEmpty()) present()
                 CommandStatus.FAILED -> Unit // The common failure path below tears down the host.
             }
         }
         // Readiness is a transaction fence, not an opacity threshold. Without source geometry
         // the seed is transparent: waiting for a visible frame here would also prevent its clock
         // from starting, leaving both sides waiting until the platform watchdog fires.
-        if (awaitingSourceRelease && !sourceFrameAcknowledged &&
+        if (awaitingSourceRelease && !sourceFrameAcknowledged && visible &&
             event.status == CommandStatus.DONE && event.frameId == lastFrameId) {
             sourceFrameAcknowledged = true
             effects += WindowSceneEffect.SourceHandoffResult(CommandStatus.DONE)
@@ -602,7 +638,7 @@ class WindowSceneController(
                 return
             }
             pendingCompletion = null
-            if (event.status == CommandStatus.SUPERSEDED && waiting.second.fullscreenStep != null) {
+            if (event.status == CommandStatus.SUPERSEDED) {
                 // A bridge fence is not optional when its queued image was coalesced.
                 present(waiting.second)
             } else report(waiting.second, event.status)
@@ -616,6 +652,11 @@ class WindowSceneController(
             motion?.let { report(it.completion, CommandStatus.FAILED) }
             motion = null
             effects += WindowSceneEffect.Failed("present frame")
+        }
+        if (event.status == CommandStatus.SUPERSEDED && event.frameId == lastFrameId && ready && visible) {
+            // HWUI may commit pending transactions without drawing a buffer. Retry an otherwise
+            // un-replaced first/ordinary frame; this cannot acknowledge source or image release.
+            republish()
         }
     }
 
@@ -699,7 +740,11 @@ class WindowSceneController(
             taskAlpha = if (!visible || entryVisual == EntryVisual.SOURCE ||
                 fullscreenStage == FullscreenStage.HIDING || !live) 0f else pose.alpha,
             presentsLiveContent = live,
-            showEntryImage = entryVisual == EntryVisual.SOURCE
+            showEntryImage = entryVisual == EntryVisual.SOURCE || entryVisual == EntryVisual.REPLACING,
+            entryImage = if (entryVisual == EntryVisual.SOURCE || entryVisual == EntryVisual.REPLACING)
+                EntryTransitionPolicy.sourceVisual(c, sourceImageAspect,
+                    entryReplacement?.value ?: 1f) else null,
+            contentAlignment = if (entryFlight) ContentAlignment.TOP else ContentAlignment.CENTER
         )
     }
 

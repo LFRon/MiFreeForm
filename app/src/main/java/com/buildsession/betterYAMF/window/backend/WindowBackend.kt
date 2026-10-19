@@ -4,6 +4,7 @@ import android.app.ActivityManager
 import android.content.ComponentName
 import android.graphics.Rect
 import com.buildsession.betterYAMF.window.core.CommandStatus
+import com.buildsession.betterYAMF.window.core.ContentAlignment
 import com.buildsession.betterYAMF.window.core.FullscreenHandoffResult
 
 /** Cancels an outstanding command; its callback still completes once with SUPERSEDED. */
@@ -51,7 +52,8 @@ interface WindowBackend {
     /**
      * Main-thread animated exit. Caller has committed an opaque full-display bridge and stopped
      * all task presentation writes. onReleased reports actual ownership loss; completion happens
-     * exactly once, with a fresh fullscreen buffer commit + native motion completion for DONE.
+     * exactly once. DONE acknowledges the current fullscreen window's requested client redraw
+     * transaction commit and native motion completion; it does not inspect native buffer contents.
      * Cancellation never restores a released task's old transform. No native objects escape here.
      */
     fun handoffFullscreen(
@@ -65,8 +67,10 @@ interface WindowBackend {
     fun applyGeometry(taskId: Int, physicalBounds: Rect)
 
     /**
-     * Prepare the fixed app viewport while invisible. Completion acknowledges the bounds/buffer
-     * transaction; a visible animation must not start before it. Every outcome is reported once.
+     * Prepare the fixed app viewport while invisible. Completion acknowledges WM's requested
+     * resize transaction commit, the current window's drawn state and native motion completion.
+     * This is WM draw readiness, not a native buffer-content witness. A retained
+     * source image may already animate independently. Every outcome is reported once.
      * Cancelling/releasing the session invalidates its outstanding callbacks before another session
      * can use the same task identity.
      */
@@ -75,7 +79,8 @@ interface WindowBackend {
     /**
      * Write a complete presentation into the frame transaction without applying it.
      * Guarantees: uniform content scale, crop filling the visible rectangle, visual-pixel corner
-     * radius and common opacity. Subsequent frames never resize the app's logical viewport.
+     * radius, crop alignment and common opacity. Subsequent frames never resize the app's logical
+     * viewport. TOP keeps its top edge fixed while the visual viewport changes aspect.
      * Returns false if these guarantees cannot be supplied; no independent fallback transaction.
      */
     fun writePresentationInto(
@@ -83,7 +88,8 @@ interface WindowBackend {
         taskId: Int,
         physicalBounds: Rect,
         cornerRadiusPx: Float,
-        alpha: Float
+        alpha: Float,
+        contentAlignment: ContentAlignment = ContentAlignment.CENTER
     ): Boolean
 
     /**

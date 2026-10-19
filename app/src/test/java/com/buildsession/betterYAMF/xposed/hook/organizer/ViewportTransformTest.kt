@@ -1,9 +1,32 @@
 package com.buildsession.betterYAMF.xposed.hook.organizer
 
+import com.buildsession.betterYAMF.window.core.ContentAlignment
+import com.buildsession.betterYAMF.window.core.EntryTransitionPolicy
+import com.buildsession.betterYAMF.window.core.SceneRect
 import org.junit.Assert.*
 import org.junit.Test
 
 class ViewportTransformTest {
+    @Test fun entrySourceAndTaskUseTheSameTopAnchoredCoverProjection() {
+        for ((width, height) in listOf(400 to 400, 250 to 550, 550 to 250)) {
+            for ((logicalWidth, logicalHeight) in listOf(1264 to 2780, 1264 to 1605, 2780 to 1264)) {
+                val f = ViewportTransform.compute(logicalWidth, logicalHeight,
+                    80, 120, width, height, 20f, ContentAlignment.TOP)!!
+                val image = EntryTransitionPolicy.cover(SceneRect(80f, 120f, width.toFloat(), height.toFloat()),
+                    logicalWidth.toFloat() / logicalHeight)
+                assertEquals(0f, f.cropTop, 0f)
+                assertEquals(120f, f.y, 0.001f)
+                assertEquals(image.left, f.x, 0.001f)
+                assertEquals(image.top, f.y, 0.001f)
+                assertEquals(image.width, logicalWidth * f.scale, 0.001f)
+                assertEquals(image.height, logicalHeight * f.scale, 0.001f)
+                assertEquals(80f, f.x + f.cropLeft * f.scale, 0.001f)
+                assertEquals(width.toFloat(), f.cropWidth * f.scale, 0.001f)
+                assertEquals(height.toFloat(), f.cropHeight * f.scale, 0.001f)
+            }
+        }
+    }
+
     @Test fun sameAspectUsesUniformScaleWithoutCropping() {
         val f = ViewportTransform.compute(1000, 1400, 80, 120, 250, 350, 12f)!!
         assertEquals(0.25f, f.scale, 0f)

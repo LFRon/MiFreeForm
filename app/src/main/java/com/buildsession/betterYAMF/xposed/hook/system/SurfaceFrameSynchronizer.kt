@@ -23,7 +23,10 @@ internal class SurfaceFrameSynchronizer(private val view: View, private val touc
     private class Submission(
         val id: Long, val write: (SurfaceControl.Transaction) -> Boolean,
         val result: (CommandStatus) -> Unit
-    ) { var timeout: Runnable? = null }
+    ) {
+        var timeout: Runnable? = null
+        val draw = RenderedFrameCommit()
+    }
     private val handler = Handler(Looper.getMainLooper())
     private val executor = Executor { handler.post(it) }
     private var pending: Submission? = null
@@ -31,6 +34,7 @@ internal class SurfaceFrameSynchronizer(private val view: View, private val touc
     private var nextId = 0L
     private var disposed = false
     private var insetsListener: Any? = null
+    private val drawApi by lazy { HardwareFrameObserver() }
     private val preDraw = ViewTreeObserver.OnPreDrawListener {
         if (pending != null) {
             // The initial traversal may precede renderer initialization. Let it draw, retaining
@@ -47,6 +51,7 @@ internal class SurfaceFrameSynchronizer(private val view: View, private val touc
     }.getOrDefault(false)
 
     fun attach(): Boolean = runCatching {
+        drawApi // Select the HWUI completion interface once, before accepting scene submissions.
         val listenerClass = Class.forName("android.view.ViewTreeObserver\$OnComputeInternalInsetsListener")
         val infoClass = Class.forName("android.view.ViewTreeObserver\$InternalInsetsInfo")
         val regionMode = XposedHelpers.getStaticIntField(infoClass, "TOUCHABLE_INSETS_REGION")
@@ -98,7 +103,12 @@ internal class SurfaceFrameSynchronizer(private val view: View, private val touc
             check(submission.write(tx)) { "Task viewport is unavailable" }
             val root = XposedHelpers.callMethod(view, "getViewRootImpl") ?: error("ViewRoot is unavailable")
             check(XposedHelpers.callMethod(root, "isHardwareEnabled") == true) { "HWUI frame is unavailable" }
-            tx.addTransactionCommittedListener(executor) { complete(submission, CommandStatus.DONE) }
+            drawApi.observe(view) { produced -> handler.post {
+                submission.draw.drawn(produced)?.let { complete(submission, it) }
+            } }
+            tx.addTransactionCommittedListener(executor) {
+                submission.draw.committed()?.let { complete(submission, it) }
+            }
             val accepted = XposedHelpers.callMethod(root, "applyTransactionOnDraw",
                 arrayOf(SurfaceControl.Transaction::class.java), tx)
             check(accepted != false) { "ViewRoot rejected the frame transaction" }
@@ -143,4 +153,5 @@ internal class SurfaceFrameSynchronizer(private val view: View, private val touc
             true
         }.onFailure { log(TAG, "trusted hardware overlay capability unavailable", it) }.getOrDefault(false)
     }
+
 }

@@ -8,6 +8,21 @@ class WindowSceneControllerTest {
     private val normal = SceneRect(180f, 700f, 898f, 1139f)
     private val style = SceneStyle(3.2f, 20f, 12f)
 
+    @Test fun aHiddenFirstBridgeCannotRetireTheNativeSourceBeforeAVisibleReplacementCommits() {
+        val d = Driver().apply { autoPresent = false }
+        d.send(WindowSceneEvent.OpenAsMini(SceneRect(493f, 113f, 429f, 942f), awaitSourceRelease = true))
+        d.send(WindowSceneEvent.VisualAvailable)
+        val original = d.presentations.last()
+        d.send(WindowSceneEvent.Visibility(false))
+        d.send(WindowSceneEvent.FrameCommitted(original.frameId, CommandStatus.DONE))
+        d.send(WindowSceneEvent.FrameCommitted(d.presentations.last().frameId, CommandStatus.DONE))
+        assertTrue(d.effects.none { it is WindowSceneEffect.SourceHandoffResult })
+        d.send(WindowSceneEvent.Visibility(true))
+        assertTrue(d.effects.none { it is WindowSceneEffect.SourceHandoffResult })
+        d.send(WindowSceneEvent.FrameCommitted(d.presentations.last().frameId, CommandStatus.DONE))
+        assertEquals(1, d.effects.count { it is WindowSceneEffect.SourceHandoffResult })
+    }
+
     @Test fun retainedSourcePresentsBeforeAdoptionWithItsActualCornersAndWaitsForNativeFinish() {
         val d = Driver()
         val source = SceneRect(493f, 113f, 429f, 942f)
@@ -31,6 +46,7 @@ class WindowSceneControllerTest {
         d.tap()
         assertEquals(beforeInput, d.scene.snapshot())
         d.ready()
+        d.settle() // A late application draw still replaces the retained pixels before input opens.
         d.tap()
         d.settle()
         assertEquals(normal, d.scene.snapshot().content)
@@ -307,6 +323,146 @@ class WindowSceneControllerTest {
         d.settle()
         assertFalse(d.scene.snapshot().showEntryImage)
         assertEquals(1, d.effects.count { it == WindowSceneEffect.ReleaseEntryImage })
+    }
+
+    @Test fun sourceCoversTheChangingViewportAndPreservesItsHeaderWithoutLetterboxing() {
+        val d = Driver()
+        val source = SceneRect(493f, 113f, 429f, 942f)
+        d.send(WindowSceneEvent.OpenAsMini(source, awaitSourceRelease = true))
+        d.send(WindowSceneEvent.VisualAvailable)
+        d.send(WindowSceneEvent.SourceReleased)
+        d.settle()
+        d.presentations.forEach { presentation ->
+            val frame = presentation.frame
+            val image = requireNotNull(frame.entryImage)
+            assertEquals(source.width / source.height, image.bounds.width / image.bounds.height, 0.0001f)
+            assertTrue(image.bounds.left <= frame.content.left + 0.01f)
+            assertEquals(frame.content.top, image.bounds.top, 0f)
+            assertTrue(image.bounds.right >= frame.content.right - 0.01f)
+            assertTrue(image.bounds.bottom >= frame.content.bottom - 0.01f)
+            assertEquals(frame.content, image.clip)
+            assertEquals(0f, image.featherPx, 0f)
+            assertEquals(ContentAlignment.TOP, frame.contentAlignment)
+        }
+        assertEquals(0f, d.scene.snapshot().taskAlpha, 0f)
+    }
+
+    @Test fun sourceProjectionUsesPixelAspectRatherThanRoundedCardAspect() {
+        val d = Driver()
+        d.send(WindowSceneEvent.OpenAsMini(SceneRect(493f, 113f, 429f, 942f),
+            awaitSourceRelease = true, sourceImageAspect = 0.5f))
+        d.send(WindowSceneEvent.VisualAvailable)
+        assertEquals(0.5f, d.scene.snapshot().entryImage!!.bounds.let { it.width / it.height }, 0.0001f)
+    }
+
+    @Test fun anUndrawnFirstBridgeRetriesWithoutAcknowledgingTheSourceOrReleasingPixels() {
+        val d = Driver().apply { autoPresent = false }
+        d.send(WindowSceneEvent.OpenAsMini(SceneRect(493f, 113f, 429f, 942f), awaitSourceRelease = true))
+        d.send(WindowSceneEvent.VisualAvailable)
+        val first = d.presentations.last()
+        d.send(WindowSceneEvent.FrameCommitted(first.frameId, CommandStatus.SUPERSEDED))
+        val retry = d.presentations.last()
+        assertTrue(retry.frameId > first.frameId)
+        assertEquals(first.frame, retry.frame)
+        assertTrue(d.effects.none { it is WindowSceneEffect.SourceHandoffResult || it == WindowSceneEffect.ReleaseEntryImage })
+        d.send(WindowSceneEvent.FrameCommitted(retry.frameId, CommandStatus.DONE))
+        assertEquals(1, d.effects.count { it is WindowSceneEffect.SourceHandoffResult })
+        assertTrue(d.effects.none { it == WindowSceneEffect.ReleaseEntryImage })
+    }
+
+    @Test fun preparedContentReplacesOnlyAnEdgeDuringTheFlightWithoutRestartingGeometryOrReflowing() {
+        val d = Driver()
+        d.send(WindowSceneEvent.OpenAsMini(SceneRect(493f, 113f, 429f, 942f), awaitSourceRelease = true))
+        d.send(WindowSceneEvent.VisualAvailable)
+        d.send(WindowSceneEvent.SourceReleased)
+        d.ready()
+        repeat(50) {
+            if (d.scene.snapshot().entryImage?.clip == d.scene.snapshot().content) d.tick()
+        }
+        val replacing = d.scene.snapshot()
+        val image = requireNotNull(replacing.entryImage)
+        assertTrue(image.clip.height > 0f && image.clip.height < replacing.content.height)
+        assertTrue(image.featherPx > 0f && image.featherPx <= 2f)
+        assertEquals(replacing.content.top, image.clip.top, 0f)
+        assertEquals(replacing.content.width, image.clip.width, 0f)
+        assertEquals(ContentAlignment.TOP, replacing.contentAlignment)
+        assertEquals(1f, replacing.taskAlpha, 0f) // Opaque source and task outside the narrow seam.
+        assertTrue(replacing.miniFraction < 1f)
+        val beforeInput = d.scene.snapshot()
+        d.tap()
+        assertEquals(beforeInput, d.scene.snapshot())
+        d.tick()
+        assertTrue(d.scene.snapshot().content.left > replacing.content.left)
+        assertEquals(normal, d.scene.normalViewport())
+        d.settle()
+        assertEquals(1, d.effects.count { it == WindowSceneEffect.ReleaseEntryImage })
+        assertEquals(ContentAlignment.CENTER, d.scene.snapshot().contentAlignment)
+    }
+
+    @Test fun latePreparationReplacesAtTheSettledPoseAndSchedulesItsOwnFrames() {
+        val d = Driver()
+        d.send(WindowSceneEvent.OpenAsMini(SceneRect(493f, 113f, 429f, 942f), awaitSourceRelease = true))
+        d.send(WindowSceneEvent.VisualAvailable)
+        d.send(WindowSceneEvent.SourceReleased)
+        d.settle()
+        val settled = d.scene.snapshot().content
+        d.ready()
+        assertNotNull(d.requested)
+        assertEquals(settled, d.scene.snapshot().entryImage!!.clip)
+        repeat(5) { d.tick() }
+        assertTrue(d.scene.snapshot().entryImage!!.clip.height < settled.height)
+        assertEquals(settled, d.scene.snapshot().content)
+        d.settle()
+        assertFalse(d.scene.snapshot().showEntryImage)
+        assertEquals(1, d.effects.count { it == WindowSceneEffect.ReleaseEntryImage })
+        d.tap(); d.settle()
+        assertEquals(normal, d.scene.snapshot().content)
+    }
+
+    @Test fun replacementNeverUncoversAnUnpreparedTaskOrReversesItsEdge() {
+        val d = Driver()
+        d.send(WindowSceneEvent.OpenAsMini(SceneRect(493f, 113f, 429f, 942f), awaitSourceRelease = true))
+        d.send(WindowSceneEvent.VisualAvailable)
+        d.send(WindowSceneEvent.SourceReleased)
+        repeat(18) { d.tick() }
+        assertEquals(d.scene.snapshot().content, d.scene.snapshot().entryImage!!.clip)
+        assertEquals(0f, d.scene.snapshot().entryImage!!.featherPx, 0f)
+        assertEquals(0f, d.scene.snapshot().taskAlpha, 0f)
+        d.ready()
+        var previous = 1f
+        repeat(100) {
+            val f = d.scene.snapshot()
+            val remaining = f.entryImage?.let { it.clip.height / f.content.height } ?: 0f
+            assertTrue(remaining <= previous + 0.0001f)
+            previous = remaining
+            d.tick()
+        }
+        assertEquals(0f, previous, 0f)
+        assertEquals(1, d.effects.filterIsInstance<WindowSceneEffect.Prepare>().size)
+        assertEquals(1, d.effects.count { it == WindowSceneEffect.ReleaseEntryImage })
+    }
+
+    @Test fun aCommittedReplacementIsNotStarvedByNewerPositionFrames() {
+        val d = Driver()
+        d.send(WindowSceneEvent.OpenAsMini(SceneRect(80f, 113f, 429f, 942f), awaitSourceRelease = true))
+        d.send(WindowSceneEvent.VisualAvailable)
+        d.send(WindowSceneEvent.SourceReleased)
+        d.ready()
+        d.autoPresent = false
+        repeat(100) { if (d.scene.snapshot().showEntryImage) d.tick() }
+        val replacement = d.presentations.last()
+        assertFalse(replacement.frame.showEntryImage)
+        assertTrue(d.effects.none { it == WindowSceneEffect.ReleaseEntryImage })
+        d.tick()
+        assertTrue(d.presentations.last().frameId > replacement.frameId)
+        d.send(WindowSceneEvent.FrameCommitted(replacement.frameId, CommandStatus.DONE))
+        assertEquals(1, d.effects.count { it == WindowSceneEffect.ReleaseEntryImage })
+        assertTrue(d.scene.isAnimating()) // Image ownership and geometry completion are distinct.
+        val pose = d.scene.snapshot()
+        d.tap()
+        assertEquals(pose, d.scene.snapshot())
+        d.autoPresent = true
+        d.settle()
     }
 
     @Test fun cancellationAfterTheBridgeAckIsASeparateOperationWithOneTerminalResult() {
