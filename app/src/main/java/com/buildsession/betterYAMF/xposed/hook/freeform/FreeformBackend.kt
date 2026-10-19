@@ -25,11 +25,12 @@ object FreeformBackend {
     private const val TAG = "reYAMF_FreeformBackend"
     private const val WINDOWING_MODE_FREEFORM = 5
 
-    private val diagnostics = BuildConfig.DEBUG
     private val platformPolicy by lazy { FreeformPolicies.forSdk(Build.VERSION.SDK_INT) }
-    private val lastLogByTask = ConcurrentHashMap<Int, String>()
-    private val snapshotLogged =
-        java.util.Collections.newSetFromMap(ConcurrentHashMap<Int, Boolean>())
+    // Accessed only under the compile-time build flag, so release never initializes log caches.
+    private object Diagnostics {
+        val lastLogByTask = ConcurrentHashMap<Int, String>()
+        val snapshotLogged = java.util.Collections.newSetFromMap(ConcurrentHashMap<Int, Boolean>())
+    }
     private val defangedSinks = ConcurrentHashMap.newKeySet<String>()
 
     // 任务对象弱引用缓存：物理矩形变化（拖动/缩放）时无需 WM 事件即可主动重施加变换
@@ -107,8 +108,10 @@ object FreeformBackend {
     /** A released presentation cannot leave delayed work targeting a later session. */
     fun forgetPresentation(taskId: Int) {
         clearPendingReassert(taskId)
-        lastLogByTask.remove(taskId)
-        snapshotLogged.remove(taskId)
+        if (BuildConfig.DEBUG) {
+            Diagnostics.lastLogByTask.remove(taskId)
+            Diagnostics.snapshotLogged.remove(taskId)
+        }
     }
 
     private fun runPendingReassert(taskId: Int) {
@@ -135,17 +138,20 @@ object FreeformBackend {
         }
     }
 
-    private fun logOnce(taskId: Int, message: String) {
-        if (!diagnostics) return
-        if (lastLogByTask.put(taskId, message) != message) {
-            log(TAG, message)
+    private inline fun logOnce(taskId: Int, message: () -> String) {
+        if (BuildConfig.DEBUG) {
+            val text = message()
+            if (Diagnostics.lastLogByTask.put(taskId, text) != text) {
+                log(TAG) { text }
+            }
         }
     }
 
-    private fun logOnceTask(task: Any, message: String) {
-        if (!diagnostics) return
-        val taskId = runCatching { XposedHelpers.getIntField(task, "mTaskId") }.getOrDefault(-1)
-        logOnce(taskId, message)
+    private inline fun logOnceTask(task: Any, message: () -> String) {
+        if (BuildConfig.DEBUG) {
+            val taskId = runCatching { XposedHelpers.getIntField(task, "mTaskId") }.getOrDefault(-1)
+            logOnce(taskId, message)
+        }
     }
 
     private fun isTaskAnimating(task: Any): Boolean =
@@ -162,7 +168,7 @@ object FreeformBackend {
         }
         if (isTaskAnimating(task)) {
             schedulePendingReassert(task)
-            logOnceTask(task, "transform skip source=$source reason=animating")
+            logOnceTask(task) { "transform skip source=$source reason=animating" }
             return
         }
         applyTaskTransform(task, clearCrop)
@@ -170,7 +176,7 @@ object FreeformBackend {
 
     fun init(classLoader: ClassLoader) {
         val policy = platformPolicy
-        if (diagnostics) {
+        if (BuildConfig.DEBUG) {
             log(TAG) { "init with policy: ${policy.displayName}" }
         }
         runCatching { hookRelaunch(classLoader) }.onFailure { log(TAG, "hookRelaunch failed", it) }
@@ -222,7 +228,7 @@ object FreeformBackend {
                 }
             }
         }
-        if (diagnostics) {
+        if (BuildConfig.DEBUG) {
             log(TAG) { "global touch tracker installed on ${cls.name}" }
         }
     }
@@ -268,7 +274,7 @@ object FreeformBackend {
                 log(TAG, "sink defang failed", it)
             }
         }
-        if (diagnostics) {
+        if (BuildConfig.DEBUG) {
             log(TAG) { "input sink defang installed (getInputWindowHandleWrapper, NOT_TOUCHABLE=$notTouchable)" }
         }
     }
@@ -308,7 +314,7 @@ object FreeformBackend {
                     // 过渡的落点帧直接复用同一套变换：位置/缩放/圆角/crop 随过渡原子提交，
                     // 与其它锚点幂等一致，不再与过渡抢表面
                     applyTaskTransformOnTransaction(task, transaction, policy.clearTaskCrop)
-                    logOnce(taskId, "transition commit transform task=$taskId")
+                    logOnce(taskId) { "transition commit transform task=$taskId" }
                 }
             }.onFailure {
                 log(TAG, "transition participation failed", it)
@@ -363,7 +369,7 @@ object FreeformBackend {
                 log(TAG, "post-finish leash reassert failed", it)
             }
         }
-        if (diagnostics) {
+        if (BuildConfig.DEBUG) {
             log(TAG) { "transition participation installed (onTransactionReady/finish)" }
         }
     }
@@ -497,7 +503,7 @@ object FreeformBackend {
         }.hookAfter { param ->
             if (isTaskAnimating(param.thisObject)) {
                 schedulePendingReassert(param.thisObject)
-                logOnceTask(param.thisObject, "transform skip source=updateSurfaceSize reason=animating")
+                logOnceTask(param.thisObject) { "transform skip source=updateSurfaceSize reason=animating" }
                 return@hookAfter
             }
             val transaction = param.args[0] as? SurfaceControl.Transaction ?: return@hookAfter
@@ -516,7 +522,7 @@ object FreeformBackend {
             reassertTaskTransform(param.thisObject, policy.clearTaskCrop, "prepareSurfaces")
         }
 
-        if (diagnostics) {
+        if (BuildConfig.DEBUG) {
             log(TAG) { "reassert anchors installed (clearCrop=${policy.clearTaskCrop}, file=Task)" }
         }
     }
@@ -554,12 +560,12 @@ object FreeformBackend {
             return
         }
         if (!WindowSessions.hostedTasks.contains(taskId)) {
-            logOnce(taskId, "transform skip task=$taskId reason=untracked")
+            logOnce(taskId) { "transform skip task=$taskId reason=untracked" }
             return
         }
         val physicalBounds = SmoothWindowBackend.geometryOf(taskId)
         if (physicalBounds == null) {
-            logOnce(taskId, "transform skip task=$taskId reason=no-physical-bounds")
+            logOnce(taskId) { "transform skip task=$taskId reason=no-physical-bounds" }
             return
         }
 
@@ -579,23 +585,23 @@ object FreeformBackend {
             spoofedHeight = spoofedBounds.height()
         )
         if (transform == null) {
-            logOnce(taskId, "transform skip task=$taskId reason=empty-spoofed-bounds")
+            logOnce(taskId) { "transform skip task=$taskId reason=empty-spoofed-bounds" }
             return
         }
 
         val surfaceControl = XposedHelpers.getObjectField(task, "mSurfaceControl") as? SurfaceControl
         if (surfaceControl == null) {
-            logOnce(taskId, "transform skip task=$taskId reason=no-surface")
+            logOnce(taskId) { "transform skip task=$taskId reason=no-surface" }
             return
         }
 
-        if (diagnostics && snapshotLogged.add(taskId)) {
+        if (BuildConfig.DEBUG && Diagnostics.snapshotLogged.add(taskId)) {
             val requested = runCatching {
                 XposedHelpers.callMethod(task, "getRequestedOverrideBounds") as Rect
             }.getOrNull()
             log(TAG) { "transform context task=$taskId configBounds=$spoofedBounds requested=$requested physical=$physicalBounds" }
         }
-        logOnce(taskId, "transform task=$taskId scale=(${transform.scaleX},${transform.scaleY}) spoofed=$spoofedBounds physical=$physicalBounds")
+        logOnce(taskId) { "transform task=$taskId scale=(${transform.scaleX},${transform.scaleY}) spoofed=$spoofedBounds physical=$physicalBounds" }
 
         XposedHelpers.callMethod(transaction, "setMatrix", surfaceControl, transform.scaleX, 0f, 0f, transform.scaleY)
         XposedHelpers.callMethod(transaction, "setPosition", surfaceControl, transform.positionX, transform.positionY)

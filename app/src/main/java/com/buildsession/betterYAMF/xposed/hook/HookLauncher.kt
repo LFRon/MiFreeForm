@@ -486,10 +486,7 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                         4 -> c.newInstance(action, activity, itemInfo, null)
                         3 -> c.newInstance(action, activity, itemInfo)
                         else -> {
-                            log(
-                                TAG,
-                                "unknown RemoteActionShortcut constructor: ${c.toGenericString()}"
-                            )
+                            log(TAG) { "unknown RemoteActionShortcut constructor: ${c.toGenericString()}" }
                             null
                         }
                     }

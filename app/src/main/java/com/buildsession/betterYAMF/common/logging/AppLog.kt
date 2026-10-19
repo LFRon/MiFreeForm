@@ -3,12 +3,10 @@ package com.buildsession.betterYAMF.common.logging
 import android.util.Log
 import com.buildsession.betterYAMF.BuildConfig
 
-/** One severity policy for the app and injected processes. Release emits WARN/ERROR only. */
+/** One severity policy for the app and injected processes. Release emits WARN/ERROR only.
+ * Debug messages must be lazy: the release compiler removes their evaluation with the log call.
+ */
 object AppLog {
-    fun debug(tag: String, message: String) {
-        if (BuildConfig.DEBUG) Log.d(tag, message)
-    }
-
     inline fun debug(tag: String, message: () -> String) {
         if (BuildConfig.DEBUG) Log.d(tag, message())
     }

@@ -1,11 +1,12 @@
 package com.buildsession.betterYAMF.xposed.utils
 
 import com.buildsession.betterYAMF.common.logging.AppLog
+import com.buildsession.betterYAMF.BuildConfig
 
 // Keep logging independent of Utils.kt's Android context initialization and Xposed's INFO sink.
-fun log(tag: String, message: String) = AppLog.debug(tag, message)
-
-inline fun log(tag: String, message: () -> String) = AppLog.debug(tag, message)
+inline fun log(tag: String, message: () -> String) {
+    if (BuildConfig.DEBUG) AppLog.debug(tag, message)
+}
 
 fun log(tag: String, message: String, error: Throwable) = AppLog.error(tag, message, error)
 
