@@ -46,12 +46,17 @@ import com.github.kyuubiran.ezxhelper.utils.newInstance
 import com.github.kyuubiran.ezxhelper.utils.paramCount
 import com.buildsession.betterYAMF.R
 import com.buildsession.betterYAMF.xposed.hook.launcher.LauncherInputAnchors
+import com.buildsession.betterYAMF.xposed.hook.launcher.LauncherCoordinateMapper
+import com.buildsession.betterYAMF.xposed.hook.launcher.LauncherMotionCoordinates
+import com.buildsession.betterYAMF.xposed.hook.launcher.LauncherOverlayDisplay
 import com.buildsession.betterYAMF.xposed.hook.launcher.ManagedTaskFilter
 import com.buildsession.betterYAMF.xposed.hook.launcher.RecentsDropHandoff
 import com.buildsession.betterYAMF.xposed.hook.launcher.RecentsDropZoneView
 import com.buildsession.betterYAMF.xposed.hook.launcher.RecentsEntryCapture
 import com.buildsession.betterYAMF.common.ipc.Protocol
+import com.buildsession.betterYAMF.window.core.RecentsGesturePolicy
 import com.buildsession.betterYAMF.xposed.utils.log
+import com.buildsession.betterYAMF.xposed.utils.logWarning
 import com.buildsession.betterYAMF.xposed.utils.registerReceiver
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.IXposedHookZygoteInit
@@ -71,6 +76,7 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
     private var isRegistered = false
 
     private var mDropZoneView: RecentsDropZoneView? = null
+    private var mOverlayDisplay: LauncherOverlayDisplay? = null
     private val mDropZoneRect = Rect()
     private val mMainHandler: Handler by lazy { Handler(Looper.getMainLooper()) }
     private var mScreenHeight = 0
@@ -80,41 +86,31 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
     private var mCurrentTaskId = -1
 
     private var mCurrentRotation = 0
-    private var mIsAlreadyVisual = true
     private var mIsPotentialSwipeUp = false
     private var mSuppressArmed = false
 
-    private fun updateDimensions(context: android.content.Context) {
-        val wm = context.getSystemService(android.content.Context.WINDOW_SERVICE) as WindowManager
-        val display = wm.defaultDisplay
-        val displayMetrics = android.util.DisplayMetrics()
-        display.getRealMetrics(displayMetrics)
-        
-        val newWidth = displayMetrics.widthPixels
-        val newHeight = displayMetrics.heightPixels
-        
-        if (newWidth != mScreenWidth || newHeight != mScreenHeight) {
-            mScreenWidth = newWidth
-            mScreenHeight = newHeight
-            
-            // 横屏下让释放区更宽一些，竖屏下保持原
-            val zoneWidthPercent = if (mScreenWidth > mScreenHeight) 0.5 else 0.6
-            val zoneHeightPercent = if (mScreenWidth > mScreenHeight) 0.4 else 0.3
-            
-            val zoneWidth = (mScreenWidth * zoneWidthPercent).toInt()
-            val zoneHeight = (mScreenHeight * zoneHeightPercent).toInt()
-            mDropZoneRect.set(mScreenWidth - zoneWidth, 0, mScreenWidth, zoneHeight)
-            
-            mMainHandler.post {
-                mDropZoneView?.let { view ->
-                    val lp = view.layoutParams as? WindowManager.LayoutParams ?: return@post
-                    lp.width = zoneWidth
-                    lp.height = zoneHeight
-                    wm.updateViewLayout(view, lp)
-                }
-            }
-            // log(TAG, "Dimensions updated: ${mScreenWidth}x${mScreenHeight}, Zone: $mDropZoneRect")
-        }
+    private fun cancelDropTarget() {
+        mDropZoneView?.visibility = View.GONE
+        mDropZoneView?.sourcePose = null
+        mIsShowingZone = false
+        mIsPotentialSwipeUp = false
+        mSuppressArmed = false
+        mCurrentTaskId = -1
+    }
+
+    private fun updateDropZoneLayout(frame: LauncherOverlayDisplay.Frame) {
+        val zone = RecentsGesturePolicy.dropZone(frame.width, frame.height)
+        val changed = mDropZoneRect.left != zone.left || mDropZoneRect.top != zone.top ||
+            mDropZoneRect.right != zone.right || mDropZoneRect.bottom != zone.bottom
+        mDropZoneRect.set(zone.left, zone.top, zone.right, zone.bottom)
+        if (changed) log(TAG) { "drop target viewport=${frame.width}x${frame.height} rotation=${frame.rotation} bounds=$mDropZoneRect" }
+        val view = mDropZoneView ?: return
+        val lp = view.layoutParams as? WindowManager.LayoutParams ?: return
+        if (lp.width == zone.width && lp.height == zone.height) return
+        lp.width = zone.width
+        lp.height = zone.height
+        // Native gravity anchors the edge; never rotate an old rectangle into a different corner.
+        mOverlayDisplay?.windowManager?.updateViewLayout(view, lp)
     }
 
     override fun initZygote(startupParam: IXposedHookZygoteInit.StartupParam) {
@@ -149,12 +145,14 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                 // 确保在主线程执行 UI 操作
                 mMainHandler.post {
                     try {
-                        updateDimensions(context)
+                        val overlay = mOverlayDisplay ?: LauncherOverlayDisplay(context).also { mOverlayDisplay = it }
+                        val frame = checkNotNull(overlay.frame()) { "Overlay display is not configured" }
+                        updateDropZoneLayout(frame)
                         val zoneWidth = mDropZoneRect.width()
                         val zoneHeight = mDropZoneRect.height()
 
                         if (mDropZoneView == null) {
-                            mDropZoneView = RecentsDropZoneView(context).apply {
+                            mDropZoneView = RecentsDropZoneView(overlay.context).apply {
                                 visibility = View.GONE
                             }
                             updateDropZoneColor(false)
@@ -168,16 +166,18 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                                         WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
                                 width = zoneWidth
                                 height = zoneHeight
-                                gravity = Gravity.TOP or Gravity.END
+                                gravity = Gravity.TOP or Gravity.RIGHT
+                                layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
                             }
 
-                            val windowManager =
-                                context.getSystemService(android.content.Context.WINDOW_SERVICE) as WindowManager
-                            windowManager.addView(mDropZoneView, lp)
+                            overlay.windowManager.addView(mDropZoneView, lp)
                             // log(TAG, "Successfully added mDropZoneView to WindowManager")
                         }
                     } catch (e: Exception) {
-                        log(TAG, "Error creating drop zone view", e)
+                        mDropZoneView = null
+                        mOverlayDisplay?.close()
+                        mOverlayDisplay = null
+                        logWarning(TAG, "Drop overlay unavailable; preserve native gesture", e)
                     }
                 }
             }
@@ -199,56 +199,42 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                         action != MotionEvent.ACTION_UP &&
                         action != MotionEvent.ACTION_CANCEL) return
 
-                    val context = param.thisObject as android.content.Context
-                    
-                    // 仅在 DOWN 时更新屏幕信息，减少开销
                     if (action == MotionEvent.ACTION_DOWN) {
-                        updateDimensions(context)
-                        val wm = context.getSystemService(android.content.Context.WINDOW_SERVICE) as WindowManager
-                        mCurrentRotation = wm.defaultDisplay.rotation
-                        val rawX = event.rawX
-                        val rawY = event.rawY
-                        
-                        mIsAlreadyVisual = if (mCurrentRotation == 0) {
-                            true
-                        } else if (mScreenWidth > mScreenHeight) {
-                            rawX > mScreenHeight + 100 || rawY > mScreenHeight + 100
-                        } else {
-                            rawX > mScreenWidth + 100 || rawY > mScreenWidth + 100
-                        }
+                        // Retire the old source before native DOWN can reuse Launcher state,
+                        // including when this device cannot normalize the new event's rotation.
+                        RecentsDropHandoff.onGestureStarted(XposedHelpers.callMethod(event, "getDisplayId") as Int)
                     }
-
-                    val rawX = event.rawX
-                    val rawY = event.rawY
-                    val correctedX: Float
-                    val correctedY: Float
-
-                    if (mIsAlreadyVisual) {
-                        correctedX = rawX
-                        correctedY = rawY
-                    } else {
-                        if (mCurrentRotation == 1) { // ROTATION_90 (Landscape CCW)
-                            correctedX = rawY
-                            correctedY = mScreenHeight.toFloat() - rawX
-                        } else if (mCurrentRotation == 3) { // ROTATION_270 (Landscape CW)
-                            correctedX = mScreenWidth.toFloat() - rawY
-                            correctedY = rawX
-                        } else {
-                            correctedX = rawX
-                            correctedY = rawY
-                        }
+                    val frame = mOverlayDisplay?.frame()?.takeIf { mDropZoneView != null }
+                        ?: run { cancelDropTarget(); return }
+                    if (action == MotionEvent.ACTION_DOWN) {
+                        mScreenWidth = frame.width
+                        mScreenHeight = frame.height
+                        mCurrentRotation = frame.rotation
                     }
+                    if (mScreenWidth <= 0 || mScreenHeight <= 0) return
+                    val point = LauncherMotionCoordinates.point(event, frame.rotation, frame.width, frame.height)
+                        ?: run {
+                            cancelDropTarget()
+                            return
+                        }
+                    // Only swipe progress stays in DOWN coordinates. Hover and release use the
+                    // CURRENT overlay frame, exactly like the visible top-right target.
+                    val gesturePoint = LauncherCoordinateMapper.rotatePoint(point.x, point.y,
+                        frame.rotation, mCurrentRotation, mScreenWidth, mScreenHeight)
+                    val correctedX = point.x
+                    val correctedY = point.y
+                    updateDropZoneLayout(frame)
 
-                    val isInZone = mDropZoneRect.contains(correctedX.toInt(), correctedY.toInt())
+                    val isInZone = correctedX >= mDropZoneRect.left && correctedX < mDropZoneRect.right &&
+                        correctedY >= mDropZoneRect.top && correctedY < mDropZoneRect.bottom
 
                     when (action) {
                         MotionEvent.ACTION_DOWN -> {
-                            RecentsDropHandoff.onGestureStarted(XposedHelpers.callMethod(event, "getDisplayId") as Int)
-                            mStartY = correctedY
+                            mStartY = gesturePoint.y
                             mIsShowingZone = false
                             mCurrentTaskId = -1
                             // 只有从底部 5% 区域开始的滑动才被认为是潜在的上划手势
-                            mIsPotentialSwipeUp = correctedY > mScreenHeight * 0.95
+                            mIsPotentialSwipeUp = gesturePoint.y > mScreenHeight * 0.95
                             mSuppressArmed = mIsPotentialSwipeUp
                             if (mSuppressArmed) {
                                 suppressRecentsGesture(900L)
@@ -259,7 +245,7 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                         MotionEvent.ACTION_MOVE -> {
                             if (!mIsPotentialSwipeUp) return
                             
-                            val diffY = mStartY - correctedY
+                            val diffY = mStartY - gesturePoint.y
                             val threshold = mScreenHeight * 0.2
                             
                             if (diffY > threshold) {
@@ -383,18 +369,18 @@ class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
                 RecentsDropHandoff.dispose()
                 // log(TAG, "TouchInteractionService#onDestroy hooked")
                 mMainHandler.post {
-                    val context = it.thisObject as android.app.Service
-                    val windowManager =
-                        context.getSystemService(android.content.Context.WINDOW_SERVICE) as WindowManager
                     mDropZoneView?.let { view ->
                         try {
-                            windowManager.removeView(view)
+                            mOverlayDisplay?.windowManager?.removeViewImmediate(view)
                             // log(TAG, "Removed mDropZoneView from WindowManager")
                         } catch (e: Exception) {
                             log(TAG, "Error removing drop zone view", e)
                         }
                         mDropZoneView = null
                     }
+                    mOverlayDisplay?.close()
+                    mOverlayDisplay = null
+                    cancelDropTarget()
                 }
             }
         }

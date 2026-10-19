@@ -26,6 +26,7 @@ import com.buildsession.betterYAMF.common.model.resolveWindowSizePx
 import com.buildsession.betterYAMF.common.model.EntrySnapshot
 import com.buildsession.betterYAMF.window.backend.WindowOperation
 import com.buildsession.betterYAMF.window.core.CommandStatus
+import com.buildsession.betterYAMF.window.core.FullscreenStage
 import com.buildsession.betterYAMF.window.core.RegionId
 import com.buildsession.betterYAMF.window.core.SceneMetrics
 import com.buildsession.betterYAMF.window.core.SceneRect
@@ -38,6 +39,7 @@ import com.buildsession.betterYAMF.window.core.WindowSceneEvent
 import com.buildsession.betterYAMF.window.core.WindowRegistration
 import com.buildsession.betterYAMF.window.core.WindowShellRegistry
 import com.buildsession.betterYAMF.window.execution.LatestOperation
+import com.buildsession.betterYAMF.window.session.WindowSessions
 import com.buildsession.betterYAMF.xposed.hook.system.SurfaceFrameSynchronizer
 import com.buildsession.betterYAMF.xposed.hook.system.EntrySnapshotTransport
 import com.buildsession.betterYAMF.xposed.hook.system.SystemBarMetrics
@@ -47,6 +49,7 @@ import com.buildsession.betterYAMF.xposed.services.YAMFManager.config
 import com.buildsession.betterYAMF.xposed.utils.Instances
 import com.buildsession.betterYAMF.xposed.utils.log
 import com.buildsession.betterYAMF.xposed.utils.logError
+import com.buildsession.betterYAMF.xposed.utils.logWarning
 import java.util.ArrayDeque
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -77,14 +80,19 @@ class AppWindow(
     private var adoptionRequested = false
     private var stagedEntry = false
     private var frameResults = 0
-    private var bridgeReleased = false
-    private var liveRevealStarted = false
-    private var liveRevealFrameId = Long.MAX_VALUE
     private var lastVisibility: Boolean? = null
     private val preparation = LatestOperation<WindowOperation> { it.cancel() }
+    private val fullscreenHandoff = LatestOperation<WindowOperation> { it.cancel() }
+    private var fullscreenReleased = false
+    private var loggedFullscreenStage: FullscreenStage? = null
+    private var iconPackage: String? = null
     private var sourcePackage: String? = null
     private var sourceHandoffId = 0L
     private var sourceReleaseTimeout: Runnable? = null
+    private var sourceReleased = false
+    private var launcherRotation = -1
+    private var entryReadyFrame: Choreographer.FrameCallback? = null
+    private var entryWaitLogged = false
 
     private val metrics = readMetrics()
     private val style = SceneStyle(
@@ -128,7 +136,10 @@ class AppWindow(
         override fun onDisplayAdded(displayId: Int) = Unit
         override fun onDisplayRemoved(displayId: Int) = Unit
         override fun onDisplayChanged(displayId: Int) {
-            if (displayId == Display.DEFAULT_DISPLAY) enqueue(WindowSceneEvent.Metrics(readMetrics()))
+            if (displayId == Display.DEFAULT_DISPLAY) {
+                enqueue(WindowSceneEvent.Metrics(readMetrics()))
+                if (sourceReleased && stagedEntry && !adoptionRequested) tryActivateStagedEntry()
+            }
         }
     }
     private val resetReceiver = object : BroadcastReceiver() {
@@ -183,7 +194,14 @@ class AppWindow(
     private fun execute(effect: WindowSceneEffect) {
         if (destroyed) return
         when (effect) {
+            WindowSceneEffect.ActivateEntry -> {
+                if (!adoptionRequested && sourceReleased) {
+                    if (YAMFManager.activateWindowTask(this)) enqueue(WindowSceneEvent.SourceReleased)
+                    else if (!destroyed) destroy(releaseTask = adoptionRequested, restoreToFront = true)
+                }
+            }
             is WindowSceneEffect.Prepare -> {
+                updateApplicationIcon()
                 val ticket = preparation.begin()
                 val operation = YAMFManager.windowBackend.preparePresentation(
                     currentTaskId, effect.normalContent.rounded().toAndroidRect()
@@ -204,39 +222,59 @@ class AppWindow(
                 preparation.attach(ticket, operation)
             }
             is WindowSceneEffect.Present -> {
-                val bridge = view.hasEntryImage && !liveRevealStarted
-                // The old image and new app have different layout aspects. Replace only at a
-                // settled, prepared pose; never center-crop the new layout into the old card.
-                val revealLive = bridge && taskPrepared && !scene.isAnimating() && effect.frame.alpha > 0f
-                if (revealLive) {
-                    liveRevealStarted = true
-                    liveRevealFrameId = effect.frameId
+                val stage = effect.frame.fullscreen?.stage
+                if (stage != loggedFullscreenStage) {
+                    loggedFullscreenStage = stage
+                    log(TAG) { "fullscreen stage=$stage window=$windowId task=$currentTaskId frame=${effect.frameId} live=${effect.frame.presentsLiveContent}" }
                 }
-                view.render(effect.frame, showEntryImage = bridge && !revealLive)
+                view.render(effect.frame)
                 synchronizer.present({ transaction ->
-                    if (!adoptionRequested && bridge) true
+                    if (!effect.frame.presentsLiveContent || !adoptionRequested && effect.frame.showEntryImage) true
                     else YAMFManager.windowBackend.writePresentationInto(
                         transaction, currentTaskId, effect.frame.content.rounded().toAndroidRect(),
-                        effect.frame.contentRadius, if (bridge && !revealLive) 0f else effect.frame.alpha
+                        effect.frame.contentRadius, effect.frame.taskAlpha
                     )
                 }) { status ->
                     if (destroyed) return@present
-                    if (effect.frameId >= liveRevealFrameId && status == CommandStatus.DONE && !bridgeReleased) {
-                        bridgeReleased = true
-                        view.releaseEntryImage()
-                        log("reYAMF_EntryV2") { "live committed task=$currentTaskId handoff=$sourceHandoffId frame=${effect.frameId} content=${effect.frame.content}" }
-                    }
                     if (status == CommandStatus.FAILED) {
                         logError(TAG, "frame commit failed window=$windowId task=$currentTaskId handoff=$sourceHandoffId frame=${effect.frameId}")
                     } else if (++frameResults <= 2) {
-                        log("reYAMF_EntryV2") { "frame status=$status task=$currentTaskId handoff=$sourceHandoffId frame=${effect.frameId} bridge=$bridge alpha=${effect.frame.alpha} content=${effect.frame.content}" }
+                        log("reYAMF_EntryV2") { "frame status=$status task=$currentTaskId handoff=$sourceHandoffId frame=${effect.frameId} bridge=${effect.frame.showEntryImage} alpha=${effect.frame.alpha} content=${effect.frame.content}" }
                     }
                     enqueue(WindowSceneEvent.FrameCommitted(effect.frameId, status))
                 }
             }
             is WindowSceneEffect.RequestFrame -> requestFrame(effect.generation)
             is WindowSceneEffect.SourceHandoffResult -> reportSourceHandoff(effect.status)
+            // The existing wire protocol distinguishes an initial frame ACK and a later abort
+            // by the source owner's phase. Keep that compatibility detail outside CORE.
+            is WindowSceneEffect.CancelSourceHandoff -> reportSourceHandoff(effect.reason)
+            WindowSceneEffect.ReleaseEntryImage -> {
+                view.releaseEntryImage()
+                log("reYAMF_EntryV2") { "entry image released after live commit task=$currentTaskId handoff=$sourceHandoffId" }
+            }
             is WindowSceneEffect.SystemCommand -> executeSystem(effect.command)
+            is WindowSceneEffect.HandoffFullscreen -> {
+                val ticket = fullscreenHandoff.begin()
+                log(TAG) { "fullscreen handoff window=$windowId task=$currentTaskId command=${effect.commandId}" }
+                val operation = YAMFManager.windowBackend.handoffFullscreen(currentTaskId, onReleased = {
+                    fullscreenReleased = true
+                    if (!destroyed) YAMFManager.onHostTaskReleased(this)
+                }) { result ->
+                    if (!destroyed && fullscreenHandoff.complete(ticket)) {
+                        if (result.ownershipKnown && result.taskReleased && !fullscreenReleased) {
+                            fullscreenReleased = true
+                            YAMFManager.onHostTaskReleased(this)
+                        }
+                        if (result.status != CommandStatus.DONE) {
+                            logWarning(TAG, "fullscreen handoff result=$result window=$windowId task=$currentTaskId command=${effect.commandId}")
+                        }
+                        enqueue(WindowSceneEvent.FullscreenHandoff(effect.commandId, result))
+                    }
+                }
+                fullscreenHandoff.attach(ticket, operation)
+            }
+            WindowSceneEffect.FinishFullscreen -> destroy(releaseTask = false, restoreToFront = true)
             WindowSceneEffect.FinishClose -> onDestroy(releaseTask = true)
             is WindowSceneEffect.Failed -> {
                 logError(TAG, "${effect.operation} failed window=$windowId task=$currentTaskId")
@@ -288,10 +326,6 @@ class AppWindow(
             is WindowCommand.DropZoneShow -> showDropZone()
             is WindowCommand.DropHover -> dropZone?.render(command.hover, command.active)
             is WindowCommand.DropZoneHide -> dropZone?.visibility = View.GONE
-            is WindowCommand.RequestFullscreen -> {
-                if (YAMFManager.switchTaskToFullscreen(currentTaskId)) onDestroy(releaseTask = false)
-                else enqueue(WindowSceneEvent.RestorePreview)
-            }
             is WindowCommand.RaiseWindow -> {
                 // Explicit user selection raises the child task; automatic Home maintenance
                 // still respects the backend's always-on-top capability below.
@@ -303,13 +337,14 @@ class AppWindow(
 
     override fun markOpenAsMini(
         dropX: Int, dropY: Int, sourceBounds: android.graphics.Rect?, awaitSourceRelease: Boolean,
-        sourcePackage: String?, handoffId: Long, entrySnapshot: EntrySnapshot?
+        sourcePackage: String?, handoffId: Long, entrySnapshot: EntrySnapshot?, launcherRotation: Int
     ) {
         val source = sourceBounds?.takeIf { it.width() > 0 && it.height() > 0 }?.let {
             SceneRect(it.left.toFloat(), it.top.toFloat(), it.width().toFloat(), it.height().toFloat())
         }
         this.sourcePackage = sourcePackage
         sourceHandoffId = handoffId
+        this.launcherRotation = launcherRotation.takeIf { it in 0..3 } ?: -1
         stagedEntry = entrySnapshot != null
         enqueue(WindowSceneEvent.OpenAsMini(source, dropX, dropY, awaitSourceRelease,
             entrySnapshot?.cornerRadius ?: 0f, entrySnapshot?.velocityX ?: 0f, entrySnapshot?.velocityY ?: 0f))
@@ -335,12 +370,48 @@ class AppWindow(
     }
 
     override fun onSourceReleased(handoffId: Long) {
-        if (handoffId == sourceHandoffId) {
+        if (Looper.myLooper() != handler.looper) {
+            handler.post { onSourceReleased(handoffId) }
+            return
+        }
+        if (destroyed || handoffId != sourceHandoffId || sourceReleased) return
+        sourceReleased = true
+        if (stagedEntry && !adoptionRequested) {
+            tryActivateStagedEntry()
+        } else {
             sourceReleaseTimeout?.let(handler::removeCallbacks)
             sourceReleaseTimeout = null
-            if (stagedEntry && !adoptionRequested && !YAMFManager.activateWindowTask(this)) return
             enqueue(WindowSceneEvent.SourceReleased)
         }
+    }
+
+    private fun tryActivateStagedEntry() {
+        if (destroyed || !sourceReleased || adoptionRequested) return
+        val rotation = displayManager.getDisplay(Display.DEFAULT_DISPLAY)?.rotation ?: -1
+        val aligned = rotation in 0..3 && (launcherRotation < 0 || rotation == launcherRotation)
+        val stable = aligned && YAMFManager.windowBackend.isTaskSurfaceStable(currentTaskId)
+        if (!stable) {
+            if (!entryWaitLogged) {
+                entryWaitLogged = true
+                log("reYAMF_EntryV2") { "destination wait task=$currentTaskId handoff=$sourceHandoffId homeRotation=$launcherRotation displayRotation=$rotation stable=$stable" }
+            }
+            if (entryReadyFrame == null) {
+                entryReadyFrame = Choreographer.FrameCallback {
+                    entryReadyFrame = null
+                    tryActivateStagedEntry()
+                }.also { Choreographer.getInstance().postFrameCallback(it) }
+            }
+            return
+        }
+        entryReadyFrame?.let { Choreographer.getInstance().removeFrameCallback(it) }
+        entryReadyFrame = null
+        sourceReleaseTimeout?.let(handler::removeCallbacks)
+        sourceReleaseTimeout = null
+        val destination = readMetrics()
+        val size = config.resolveWindowSizePx(destination.width, destination.height)
+        enqueue(WindowSceneEvent.EntryLayout(destination, size.first, size.second,
+            if (destination.height >= destination.width) config.portraitY else config.landscapeY))
+        log("reYAMF_EntryV2") { "destination ready task=$currentTaskId handoff=$sourceHandoffId homeRotation=$launcherRotation displayRotation=$rotation metrics=$destination viewport=${scene.normalViewport()}" }
     }
     override fun onPresentationInvalidated() = enqueue(WindowSceneEvent.PresentationInvalidated)
 
@@ -355,12 +426,23 @@ class AppWindow(
     }
 
     override fun onTaskDescriptionChanged(taskInfo: ActivityManager.RunningTaskInfo) {
-        if (taskInfo.taskId == currentTaskId) enqueue(WindowSceneEvent.TaskColor(taskInfo.taskDescription?.backgroundColor ?: 0))
+        if (taskInfo.taskId == currentTaskId) {
+            updateApplicationIcon(taskInfo.topActivity?.packageName)
+            enqueue(WindowSceneEvent.TaskColor(taskInfo.taskDescription?.backgroundColor ?: 0))
+        }
+    }
+
+    private fun updateApplicationIcon(packageName: String? = WindowSessions.taskActivities[currentTaskId]?.packageName) {
+        if (packageName == null || packageName == iconPackage) return
+        runCatching { context.packageManager.getApplicationIcon(packageName) }.onSuccess {
+            iconPackage = packageName
+            view.setApplicationIcon(it)
+        }.onFailure { logWarning(TAG, "application icon unavailable task=$currentTaskId package=$packageName", it) }
     }
 
     override fun onTaskVisibilityChanged(visible: Boolean) {
         fun applyVisibility() {
-            if (destroyed || !taskPrepared || lastVisibility == visible) return
+            if (destroyed || fullscreenReleased || !taskPrepared || lastVisibility == visible) return
             // A hidden preparation is a resource phase, not a request to hide the user's bridge.
             // There is no delayed false capable of overriding a later native true.
             lastVisibility = visible
@@ -373,10 +455,10 @@ class AppWindow(
     override fun onHomeTop() = keepAboveHome()
 
     private fun keepAboveHome() {
-        if (destroyed || YAMFManager.windowBackend.isAlwaysOnTopActive()) return
+        if (destroyed || !adoptionRequested || fullscreenReleased || YAMFManager.windowBackend.isAlwaysOnTopActive()) return
         // Non-AOT capability fallback: never reorder while the user or recents owns a gesture.
         handler.post {
-            if (!destroyed && currentTaskId > 0 && !YAMFManager.windowBackend.isTouchActive() &&
+            if (!destroyed && adoptionRequested && !fullscreenReleased && currentTaskId > 0 && !YAMFManager.windowBackend.isTouchActive() &&
                 SystemClock.uptimeMillis() >= YAMFManager.windowBackend.recentsGestureSuppressUntilMs()) {
                 YAMFManager.windowBackend.bringTaskToFront(currentTaskId)
             }
@@ -416,7 +498,7 @@ class AppWindow(
             // already received native completion before creation and can release their frame wait.
             sourceReleaseTimeout = Runnable {
                 sourceReleaseTimeout = null
-                logError(TAG, "source acknowledgement timeout window=$windowId handoff=$sourceHandoffId")
+                logError(TAG, "entry readiness timeout window=$windowId handoff=$sourceHandoffId sourceReleased=$sourceReleased homeRotation=$launcherRotation")
                 if (stagedEntry) destroy(releaseTask = adoptionRequested, restoreToFront = true)
                 else enqueue(WindowSceneEvent.SourceReleased)
             }.also { handler.postDelayed(it, 5000L) } // LoS's surface-sync failure bound.
@@ -445,11 +527,14 @@ class AppWindow(
         shellRegistry.unregister(intentController)
         destroyed = true
         preparation.cancel()
+        fullscreenHandoff.cancel()
         events.clear()
         frameCallback?.let { Choreographer.getInstance().removeFrameCallback(it) }
         frameCallback = null
         handler.removeCallbacksAndMessages(null)
         sourceReleaseTimeout = null
+        entryReadyFrame?.let { Choreographer.getInstance().removeFrameCallback(it) }
+        entryReadyFrame = null
         // Detach the full-display input window before removing its restricted touch-region
         // listener. Frame failures are posted out of ViewRoot traversal by the synchronizer.
         runCatching { if (added) Instances.windowManager.removeViewImmediate(view) }
@@ -460,7 +545,7 @@ class AppWindow(
         runCatching { setFrameRateBoost(false) }
         runCatching { displayManager.unregisterDisplayListener(displayListener) }
         runCatching { context.unregisterReceiver(resetReceiver) }
-        if (releaseTask && currentTaskId > 0 && adoptionRequested) {
+        if (releaseTask && !fullscreenReleased && currentTaskId > 0 && adoptionRequested) {
             // A failed entry restores the app. Only an intentional close sends it to the back.
             runCatching { YAMFManager.switchTaskToFullscreen(currentTaskId, toFront = restoreToFront) }
                 .onFailure { log(TAG, "release failed", it) }

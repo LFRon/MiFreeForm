@@ -16,6 +16,8 @@ class WindowSceneController(
 ) {
     private var metrics = initialMetrics
     private var normalContent = initialContent
+    private var preferredNormalWidth = initialContent.width
+    private var preferredNormalHeight = initialContent.height
     private var pose = Pose(initialContent, 0f, 0f)
     private var ready = false
     private var taskReady = false
@@ -32,10 +34,16 @@ class WindowSceneController(
     private var resizeBase = initialContent
     private var previewBase: Pose? = null
     private var fullscreenHint = false
+    private var fullscreenStage: FullscreenStage? = null
+    private var fullscreenCommandId = 0L
     private var controllerColor = 0xFFFFFFFF.toInt()
     private var openAsMini = false
     private var awaitingSourceRelease = false
     private var sourceFrameAcknowledged = false
+    private enum class EntryVisual { SOURCE, REVEALING, LIVE }
+    private var entryVisual = EntryVisual.LIVE
+    private var entryRevealFrameId: Long? = null
+    private var entryLayoutChosen = false
     private var entrySource: SceneRect? = null
     private var entryCornerRadius = 0f
     private var entryVelocityX = 0f
@@ -45,19 +53,25 @@ class WindowSceneController(
     private var lastCorner = DropKind.CORNER_TR
     private var effects = mutableListOf<WindowSceneEffect>()
 
-    private data class Pose(val content: SceneRect, val mini: Float, val alpha: Float, val normalChrome: Float = 1f - mini, val entryRadius: Float = 0f)
-    private enum class Property { X, Y, W, H, MINI, NORMAL_CHROME, ALPHA, ENTRY_RADIUS }
+    private data class Pose(
+        val content: SceneRect, val mini: Float, val alpha: Float,
+        val normalChrome: Float = 1f - mini, val entryRadius: Float = 0f,
+        val cover: Float = 0f, val outline: Float = 0f
+    )
+    private enum class Property { X, Y, W, H, MINI, NORMAL_CHROME, ALPHA, ENTRY_RADIUS, COVER, OUTLINE }
+    private enum class FullscreenStep { EXPAND, RELEASE, FINISH, RESTORE }
     private data class Completion(
         val miniCommandId: Long,
         val close: Boolean,
-        val fullscreen: WindowCommand.RequestFullscreen? = null
+        val fullscreenStep: FullscreenStep? = null
     )
     private data class Motion(
         val generation: Long,
         val tracks: Map<Property, SpringTrack>,
-        val target: Pose,
+        var target: Pose,
         val completion: Completion,
         val keepInside: Boolean,
+        val fullscreenKind: FullscreenMotionKind? = null,
         var previousTimeMs: Long = -1L,
         var elapsedMs: Long = 0L
     )
@@ -69,8 +83,10 @@ class WindowSceneController(
     fun snapshot(): WindowSceneFrame = frame()
     fun shellSnapshot(): ShellSnapshot = shell.snapshot()
     fun normalViewport(): SceneRect = normalContent
-    fun isAnimating(): Boolean = motion != null || pendingCompletion != null
+    fun isAnimating(): Boolean = !destroyed && (motion != null || pendingCompletion != null ||
+        entryVisual == EntryVisual.REVEALING || fullscreenStage?.let { it != FullscreenStage.DRAGGING } == true)
     fun prefersHighFrameRate(): Boolean {
+        if (destroyed) return false
         val input = shell.snapshot()
         return isAnimating() || input.dragging || input.resizing || previewBase != null
     }
@@ -79,7 +95,8 @@ class WindowSceneController(
         effects = mutableListOf()
         if (destroyed) return emptyList()
         when (event) {
-            is WindowSceneEvent.Input -> if (ready && taskReady && !awaitingSourceRelease) input(event.event)
+            is WindowSceneEvent.Input -> if (ready && taskReady && !awaitingSourceRelease &&
+                entryVisual == EntryVisual.LIVE && permitsInput(event.event)) input(event.event)
             is WindowSceneEvent.OpenAsMini -> {
                 openAsMini = true
                 entrySource = event.source?.takeIf { it.width > 0f && it.height > 0f }
@@ -93,7 +110,21 @@ class WindowSceneController(
             }
             WindowSceneEvent.SourceReleased -> {
                 awaitingSourceRelease = false
-                motion?.let { effects += WindowSceneEffect.RequestFrame(it.generation) }
+                val active = motion
+                if (active != null) effects += WindowSceneEffect.RequestFrame(active.generation)
+                else if (ready) republish()
+            }
+            is WindowSceneEvent.EntryLayout -> if (awaitingSourceRelease && !entryLayoutChosen && !taskReady && prepareId == 0L) {
+                entryLayoutChosen = true
+                metrics = event.metrics
+                shell.onScreenMetricsChanged(metrics.width, metrics.height)
+                normalContent = initialContent(metrics, style, event.width, event.height, event.preferredTop)
+                preferredNormalWidth = normalContent.width
+                preferredNormalHeight = normalContent.height
+                // Retarget the frozen source bridge from its exact current pose. Do this before
+                // Prepare: the live application must receive this final aspect exactly once.
+                if (ready) enterMini(lastCorner, 0L)
+                effects += WindowSceneEffect.ActivateEntry
             }
             WindowSceneEvent.PresentationInvalidated -> if (ready) republish()
             is WindowSceneEvent.TaskColor -> {
@@ -103,13 +134,9 @@ class WindowSceneController(
                     if (ready) republish()
                 }
             }
-            WindowSceneEvent.RestorePreview -> {
-                val base = previewBase ?: pose.copy(alpha = 1f)
-                previewBase = null
-                fullscreenHint = false
-                startMotion(base, MiniAnimKind.OPEN)
-            }
+            WindowSceneEvent.RestorePreview -> returnFromPull()
             WindowSceneEvent.VisualAvailable -> if (!ready && openAsMini && entrySource != null) {
+                entryVisual = EntryVisual.SOURCE
                 ready = true
                 shell.onInput(WindowInputEvent.RequestMini(windowId, 0L)).forEach(::command)
             }
@@ -137,13 +164,17 @@ class WindowSceneController(
             }
             is WindowSceneEvent.Tick -> tick(event)
             is WindowSceneEvent.FrameCommitted -> frameCommitted(event)
+            is WindowSceneEvent.FullscreenHandoff -> fullscreenHandoff(event)
             is WindowSceneEvent.Metrics -> {
                 // A refresh-rate vote also produces onDisplayChanged. It is not a geometry event.
                 if (metrics != event.metrics) {
                     metrics = event.metrics
                     shell.onScreenMetricsChanged(metrics.width, metrics.height)
-                    normalContent = clamp(fitNormalContent(normalContent), 0f)
-                    if (ready) {
+                    normalContent = clamp(fitNormalContent(normalContent.copy(
+                        width = preferredNormalWidth, height = preferredNormalHeight)), 0f)
+                    if (ready && fullscreenStage != null) {
+                        fullscreenMetricsChanged()
+                    } else if (ready) {
                         if (shell.snapshot().mode == ShellMode.MINI) enterMini(lastCorner, 0L)
                         else startMotion(Pose(normalContent, 0f, pose.alpha), MiniAnimKind.OPEN)
                     }
@@ -157,7 +188,7 @@ class WindowSceneController(
                     republish()
                 }
             }
-            WindowSceneEvent.ResetPosition -> if (ready) {
+            WindowSceneEvent.ResetPosition -> if (ready && fullscreenStage == null) {
                 val c = pose.content
                 val centered = c.copy(left = (metrics.width - c.width) / 2f, top = (metrics.height - c.height) / 2f)
                 startMotion(Pose(clamp(centered, pose.mini), pose.mini, 1f), MiniAnimKind.OPEN)
@@ -166,15 +197,33 @@ class WindowSceneController(
                 endSourceHandoff(CommandStatus.SUPERSEDED)
                 interrupt()
                 destroyed = true
+                ready = false
+                taskReady = false
+                visible = false
+                entryRevealFrameId = null
+                fullscreenStage = null
+                previewBase = null
+                fullscreenHint = false
+                pose = pose.copy(alpha = 0f, cover = 0f, outline = 0f)
             }
         }
         return effects.toList()
+    }
+
+    private fun permitsInput(event: WindowInputEvent): Boolean = when (fullscreenStage) {
+        null -> true
+        FullscreenStage.DRAGGING -> event !is WindowInputEvent.Press ||
+            event.region == RegionId.BAR_BOTTOM || event.region == RegionId.BAR_SIDE
+        FullscreenStage.RETURNING -> event is WindowInputEvent.Press &&
+            (event.region == RegionId.BAR_BOTTOM || event.region == RegionId.BAR_SIDE)
+        else -> false
     }
 
     private fun input(event: WindowInputEvent) {
         if (event.windowId != windowId) return
         if (event is WindowInputEvent.Press) {
             interrupt()
+            if (fullscreenStage == FullscreenStage.RETURNING) fullscreenStage = FullscreenStage.DRAGGING
             dragBase = pose
             resizeBase = pose.content
         }
@@ -186,6 +235,7 @@ class WindowSceneController(
             is WindowCommand.EnterMini -> enterMini(command.corner, command.cmdId)
             is WindowCommand.ExitMini -> {
                 previewBase = null
+                fullscreenStage = null
                 startMotion(Pose(clamp(normalContent, 0f), 0f, 1f), MiniAnimKind.OPEN, command.cmdId)
             }
             is WindowCommand.MoveBy -> {
@@ -219,47 +269,136 @@ class WindowSceneController(
                 val maxFactor = minOf(maxWidth / resizeBase.width, maxHeight / resizeBase.height).coerceAtLeast(ResizePolicy.MIN_FACTOR)
                 val f = factor.coerceAtMost(maxFactor)
                 pose = pose.copy(content = resizeBase.copy(width = resizeBase.width * f, height = resizeBase.height * f))
-                rememberNormal()
+                rememberNormal(resized = true)
                 present()
             }
             is WindowCommand.ResizePreviewCommit ->
                 startMotion(Pose(clamp(pose.content, 0f), 0f, 1f), MiniAnimKind.OPEN)
             is WindowCommand.VerticalDragPreview -> {
                 val base = previewBase ?: pose.also { previewBase = it }
-                // Preserve the existing bar gesture's 0.7x close / 1.2x fullscreen preview policy.
-                val scale = if (command.downward) 1f + command.progress * 0.2f else 1f - command.progress * 0.3f
-                val c = base.content
-                pose = base.copy(
-                    content = SceneRect(c.left + c.width * (1f - scale) / 2f, c.top + c.height * (1f - scale) / 2f, c.width * scale, c.height * scale),
-                    alpha = if (command.downward) 1f else 1f - command.progress
-                )
-                fullscreenHint = command.showFullscreenHint
-                present()
+                fullscreenStage = FullscreenStage.DRAGGING
+                val c = dragBase.content
+                val scale = 1f - command.progress.coerceIn(0f, 1f) * 0.3f
+                val content = if (command.downward)
+                    FullscreenAnimPolicy.previewContent(c, command.progress, metrics, style.margin,
+                        if (metrics.height >= metrics.width) 0f else style.sideBar * dragBase.normalChrome,
+                        if (metrics.height >= metrics.width) style.bottomBar * dragBase.normalChrome else 0f)
+                else SceneRect(c.left + c.width * (1f - scale) / 2f,
+                    c.top + c.height * (1f - scale) / 2f, c.width * scale, c.height * scale)
+                val armed = command.downward && command.showFullscreenHint
+                followPull(dragBase.copy(
+                    content = content,
+                    alpha = if (command.downward) base.alpha else base.alpha * (1f - command.progress),
+                    cover = if (armed) 1f else 0f,
+                    outline = if (armed) 1f else 0f
+                ))
+                fullscreenHint = armed
             }
-            is WindowCommand.ClearVerticalDragPreview -> {
-                val base = previewBase ?: pose.copy(alpha = 1f)
-                previewBase = null
-                fullscreenHint = false
-                startMotion(base, MiniAnimKind.OPEN)
-            }
+            is WindowCommand.ClearVerticalDragPreview -> returnFromPull()
             is WindowCommand.RequestClose -> {
+                fullscreenStage = null
+                previewBase = null
+                pose = pose.copy(cover = 0f, outline = 0f)
                 fullscreenHint = false
                 val c = pose.content
                 startMotion(Pose(SceneRect(c.left + c.width / 2f, c.top + c.height / 2f, 1f, 1f), pose.mini, 0f), MiniAnimKind.MINIMIZE, close = true)
             }
             is WindowCommand.RequestFullscreen -> {
-                interrupt()
+                previewBase = previewBase ?: pose
+                fullscreenCommandId = nextId++
                 fullscreenHint = false
-                // Drain the last preview frame before releasing the task. Otherwise an already
-                // queued frame could restore its old matrix/alpha after the fullscreen reset.
-                present(Completion(0L, close = false, fullscreen = command))
+                fullscreenStage = FullscreenStage.COVERING
+                startMotion(pose.copy(alpha = 1f, cover = 1f, outline = 1f), MiniAnimKind.OPEN,
+                    fullscreenKind = FullscreenMotionKind.COVER, fullscreenStep = FullscreenStep.EXPAND)
             }
             else -> effects += WindowSceneEffect.SystemCommand(command)
         }
     }
 
+    private fun followPull(target: Pose) {
+        val active = motion
+        if (active?.fullscreenKind == FullscreenMotionKind.FOLLOW && active.completion.fullscreenStep == null) {
+            active.target = target
+            active.elapsedMs = 0L
+            values(target).forEach { (property, value) -> active.tracks.getValue(property).retarget(value) }
+            effects += WindowSceneEffect.RequestFrame(active.generation)
+        } else {
+            startMotion(target, MiniAnimKind.OPEN, fullscreenKind = FullscreenMotionKind.FOLLOW)
+        }
+    }
+
+    private fun returnFromPull() {
+        val base = previewBase ?: return
+        fullscreenHint = false
+        fullscreenStage = FullscreenStage.RETURNING
+        startMotion(base.copy(cover = 0f, outline = 0f), MiniAnimKind.OPEN,
+            fullscreenKind = FullscreenMotionKind.RETURN, fullscreenStep = FullscreenStep.RESTORE)
+    }
+
+    private fun expandFullscreen() {
+        val card = frame().outer
+        val radius = fullscreenRadius()
+        fullscreenStage = FullscreenStage.EXPANDING
+        // The opaque frame has committed with taskAlpha=0. Only the independent bridge moves
+        // from now on; a new app layout never gets cropped into the old window's aspect.
+        pose = pose.copy(content = card, mini = 0f, normalChrome = 0f, entryRadius = radius,
+            alpha = 1f, cover = 1f, outline = 1f)
+        startMotion(pose.copy(content = displayRect(), entryRadius = 0f), MiniAnimKind.OPEN,
+            fullscreenKind = FullscreenMotionKind.EXPAND, fullscreenStep = FullscreenStep.RELEASE)
+    }
+
+    private fun fullscreenHandoff(event: WindowSceneEvent.FullscreenHandoff) {
+        if (fullscreenStage != FullscreenStage.WAITING || event.commandId != fullscreenCommandId) return
+        if (!event.result.ownershipKnown) {
+            fullscreenStage = FullscreenStage.FINISHED
+            effects += WindowSceneEffect.Failed("fullscreen ownership unavailable")
+        } else if (event.result.status == CommandStatus.DONE && event.result.taskReleased) {
+            fullscreenStage = FullscreenStage.REVEALING
+            startMotion(pose.copy(cover = 0f, outline = 0f), MiniAnimKind.OPEN,
+                fullscreenKind = FullscreenMotionKind.REVEAL, fullscreenStep = FullscreenStep.FINISH)
+        } else if (event.result.taskReleased) {
+            // Ownership cannot be rolled back by writing the obsolete task pose.
+            fullscreenStage = FullscreenStage.FINISHED
+            effects += WindowSceneEffect.FinishFullscreen
+        } else {
+            // Restore the still-owned task under an opaque card, then reveal its original pose.
+            pose = (previewBase ?: pose).copy(cover = 1f, outline = 1f)
+            returnFromPull()
+        }
+    }
+
+    private fun fullscreenMetricsChanged() {
+        when (fullscreenStage) {
+            FullscreenStage.EXPANDING -> startMotion(pose.copy(content = displayRect(), entryRadius = 0f),
+                MiniAnimKind.OPEN, fullscreenKind = FullscreenMotionKind.EXPAND, fullscreenStep = FullscreenStep.RELEASE)
+            FullscreenStage.WAITING -> {
+                pose = pose.copy(content = displayRect(), entryRadius = 0f)
+                republish()
+            }
+            FullscreenStage.REVEALING -> {
+                pose = pose.copy(content = displayRect(), entryRadius = 0f)
+                startMotion(pose.copy(cover = 0f, outline = 0f), MiniAnimKind.OPEN,
+                    fullscreenKind = FullscreenMotionKind.REVEAL, fullscreenStep = FullscreenStep.FINISH)
+            }
+            FullscreenStage.FINISHED, null -> Unit
+            else -> {
+                previewBase = previewBase?.copy(content = normalContent)
+                returnFromPull()
+            }
+        }
+    }
+
+    private fun displayRect() = SceneRect(0f, 0f, metrics.width.toFloat(), metrics.height.toFloat())
+
+    private fun fullscreenRadius(): Float = when (fullscreenStage) {
+        FullscreenStage.EXPANDING, FullscreenStage.WAITING, FullscreenStage.REVEALING,
+        FullscreenStage.FINISHED -> pose.entryRadius
+        else -> maxOf(style.barCorner, style.miniCorner)
+    }
+
     private fun enterMini(corner: DropKind, commandId: Long) {
         previewBase = null
+        fullscreenStage = null
         fullscreenHint = false
         lastCorner = corner
         val miniInsets = MiniPolicy.ShellInsets(style.bezel.roundToInt(), style.bezel.roundToInt(), style.bezel.roundToInt(), style.bezel.roundToInt())
@@ -288,14 +427,18 @@ class WindowSceneController(
         startMotion(Pose(target, 1f, 1f), MiniAnimKind.MINIMIZE, commandId)
     }
 
-    private fun startMotion(target: Pose, kind: MiniAnimKind, commandId: Long = 0L, close: Boolean = false) {
+    private fun startMotion(
+        target: Pose, kind: MiniAnimKind, commandId: Long = 0L, close: Boolean = false,
+        fullscreenKind: FullscreenMotionKind? = null, fullscreenStep: FullscreenStep? = null
+    ) {
         val seed = motion?.tracks?.mapValues { it.value.velocity } ?: velocitySeed
         interrupt()
         velocitySeed = null
-        val completion = Completion(commandId, close)
+        val completion = Completion(commandId, close, fullscreenStep)
         if (style.timeScale <= 0f || pose == target) {
             pose = target
-            present(completion)
+            if (fullscreenStep == FullscreenStep.EXPAND) velocitySeed = seed
+            presentCompletion(completion)
             return
         }
         val fromValues = values(pose)
@@ -306,18 +449,20 @@ class WindowSceneController(
                 Property.Y -> MiniAnimProp.TY
                 Property.W, Property.MINI, Property.NORMAL_CHROME, Property.ENTRY_RADIUS -> MiniAnimProp.W
                 Property.H -> MiniAnimProp.H
-                Property.ALPHA -> MiniAnimProp.ALPHA
+                Property.ALPHA, Property.COVER, Property.OUTLINE -> MiniAnimProp.ALPHA
             }
-            val unitless = property == Property.MINI || property == Property.NORMAL_CHROME || property == Property.ALPHA
+            val unitless = property == Property.MINI || property == Property.NORMAL_CHROME ||
+                property == Property.ALPHA || property == Property.COVER || property == Property.OUTLINE
             SpringTrack(
                 fromValues.getValue(property), targetValues.getValue(property),
-                MiniAnimPolicy.spec(kind, prop, style.timeScale),
+                if (fullscreenKind != null) FullscreenAnimPolicy.spec(fullscreenKind, unitless, style.timeScale)
+                else MiniAnimPolicy.spec(kind, prop, style.timeScale),
                 if (unitless) 0.001f else 0.25f, if (unitless) 0.01f else 15f
             ).also { track -> seed?.get(property)?.let { track.seed(track.value, it) } }
         }
         val id = ++generation
         val keepInside = clamp(pose.content, pose.mini) == pose.content && clamp(target.content, target.mini) == target.content
-        motion = Motion(id, tracks, target, completion, keepInside)
+        motion = Motion(id, tracks, target, completion, keepInside, fullscreenKind)
         present()
         if (!awaitingSourceRelease) effects += WindowSceneEffect.RequestFrame(id)
     }
@@ -333,7 +478,8 @@ class WindowSceneController(
         pose = Pose(
             SceneRect(value(Property.X), value(Property.Y), value(Property.W).coerceAtLeast(1f), value(Property.H).coerceAtLeast(1f)),
             value(Property.MINI).coerceIn(0f, 1f), value(Property.ALPHA).coerceIn(0f, 1f),
-            value(Property.NORMAL_CHROME).coerceIn(0f, 1f), value(Property.ENTRY_RADIUS).coerceAtLeast(0f)
+            value(Property.NORMAL_CHROME).coerceIn(0f, 1f), value(Property.ENTRY_RADIUS).coerceAtLeast(0f),
+            value(Property.COVER).coerceIn(0f, 1f), value(Property.OUTLINE).coerceIn(0f, 1f)
         )
         if (active.keepInside) {
             val bounded = clamp(pose.content, pose.mini)
@@ -343,14 +489,26 @@ class WindowSceneController(
         }
         val settled = active.tracks.values.all { it.atRest() } ||
             active.elapsedMs >= (MiniAnimPolicy.SETTLE_TIMEOUT_MS * style.timeScale).toLong()
-        if (settled) {
+        if (fullscreenStage == FullscreenStage.COVERING &&
+            (active.tracks.getValue(Property.COVER).atRest() || settled)) {
+            // Capture the geometry velocity at the cover fence instead of braking it to zero.
+            velocitySeed = active.tracks.mapValues { it.value.velocity }
+            pose = pose.copy(alpha = 1f, cover = 1f, outline = 1f)
+            motion = null
+            presentCompletion(active.completion)
+        } else if (settled) {
             pose = active.target
             motion = null
-            present(active.completion)
+            presentCompletion(active.completion)
         } else {
             present()
             effects += WindowSceneEffect.RequestFrame(active.generation)
         }
+    }
+
+    private fun presentCompletion(completion: Completion) {
+        if (completion.fullscreenStep == FullscreenStep.EXPAND) fullscreenStage = FullscreenStage.HIDING
+        present(completion)
     }
 
     private fun interrupt() {
@@ -371,13 +529,39 @@ class WindowSceneController(
         if (status == CommandStatus.DONE) {
             rememberNormal()
             if (completion.close) effects += WindowSceneEffect.FinishClose
-            completion.fullscreen?.let { effects += WindowSceneEffect.SystemCommand(it) }
+            when (completion.fullscreenStep) {
+                FullscreenStep.EXPAND -> expandFullscreen()
+                FullscreenStep.RELEASE -> {
+                    fullscreenStage = FullscreenStage.WAITING
+                    effects += WindowSceneEffect.HandoffFullscreen(fullscreenCommandId)
+                }
+                FullscreenStep.FINISH -> {
+                    fullscreenStage = FullscreenStage.FINISHED
+                    effects += WindowSceneEffect.FinishFullscreen
+                }
+                FullscreenStep.RESTORE -> {
+                    previewBase = null
+                    fullscreenStage = null
+                    rememberNormal()
+                    present()
+                }
+                null -> Unit
+            }
         }
     }
 
     private fun present(completion: Completion? = null) {
+        // Source pixels have the old app's aspect. Switch at the settled destination pose,
+        // after both owners are ready, and retain them until this exact replacement commits.
+        if (entryVisual == EntryVisual.SOURCE && taskReady && !awaitingSourceRelease &&
+            motion == null && pendingCompletion == null && completion == null && visible && pose.alpha > 0f) {
+            entryVisual = EntryVisual.REVEALING
+        }
         val id = nextId++
         lastFrameId = id
+        if (entryVisual == EntryVisual.REVEALING) {
+            entryRevealFrameId = id.takeIf { visible && pose.alpha > 0f }
+        }
         if (completion != null) pendingCompletion = id to completion
         effects += WindowSceneEffect.Present(id, frame())
     }
@@ -389,6 +573,18 @@ class WindowSceneController(
     }
 
     private fun frameCommitted(event: WindowSceneEvent.FrameCommitted) {
+        if (entryVisual == EntryVisual.REVEALING && event.frameId == entryRevealFrameId) {
+            entryRevealFrameId = null
+            when (event.status) {
+                CommandStatus.DONE -> {
+                    entryVisual = EntryVisual.LIVE
+                    effects += WindowSceneEffect.ReleaseEntryImage
+                    present()
+                }
+                CommandStatus.SUPERSEDED -> present() // Coalescing cannot bypass the release fence.
+                CommandStatus.FAILED -> Unit // The common failure path below tears down the host.
+            }
+        }
         // Readiness is a transaction fence, not an opacity threshold. Without source geometry
         // the seed is transparent: waiting for a visible frame here would also prevent its clock
         // from starting, leaving both sides waiting until the platform watchdog fires.
@@ -399,9 +595,18 @@ class WindowSceneController(
         }
         val waiting = pendingCompletion
         if (waiting?.first == event.frameId) {
+            if (!visible && event.status == CommandStatus.DONE &&
+                (waiting.second.fullscreenStep == FullscreenStep.EXPAND || waiting.second.fullscreenStep == FullscreenStep.RELEASE)) {
+                // A hidden shell has not covered the display. Visibility(true) republishes this
+                // fence; only its subsequent visible image may advance the task handoff.
+                return
+            }
             pendingCompletion = null
-            report(waiting.second, event.status)
-            if (event.status == CommandStatus.DONE && !waiting.second.close && waiting.second.fullscreen == null) {
+            if (event.status == CommandStatus.SUPERSEDED && waiting.second.fullscreenStep != null) {
+                // A bridge fence is not optional when its queued image was coalesced.
+                present(waiting.second)
+            } else report(waiting.second, event.status)
+            if (event.status == CommandStatus.DONE && !waiting.second.close && waiting.second.fullscreenStep == null) {
                 // Enable application input only after the settled frame has committed.
                 present()
             }
@@ -417,20 +622,29 @@ class WindowSceneController(
     private fun endSourceHandoff(status: CommandStatus) {
         if (awaitingSourceRelease) {
             awaitingSourceRelease = false
-            effects += WindowSceneEffect.SourceHandoffResult(status)
+            effects += if (sourceFrameAcknowledged) WindowSceneEffect.CancelSourceHandoff(status)
+                else WindowSceneEffect.SourceHandoffResult(status)
         }
     }
 
-    private fun rememberNormal() {
-        if (pose.mini <= 0.001f && shell.snapshot().mode == ShellMode.NORMAL && pose.alpha >= 0.999f) {
+    private fun rememberNormal(resized: Boolean = false) {
+        if (fullscreenStage == null && previewBase == null && pose.mini <= 0.001f &&
+            shell.snapshot().mode == ShellMode.NORMAL && pose.alpha >= 0.999f) {
             normalContent = pose.content
+            // A temporary display constraint must not become the user's remembered size.
+            // Only an explicit resize (or the initial destination layout) changes that intent.
+            if (resized) {
+                preferredNormalWidth = pose.content.width
+                preferredNormalHeight = pose.content.height
+            }
         }
     }
 
     private fun values(p: Pose) = mapOf(
         Property.X to p.content.left, Property.Y to p.content.top, Property.W to p.content.width,
         Property.H to p.content.height, Property.MINI to p.mini, Property.NORMAL_CHROME to p.normalChrome,
-        Property.ALPHA to p.alpha, Property.ENTRY_RADIUS to p.entryRadius
+        Property.ALPHA to p.alpha, Property.ENTRY_RADIUS to p.entryRadius,
+        Property.COVER to p.cover, Property.OUTLINE to p.outline
     )
 
     private fun frame(): WindowSceneFrame {
@@ -441,22 +655,51 @@ class WindowSceneController(
         val top = style.topBar * normal + style.bezel * m
         val right = (if (portrait) 0f else style.sideBar) * normal + style.bezel * m
         val bottom = (if (portrait) style.bottomBar else 0f) * normal + style.bezel * m
-        // All consumers receive the same raster rectangle; keep subpixel precision only in the
-        // spring state, so Canvas and task adapters cannot round opposite sides independently.
+        val live = fullscreenStage != FullscreenStage.EXPANDING && fullscreenStage != FullscreenStage.WAITING &&
+            fullscreenStage != FullscreenStage.REVEALING && fullscreenStage != FullscreenStage.FINISHED
+        // Live content and Canvas share one raster rectangle. The independent exit bridge has
+        // no task transform to round against and preserves its captured outer's subpixel pose.
         val raster = pose.content.rounded()
-        val c = SceneRect(raster.left.toFloat(), raster.top.toFloat(), raster.width.toFloat(), raster.height.toFloat())
+        val c = if (!live) pose.content else
+            SceneRect(raster.left.toFloat(), raster.top.toFloat(), raster.width.toFloat(), raster.height.toFloat())
+        val outer = SceneRect(c.left - left, c.top - top, c.width + left + right, c.height + top + bottom)
+        val bridge = fullscreenStage?.let { stage ->
+            val end = displayRect()
+            val p = pose.outline.coerceIn(0f, 1f)
+            fun mix(a: Float, b: Float) = a + (b - a) * p
+            FullscreenVisual(stage, pose.cover, fullscreenRadius(),
+                SceneRect(mix(outer.left, end.left), mix(outer.top, end.top),
+                    mix(outer.width, end.width), mix(outer.height, end.height)),
+                style.miniCorner, p * 0.14f,
+                stage == FullscreenStage.DRAGGING || stage == FullscreenStage.RETURNING,
+                if (stage == FullscreenStage.DRAGGING || stage == FullscreenStage.RETURNING) outer else end)
+        }
+        val baseRadius = pose.entryRadius + style.barCorner * normal + style.miniCorner * m
+        val baseBottomRadius = pose.entryRadius + (if (portrait) style.barCorner * normal else 0f) + style.miniCorner * m
+        val baseContentRadius = pose.entryRadius + (style.miniCorner - style.bezel).coerceAtLeast(0f) * m
+        val contentRadius = if (bridge != null && live)
+            baseContentRadius + (maxOf(baseContentRadius, bridge.cornerRadius) - baseContentRadius) * bridge.maskAlpha
+            else baseContentRadius
+        fun bridgeRadius(radius: Float) = if (bridge == null) radius
+            else radius + (bridge.cornerRadius - radius) * bridge.maskAlpha
         return WindowSceneFrame(
-            c, SceneRect(c.left - left, c.top - top, c.width + left + right, c.height + top + bottom),
+            c, outer,
             m, if (visible) pose.alpha else 0f,
-            pose.entryRadius + style.barCorner * normal + style.miniCorner * m,
-            pose.entryRadius + (style.miniCorner - style.bezel).coerceAtLeast(0f) * m,
-            normal * pose.alpha,
+            bridgeRadius(baseRadius),
+            contentRadius,
+            normal * pose.alpha * (1f - pose.cover),
             ready && taskReady && visible && shell.snapshot().mode == ShellMode.NORMAL && motion == null &&
-                pendingCompletion == null && m <= 0.001f && normal >= 0.999f,
+                pendingCompletion == null && entryVisual == EntryVisual.LIVE &&
+                fullscreenStage == null && m <= 0.001f && normal >= 0.999f,
             portrait, fullscreenHint,
-            outerBottomRadius = pose.entryRadius + (if (portrait) style.barCorner * normal else 0f) + style.miniCorner * m,
+            outerBottomRadius = bridgeRadius(baseBottomRadius),
             controllerColor = controllerColor,
-            controlsColor = if (controllerBrightness() < 128) 0xFFFFFFFF.toInt() else 0xFF777777.toInt()
+            controlsColor = if (controllerBrightness() < 128) 0xFFFFFFFF.toInt() else 0xFF777777.toInt(),
+            fullscreen = bridge,
+            taskAlpha = if (!visible || entryVisual == EntryVisual.SOURCE ||
+                fullscreenStage == FullscreenStage.HIDING || !live) 0f else pose.alpha,
+            presentsLiveContent = live,
+            showEntryImage = entryVisual == EntryVisual.SOURCE
         )
     }
 
@@ -489,13 +732,24 @@ class WindowSceneController(
         fun initialContent(metrics: SceneMetrics, style: SceneStyle, width: Int, height: Int, preferredTop: Int): SceneRect {
             val portrait = metrics.height >= metrics.width
             val barHeight = style.topBar + if (portrait) style.bottomBar else 0f
-            val left = (metrics.width - width) / 2f
+            val rightBar = if (portrait) 0f else style.sideBar
+            val availableWidth = (metrics.width - style.margin * 2f - rightBar).coerceAtLeast(1f)
+            val availableHeight = (metrics.height - metrics.topInset - metrics.bottomInset -
+                style.margin * 2f - barHeight).coerceAtLeast(1f)
+            val safeWidth = width.coerceAtLeast(1).toFloat()
+            val safeHeight = height.coerceAtLeast(1).toFloat()
+            val scale = minOf(1f, availableWidth / safeWidth, availableHeight / safeHeight)
+            val w = safeWidth * scale
+            val h = safeHeight * scale
+            val left = (metrics.width - w) / 2f
             // Keep the existing portrait placement (80dp above center), within system safe bands.
             val requestedTop = if (preferredTop != 0) preferredTop.toFloat() + style.topBar else
-                (metrics.height - height - barHeight) / 2f + style.topBar - if (portrait) 80f * style.density else 0f
+                (metrics.height - h - barHeight) / 2f + style.topBar - if (portrait) 80f * style.density else 0f
             val minTop = metrics.topInset + style.margin + style.topBar
-            val maxTop = (metrics.height - metrics.bottomInset - style.margin - height - style.bottomBar).coerceAtLeast(minTop)
-            return SceneRect(left.coerceAtLeast(style.margin), requestedTop.coerceIn(minTop, maxTop), width.toFloat(), height.toFloat())
+            val maxTop = (metrics.height - metrics.bottomInset - style.margin - h -
+                if (portrait) style.bottomBar else 0f).coerceAtLeast(minTop)
+            val maxLeft = (metrics.width - style.margin - rightBar - w).coerceAtLeast(style.margin)
+            return SceneRect(left.coerceIn(style.margin, maxLeft), requestedTop.coerceIn(minTop, maxTop), w, h)
         }
     }
 }

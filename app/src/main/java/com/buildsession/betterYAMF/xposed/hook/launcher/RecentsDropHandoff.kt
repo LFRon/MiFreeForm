@@ -125,7 +125,8 @@ internal object RecentsDropHandoff {
         internal val swipeHandler: Any,
         private val activeConsumer: Any,
         private val currentController: () -> Any?,
-        private val snapshot: EntrySnapshot
+        private val snapshot: EntrySnapshot,
+        private val launcherRotation: Int
     ) {
         internal val id = SystemClock.elapsedRealtimeNanos()
 
@@ -142,6 +143,7 @@ internal object RecentsDropHandoff {
                     putExtra(Protocol.EXTRA_ENTRY_PROTOCOL, Protocol.ENTRY_PROTOCOL)
                     putExtra(Protocol.EXTRA_SOURCE_PACKAGE, context.packageName)
                     putExtra(Protocol.EXTRA_HANDOFF_ID, id)
+                    putExtra(Protocol.EXTRA_LAUNCHER_ROTATION, launcherRotation)
                     pending.pixels!!.attachTo(this)
                 }
                 context.sendBroadcast(request)
@@ -280,13 +282,20 @@ internal object RecentsDropHandoff {
         val controller = anchor.animationControllerOf(owner, displayId)
             ?: XposedHelpers.callMethod(recentsView, "getRecentsAnimationController")
         val animation = CapturedRecentsAnimation.probe(controller) ?: return null
+        // LoS RecentsOrientedState:250-287 distinguishes fixed Home from the touch/display
+        // rotation. Do not assume every Launcher is portrait or follows the source application.
+        val launcherRotation = runCatching {
+            val oriented = XposedHelpers.callMethod(recentsView, "getPagedViewOrientedState")
+            XposedHelpers.callMethod(oriented, "getRecentsActivityRotation") as Int
+        }.onFailure { logWarning(TAG, "Home rotation unavailable task=$taskId", it) }
+            .getOrDefault(-1).takeIf { it in 0..3 } ?: -1
         if (!installEndGate(swipe)) return null
         val snapshot = RecentsEntryCapture.capture(swipe, taskId, active) ?: return null
         Handoff(taskId, displayId, animation, retirement, swipe, active, {
             anchor.animationControllerOf(owner, displayId) ?: runCatching {
                 XposedHelpers.callMethod(recentsView, "getRecentsAnimationController")
             }.getOrNull()
-        }, snapshot)
+        }, snapshot, launcherRotation)
     }.onFailure { logWarning(TAG, "recents bridge unavailable; preserve native gesture", it) }.getOrNull()
 
     fun isSourceVisible(gesture: Any): Boolean = runCatching {

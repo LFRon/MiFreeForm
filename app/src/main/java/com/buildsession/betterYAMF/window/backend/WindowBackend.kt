@@ -4,6 +4,7 @@ import android.app.ActivityManager
 import android.content.ComponentName
 import android.graphics.Rect
 import com.buildsession.betterYAMF.window.core.CommandStatus
+import com.buildsession.betterYAMF.window.core.FullscreenHandoffResult
 
 /** Cancels an outstanding command; its callback still completes once with SUPERSEDED. */
 fun interface WindowOperation {
@@ -46,6 +47,16 @@ interface WindowBackend {
      * 返回是否处理成功。
      */
     fun releaseTask(taskId: Int, toFront: Boolean = true): Boolean
+
+    /**
+     * Main-thread animated exit. Caller has committed an opaque full-display bridge and stopped
+     * all task presentation writes. onReleased reports actual ownership loss; completion happens
+     * exactly once, with a fresh fullscreen buffer commit + native motion completion for DONE.
+     * Cancellation never restores a released task's old transform. No native objects escape here.
+     */
+    fun handoffFullscreen(
+        taskId: Int, onReleased: () -> Unit, onComplete: (FullscreenHandoffResult) -> Unit
+    ): WindowOperation
 
     /**
      * 几何：按物理矩形（屏幕坐标）更新任务表面的缩放/位置/裁剪/圆角。
@@ -105,7 +116,7 @@ interface WindowBackend {
     /**
      * 静止结算：把窗口静止几何（内容盒，屏幕坐标）交给后端落地。
      * 实现语义（ColorOS 16 缩放逻辑 / 澎湃OS3 观感）：**首次结算**塑形任务**虚拟尺寸**——
-     * 近全屏宽（屏幕短边）× 窗口宽高比，应用按全屏布局一次、窗口显示其**等比缩小视图**
+     * 目标朝向的显示宽 × 窗口宽高比，应用按全屏布局一次、窗口显示其**等比缩小视图**
      *（UI 元素为全屏版的缩放、内容更密）；**此后同一任务的尺寸变化一律以纯表面缩放落地**
      *（虚拟尺寸恒定、任务 bounds 不再改动、应用零重排）——无损放大缩小的前提。
      * 与 [applyGeometry]（动画/mini 的过渡缩放态）成对使用：过渡用前者、静止用本方法。

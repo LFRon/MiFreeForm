@@ -2,9 +2,13 @@ package com.buildsession.betterYAMF.xposed.hook.organizer
 
 import android.app.ActivityManager
 import android.graphics.Rect
+import android.hardware.display.DisplayManager
 import android.os.Binder
+import android.util.DisplayMetrics
+import android.view.Display
 import android.view.SurfaceControl
 import android.window.ITaskOrganizer
+import com.buildsession.betterYAMF.window.core.WindowViewportPolicy
 import com.buildsession.betterYAMF.xposed.hook.freeform.FreeformBackend
 import com.buildsession.betterYAMF.xposed.utils.Instances
 import com.buildsession.betterYAMF.xposed.utils.log
@@ -705,11 +709,10 @@ object SmoothTaskOrganizer {
                 }
             }
 
-            val dm = Instances.systemContext.resources.displayMetrics
+            val dm = displayMetrics()
             val bounds = if (initialBounds != null) {
                 check(initialBounds.width() > 0 && initialBounds.height() > 0)
-                val short = minOf(dm.widthPixels, dm.heightPixels)
-                Rect(0, 0, short, Math.round(short.toFloat() * initialBounds.height() / initialBounds.width()))
+                logicalViewport(initialBounds, dm)
             } else Rect(0, 0, dm.widthPixels, dm.heightPixels)
             val stage = initialBounds?.let { InitialPresentation(Rect(it)) }
             if (stage != null) initialPresentations[taskId] = stage
@@ -988,9 +991,9 @@ object SmoothTaskOrganizer {
 
     /**
      * 静止结算（ColorOS 16 缩放逻辑 / 澎湃OS3 小窗观感）：
-     * - **首次结算**：把任务真实 bounds 固定为**虚拟尺寸 = 屏幕短边 × 窗口宽高比**——近全屏宽，
+     * - **首次结算**：把任务真实 bounds 固定为**虚拟尺寸 = 目标显示宽 × 窗口宽高比**——近全屏宽，
      *   应用按全屏宽度布局**一次**，窗口显示其**等比缩小视图**（UI 元素 = 全屏版的缩放、
-     *   内容更密——对标 ColorOS `OplusZoomDisplay`：虚拟宽 = min(screenW,screenH)，
+     *   内容更密；竖屏保持短边宽，支持旋转的 Home 横屏时采用其横屏显示宽，
      *   显示 scale = 可见宽/虚拟宽）；leash 以 [SurfaceControl.Transaction] 与 bounds 变更
      *   **原子同步**写入缩放态。
      * - **此后一切尺寸/位置变化**（缩放 / mini 还原 / 移动）：只做**表面等比缩放**
@@ -1007,7 +1010,7 @@ object SmoothTaskOrganizer {
             val current = runCatching { XposedHelpers.callMethod(task, "getBounds") as? Rect }.getOrNull()
 
             if (!shapedTasks.contains(taskId)) {
-                // ——— 首次塑形：虚拟尺寸 = 屏幕短边 × 窗口宽高比（应用按全屏布局一次）———
+                // 首次塑形：采用交接后目标显示器的宽度；应用只在此阶段确定逻辑视口。
                 // 观感依据（用户裁定）：应用内 UI 元素应为全屏版的等比缩小（澎湃OS3/ColorOS），
                 // 而非按小窗宽度重排的"大元素"版本。
                 // ⚠ WindowContainerToken 必须取自 RunningTaskInfo.token：
@@ -1022,14 +1025,7 @@ object SmoothTaskOrganizer {
                     return false
                 }
 
-                val dm = Instances.systemContext.resources.displayMetrics
-                val shortSide = minOf(dm.widthPixels, dm.heightPixels)
-                val virtual = Rect(
-                    0,
-                    0,
-                    shortSide,
-                    Math.round(shortSide.toFloat() * physical.height() / physical.width())
-                )
+                val virtual = logicalViewport(physical)
                 logicalBounds[taskId] = virtual
 
                 if (current == virtual) {
@@ -1085,6 +1081,18 @@ object SmoothTaskOrganizer {
             true
         }.onFailure { log(TAG, "settleGeometry failed task=$taskId rect=$physical", it) }
             .getOrDefault(false)
+    }
+
+    /** Read the current display rather than a resources configuration from before Home rotated. */
+    private fun displayMetrics(): DisplayMetrics = DisplayMetrics().also { metrics ->
+        checkNotNull(Instances.systemContext.getSystemService(DisplayManager::class.java)
+            .getDisplay(Display.DEFAULT_DISPLAY)).getRealMetrics(metrics)
+        check(metrics.widthPixels > 0 && metrics.heightPixels > 0)
+    }
+
+    private fun logicalViewport(physical: Rect, dm: DisplayMetrics = displayMetrics()): Rect {
+        val r = WindowViewportPolicy.logicalBounds(dm.widthPixels, physical.width(), physical.height())
+        return Rect(r.left, r.top, r.right, r.bottom)
     }
 
     /** 取任务 RunningTaskInfo（token 的唯一可靠来源；与 release 路径同一取法）。 */

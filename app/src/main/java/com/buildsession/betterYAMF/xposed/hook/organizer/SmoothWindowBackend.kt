@@ -8,6 +8,7 @@ import android.graphics.Rect
 import com.buildsession.betterYAMF.window.backend.WindowBackend
 import com.buildsession.betterYAMF.window.backend.WindowOperation
 import com.buildsession.betterYAMF.window.core.CommandStatus
+import com.buildsession.betterYAMF.window.core.FullscreenHandoffResult
 import com.buildsession.betterYAMF.window.backend.WindowBackendCallbacks
 import com.buildsession.betterYAMF.xposed.hook.freeform.FreeformBackend
 import com.buildsession.betterYAMF.xposed.hook.system.SystemSignals
@@ -92,6 +93,7 @@ object SmoothWindowBackend : WindowBackend {
         // 先绑回调再初始化：初始化过程中可能触发任务事件
         this.callbacks = callbacks
         SmoothTaskOrganizer.init()
+        FullscreenTaskHandoff.initialize()
     }
 
     // Installed exclusively by YAMFManager.systemReady in system_server, using its system-UID
@@ -102,6 +104,7 @@ object SmoothWindowBackend : WindowBackend {
             logWarning(TAG, "refuse application adoption for internal/invalid task=$taskId")
             return false
         }
+        FullscreenTaskHandoff.cancel(taskId)
         taskCallbacks.begin(taskId)
         // 认领 + 置前；不施加任何密度覆盖——小窗不改应用 DPI。
         if (initialBounds != null) {
@@ -173,6 +176,26 @@ object SmoothWindowBackend : WindowBackend {
         }.onFailure {
             log(TAG, "releaseTask failed task=$taskId", it)
         }.getOrDefault(false)
+    }
+
+    override fun handoffFullscreen(
+        taskId: Int, onReleased: () -> Unit, onComplete: (FullscreenHandoffResult) -> Unit
+    ): WindowOperation {
+        val oldGeometry = geometryByTask[taskId]?.let(::Rect)
+        val oldAppearance = appearanceByTask[taskId]
+        val wasSynchronized = frameSynchronizedTasks.contains(taskId)
+        val task = resolveTaskObject(taskId)
+        return FullscreenTaskHandoff.start(taskId, task, { releaseTask(taskId, toFront = true) }, onReleased) { result ->
+            if (result.ownershipKnown && !result.taskReleased && SmoothTaskOrganizer.isLeashManaged(taskId)) {
+                // A rejected release may already have invalidated the old backend callbacks/cache.
+                // Restore only the still-owned session, never an already migrated native surface.
+                taskCallbacks.begin(taskId)
+                if (oldGeometry != null) geometryByTask[taskId] = oldGeometry
+                if (oldAppearance != null) appearanceByTask[taskId] = oldAppearance
+                if (wasSynchronized) frameSynchronizedTasks.add(taskId)
+            }
+            onComplete(result)
+        }
     }
 
     override fun applyGeometry(taskId: Int, physicalBounds: Rect) {
@@ -441,6 +464,7 @@ object SmoothWindowBackend : WindowBackend {
     override fun currentGeometry(taskId: Int): Rect? = geometryOf(taskId)
 
     override fun forgetTask(taskId: Int) {
+        FullscreenTaskHandoff.cancel(taskId)
         forgetGeometry(taskId)
     }
 

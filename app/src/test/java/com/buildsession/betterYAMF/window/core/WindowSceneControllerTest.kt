@@ -66,8 +66,265 @@ class WindowSceneControllerTest {
         assertTrue(position(2000f) > position(0f) + 5f)
     }
 
-    private inner class Driver(animatorScale: Float = 1f, coloredController: Boolean = false) {
-        val scene = WindowSceneController(1, style.copy(animatorScale = animatorScale, coloredController = coloredController), metrics, normal)
+    @Test fun landscapeEntryChoosesFinalPortraitViewportBeforeAdoptingTheApplication() {
+        val d = Driver(initialMetrics = SceneMetrics(2780, 1264, 100, 70),
+            initialContent = SceneRect(400f, 300f, 1973f, 518f))
+        val source = SceneRect(493f, 113f, 429f, 942f)
+        d.send(WindowSceneEvent.OpenAsMini(source, awaitSourceRelease = true))
+        d.send(WindowSceneEvent.VisualAvailable)
+        d.send(WindowSceneEvent.Metrics(metrics))
+        // The former path kept this short landscape aspect even after returning to portrait.
+        assertTrue(d.scene.normalViewport().height < 400f)
+        val effects = d.send(WindowSceneEvent.EntryLayout(metrics, 898, 1139))
+        val viewport = d.scene.normalViewport()
+        assertEquals(898f, viewport.width, 0.01f)
+        assertEquals(1139f, viewport.height, 0.01f)
+        assertEquals(source, d.scene.snapshot().content)
+        assertEquals(1, effects.count { it == WindowSceneEffect.ActivateEntry })
+        assertNull(d.requested)
+        val preparation = d.send(WindowSceneEvent.TaskAvailable).filterIsInstance<WindowSceneEffect.Prepare>().single()
+        assertEquals(viewport, preparation.normalContent)
+        d.send(WindowSceneEvent.Prepared(preparation.commandId, CommandStatus.DONE))
+        assertNull(d.requested)
+        d.send(WindowSceneEvent.SourceReleased)
+        d.settle(); d.tap(); d.settle()
+        assertEquals(viewport.rounded(), d.scene.snapshot().content.rounded())
+        assertTrue(d.scene.snapshot().acceptsContent)
+    }
+
+    @Test fun duplicateDestinationReadinessCannotAdoptOrChangeTheViewportTwice() {
+        val d = Driver()
+        d.send(WindowSceneEvent.OpenAsMini(SceneRect(493f, 113f, 429f, 942f), awaitSourceRelease = true))
+        d.send(WindowSceneEvent.VisualAvailable)
+        d.send(WindowSceneEvent.EntryLayout(metrics, 898, 1139))
+        val selected = d.scene.normalViewport()
+        assertTrue(d.send(WindowSceneEvent.EntryLayout(metrics, 500, 300)).isEmpty())
+        assertEquals(selected, d.scene.normalViewport())
+        assertEquals(1, d.effects.count { it == WindowSceneEffect.ActivateEntry })
+    }
+
+    @Test fun aRotatingHomeSelectsTheLandscapeViewportInsteadOfForcingPortrait() {
+        val d = Driver()
+        d.send(WindowSceneEvent.OpenAsMini(SceneRect(300f, 200f, 700f, 400f), awaitSourceRelease = true))
+        d.send(WindowSceneEvent.VisualAvailable)
+        d.send(WindowSceneEvent.EntryLayout(SceneMetrics(2780, 1264, 100, 70), 1973, 518))
+        val preparation = d.send(WindowSceneEvent.TaskAvailable).filterIsInstance<WindowSceneEffect.Prepare>().single()
+        assertEquals(1973f, preparation.normalContent.width, 0.01f)
+        assertEquals(518f, preparation.normalContent.height, 0.01f)
+        assertFalse(d.scene.snapshot().portrait)
+        assertNull(d.requested)
+    }
+
+    @Test fun disabledAnimationsStillAdoptTheFinalViewportAndWaitForSourceRelease() {
+        val d = Driver(animatorScale = 0f)
+        d.send(WindowSceneEvent.OpenAsMini(SceneRect(493f, 113f, 429f, 942f), awaitSourceRelease = true))
+        d.send(WindowSceneEvent.VisualAvailable)
+        val result = d.send(WindowSceneEvent.EntryLayout(metrics, 898, 1139))
+        assertEquals(1, result.count { it == WindowSceneEffect.ActivateEntry })
+        assertEquals(1f, d.scene.snapshot().miniFraction, 0f)
+        assertFalse(d.scene.snapshot().acceptsContent)
+        d.ready()
+        d.tap()
+        assertEquals(ShellMode.MINI, d.scene.shellSnapshot().mode)
+        d.send(WindowSceneEvent.SourceReleased)
+        d.tap()
+        assertEquals(898f, d.scene.snapshot().content.width, 0.01f)
+        assertEquals(1139f, d.scene.snapshot().content.height, 0.01f)
+        assertTrue(d.scene.snapshot().acceptsContent)
+    }
+
+    @Test fun destinationCannotReshapeAnAlreadyPreparingTask() {
+        val d = Driver()
+        d.send(WindowSceneEvent.OpenAsMini(SceneRect(493f, 113f, 429f, 942f), awaitSourceRelease = true))
+        d.send(WindowSceneEvent.VisualAvailable)
+        val preparation = d.send(WindowSceneEvent.TaskAvailable).filterIsInstance<WindowSceneEffect.Prepare>().single()
+        assertTrue(d.send(WindowSceneEvent.EntryLayout(metrics, 500, 300)).isEmpty())
+        assertEquals(normal, d.scene.normalViewport())
+        d.send(WindowSceneEvent.Prepared(preparation.commandId, CommandStatus.DONE))
+        assertTrue(d.send(WindowSceneEvent.EntryLayout(metrics, 500, 300)).isEmpty())
+        assertEquals(normal, d.scene.normalViewport())
+    }
+
+    @Test fun aLateDestinationAfterCancellationCannotAcquireTheTask() {
+        val d = Driver()
+        d.send(WindowSceneEvent.OpenAsMini(SceneRect(493f, 113f, 429f, 942f), awaitSourceRelease = true))
+        d.send(WindowSceneEvent.VisualAvailable)
+        d.send(WindowSceneEvent.Destroy)
+        assertTrue(d.send(WindowSceneEvent.EntryLayout(metrics, 898, 1139)).isEmpty())
+        assertTrue(d.effects.none { it == WindowSceneEffect.ActivateEntry })
+    }
+
+    @Test fun destinationLayoutDoesNotAffectAnOrdinaryWindow() {
+        val d = Driver(); d.ready(); d.settle()
+        val before = d.scene.snapshot()
+        assertTrue(d.send(WindowSceneEvent.EntryLayout(metrics, 500, 300)).isEmpty())
+        assertEquals(before, d.scene.snapshot())
+    }
+
+    @Test fun oversizedInitialWindowFitsItsDestinationIncludingBothOrientationsChrome() {
+        for (m in listOf(metrics, SceneMetrics(2780, 1264, 100, 70))) {
+            val c = WindowSceneController.initialContent(m, style, 10000, 8000, 99999)
+            val portrait = m.height >= m.width
+            val rightBar = if (portrait) 0f else style.sideBar
+            val bottomBar = if (portrait) style.bottomBar else 0f
+            assertEquals(10000f / 8000f, c.width / c.height, 0.001f)
+            assertTrue(c.left >= style.margin - 0.01f)
+            assertTrue(c.right + rightBar <= m.width - style.margin + 0.01f)
+            assertTrue(c.top - style.topBar >= m.topInset + style.margin - 0.01f)
+            assertTrue(c.bottom + bottomBar <= m.height - m.bottomInset - style.margin + 0.01f)
+        }
+    }
+
+    @Test fun rotatingBackRestoresThePreferredNormalSizeIncludingWhileMini() {
+        for (mini in listOf(false, true)) {
+            val d = Driver(); d.ready(); d.settle()
+            if (mini) { d.enter(); d.settle() }
+            repeat(3) {
+                d.send(WindowSceneEvent.Metrics(SceneMetrics(2780, 1264, 100, 70)))
+                d.settle()
+                assertTrue(d.scene.normalViewport().height < normal.height)
+                d.send(WindowSceneEvent.Metrics(metrics))
+                d.settle()
+                assertEquals(normal.width, d.scene.normalViewport().width, 0.01f)
+                assertEquals(normal.height, d.scene.normalViewport().height, 0.01f)
+            }
+            if (mini) { d.tap(); d.settle() }
+            assertEquals(normal.width, d.scene.snapshot().content.width, 0.01f)
+            assertEquals(normal.height, d.scene.snapshot().content.height, 0.01f)
+        }
+    }
+
+    @Test fun anExplicitResizeUpdatesTheSizeRememberedAcrossDisplayConstraints() {
+        val d = Driver(); d.ready(); d.settle()
+        d.press(RegionId.RESIZE_HANDLE, normal.right, normal.bottom)
+        d.input(WindowInputEvent.Move(1, d.time, RegionId.RESIZE_HANDLE, normal.right - 90f, normal.bottom - 120f))
+        d.input(WindowInputEvent.Up(1, d.time, RegionId.RESIZE_HANDLE, normal.right - 90f, normal.bottom - 120f))
+        d.settle()
+        val resized = d.scene.normalViewport()
+        assertTrue(resized.width < normal.width)
+        d.send(WindowSceneEvent.Metrics(SceneMetrics(2780, 1264, 100, 70)))
+        d.settle()
+        d.send(WindowSceneEvent.Metrics(metrics))
+        d.settle()
+        assertEquals(resized.width, d.scene.normalViewport().width, 0.01f)
+        assertEquals(resized.height, d.scene.normalViewport().height, 0.01f)
+    }
+
+    private fun entryWaitingForLiveCommit(): Driver {
+        val d = Driver(animatorScale = 0f)
+        d.send(WindowSceneEvent.OpenAsMini(SceneRect(493f, 113f, 429f, 942f), awaitSourceRelease = true))
+        d.send(WindowSceneEvent.VisualAvailable)
+        d.ready()
+        assertTrue(d.scene.snapshot().showEntryImage)
+        assertEquals(0f, d.scene.snapshot().taskAlpha, 0f)
+        d.autoPresent = false
+        d.send(WindowSceneEvent.SourceReleased)
+        return d
+    }
+
+    @Test fun sourcePixelsAndInputWaitForTheExactLiveReplacementCommit() {
+        val d = entryWaitingForLiveCommit()
+        val replacement = d.presentations.last()
+        assertFalse(replacement.frame.showEntryImage)
+        assertEquals(1f, replacement.frame.taskAlpha, 0f)
+        assertTrue(d.scene.isAnimating())
+        d.press(RegionId.BODY_MASK)
+        d.tap()
+        assertEquals(replacement.frame, d.scene.snapshot())
+        assertEquals(ShellMode.MINI, d.scene.shellSnapshot().mode)
+        assertFalse(d.effects.contains(WindowSceneEffect.ReleaseEntryImage))
+        d.send(WindowSceneEvent.FrameCommitted(replacement.frameId - 1, CommandStatus.DONE))
+        assertFalse(d.effects.contains(WindowSceneEffect.ReleaseEntryImage))
+        d.send(WindowSceneEvent.FrameCommitted(replacement.frameId, CommandStatus.DONE))
+        d.send(WindowSceneEvent.FrameCommitted(replacement.frameId, CommandStatus.DONE))
+        assertEquals(1, d.effects.count { it == WindowSceneEffect.ReleaseEntryImage })
+        assertFalse(d.scene.isAnimating())
+        d.tap()
+        assertEquals(ShellMode.NORMAL, d.scene.shellSnapshot().mode)
+    }
+
+    @Test fun coalescedReplacementMustCommitItsCurrentFrameBeforeReleasingTheImage() {
+        val d = entryWaitingForLiveCommit()
+        val old = d.presentations.last()
+        d.send(WindowSceneEvent.PresentationInvalidated)
+        val current = d.presentations.last()
+        d.send(WindowSceneEvent.FrameCommitted(old.frameId, CommandStatus.DONE))
+        assertFalse(d.effects.contains(WindowSceneEffect.ReleaseEntryImage))
+        d.send(WindowSceneEvent.FrameCommitted(current.frameId, CommandStatus.SUPERSEDED))
+        val retry = d.presentations.last()
+        assertTrue(retry.frameId > current.frameId)
+        d.send(WindowSceneEvent.FrameCommitted(current.frameId, CommandStatus.DONE))
+        assertFalse(d.effects.contains(WindowSceneEffect.ReleaseEntryImage))
+        d.send(WindowSceneEvent.FrameCommitted(retry.frameId, CommandStatus.DONE))
+        assertEquals(1, d.effects.count { it == WindowSceneEffect.ReleaseEntryImage })
+    }
+
+    @Test fun aHiddenReplacementCannotReleaseTheImageOrOpenInput() {
+        val d = entryWaitingForLiveCommit()
+        val old = d.presentations.last()
+        d.send(WindowSceneEvent.Visibility(false))
+        val hidden = d.presentations.last()
+        assertEquals(0f, hidden.frame.taskAlpha, 0f)
+        d.send(WindowSceneEvent.FrameCommitted(old.frameId, CommandStatus.DONE))
+        d.send(WindowSceneEvent.FrameCommitted(hidden.frameId, CommandStatus.DONE))
+        assertFalse(d.effects.contains(WindowSceneEffect.ReleaseEntryImage))
+        d.tap()
+        assertEquals(ShellMode.MINI, d.scene.shellSnapshot().mode)
+        d.send(WindowSceneEvent.Visibility(true))
+        d.send(WindowSceneEvent.FrameCommitted(d.presentations.last().frameId, CommandStatus.DONE))
+        assertEquals(1, d.effects.count { it == WindowSceneEffect.ReleaseEntryImage })
+    }
+
+    @Test fun failedOrDestroyedReplacementCannotBeResurrectedByALateCommit() {
+        for (fail in listOf(false, true)) {
+            val d = entryWaitingForLiveCommit()
+            val replacement = d.presentations.last()
+            if (fail) {
+                val result = d.send(WindowSceneEvent.FrameCommitted(replacement.frameId, CommandStatus.FAILED))
+                assertTrue(result.any { it is WindowSceneEffect.Failed })
+                d.tap()
+                assertEquals(ShellMode.MINI, d.scene.shellSnapshot().mode)
+            }
+            d.send(WindowSceneEvent.Destroy)
+            assertTrue(d.send(WindowSceneEvent.FrameCommitted(replacement.frameId, CommandStatus.DONE)).isEmpty())
+            assertTrue(d.send(WindowSceneEvent.Destroy).isEmpty())
+            assertFalse(d.effects.contains(WindowSceneEffect.ReleaseEntryImage))
+        }
+    }
+
+    @Test fun livePreparationKeepsTheTaskHiddenAndInputClosedThroughoutTheRetainedFlight() {
+        val d = Driver()
+        d.send(WindowSceneEvent.OpenAsMini(SceneRect(493f, 113f, 429f, 942f), awaitSourceRelease = true))
+        d.send(WindowSceneEvent.VisualAvailable)
+        d.ready()
+        d.send(WindowSceneEvent.SourceReleased)
+        repeat(5) { d.tick() }
+        val moving = d.scene.snapshot()
+        assertTrue(moving.showEntryImage)
+        assertEquals(0f, moving.taskAlpha, 0f)
+        d.tap()
+        assertEquals(moving, d.scene.snapshot())
+        d.settle()
+        assertFalse(d.scene.snapshot().showEntryImage)
+        assertEquals(1, d.effects.count { it == WindowSceneEffect.ReleaseEntryImage })
+    }
+
+    @Test fun cancellationAfterTheBridgeAckIsASeparateOperationWithOneTerminalResult() {
+        val d = Driver()
+        d.send(WindowSceneEvent.OpenAsMini(SceneRect(493f, 113f, 429f, 942f), awaitSourceRelease = true))
+        d.send(WindowSceneEvent.VisualAvailable)
+        val prepare = d.send(WindowSceneEvent.TaskAvailable).single() as WindowSceneEffect.Prepare
+        val failure = d.send(WindowSceneEvent.Prepared(prepare.commandId, CommandStatus.FAILED))
+        assertEquals(WindowSceneEffect.CancelSourceHandoff(CommandStatus.FAILED), failure.first())
+        d.send(WindowSceneEvent.Destroy)
+        assertEquals(listOf(CommandStatus.DONE),
+            d.effects.filterIsInstance<WindowSceneEffect.SourceHandoffResult>().map { it.status })
+        assertEquals(1, d.effects.filterIsInstance<WindowSceneEffect.CancelSourceHandoff>().size)
+    }
+
+    private inner class Driver(animatorScale: Float = 1f, coloredController: Boolean = false,
+        initialMetrics: SceneMetrics = metrics, initialContent: SceneRect = normal) {
+        val scene = WindowSceneController(1, style.copy(animatorScale = animatorScale, coloredController = coloredController), initialMetrics, initialContent)
         var requested: Long? = null
         var time = 0L
         var autoPresent = true
@@ -445,13 +702,15 @@ class WindowSceneControllerTest {
         }
     }
 
-    @Test fun fullscreenReleaseWaitsUntilTheLastPreviewFrameIsCommitted() {
+    @Test fun fullscreenReleaseWaitsForTheHiddenTaskAndFullscreenBridgeFrames() {
         val d = Driver(0f); d.ready(); d.autoPresent = false
         d.press(RegionId.BAR_BOTTOM, 300f, 1500f)
         d.input(WindowInputEvent.Move(1, d.time, RegionId.BAR_BOTTOM, 300f, 2000f))
         d.input(WindowInputEvent.Up(1, d.time, RegionId.BAR_BOTTOM, 300f, 2000f))
-        assertTrue(d.effects.filterIsInstance<WindowSceneEffect.SystemCommand>().none { it.command is WindowCommand.RequestFullscreen })
+        assertTrue(d.effects.filterIsInstance<WindowSceneEffect.HandoffFullscreen>().isEmpty())
         d.send(WindowSceneEvent.FrameCommitted(d.presentations.last().frameId, CommandStatus.DONE))
-        assertEquals(1, d.effects.filterIsInstance<WindowSceneEffect.SystemCommand>().count { it.command is WindowCommand.RequestFullscreen })
+        assertTrue(d.effects.filterIsInstance<WindowSceneEffect.HandoffFullscreen>().isEmpty())
+        d.send(WindowSceneEvent.FrameCommitted(d.presentations.last().frameId, CommandStatus.DONE))
+        assertEquals(1, d.effects.filterIsInstance<WindowSceneEffect.HandoffFullscreen>().size)
     }
 }

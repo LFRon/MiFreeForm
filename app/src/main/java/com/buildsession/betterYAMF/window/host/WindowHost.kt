@@ -20,7 +20,8 @@ interface WindowHost {
         dropX: Int = -1, dropY: Int = -1,
         sourceBounds: android.graphics.Rect? = null, awaitSourceRelease: Boolean = false,
         sourcePackage: String? = null, handoffId: Long = 0L,
-        entrySnapshot: com.buildsession.betterYAMF.common.model.EntrySnapshot? = null
+        entrySnapshot: com.buildsession.betterYAMF.common.model.EntrySnapshot? = null,
+        launcherRotation: Int = -1
     )
 
     /** Adopt using the core's normal viewport; a staged source is displayed before this call. */

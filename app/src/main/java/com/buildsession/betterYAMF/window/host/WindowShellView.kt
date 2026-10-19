@@ -8,6 +8,7 @@ import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.RectF
 import android.graphics.Region
+import android.graphics.drawable.Drawable
 import android.view.MotionEvent
 import android.view.View
 import androidx.core.graphics.withSave
@@ -30,7 +31,10 @@ internal class WindowShellView(context: Context, private val style: SceneStyle) 
     private var drawEntryImage = false
     private val imageClip = Path()
     private val imageBounds = RectF()
-    val hasEntryImage: Boolean get() = entryImage != null
+    private val bridgeBounds = RectF()
+    private var applicationIcon: Drawable? = null
+
+    fun setApplicationIcon(icon: Drawable?) { applicationIcon = icon?.mutate() }
 
     fun retainEntryImage(bitmap: Bitmap) {
         entryImage = bitmap
@@ -49,9 +53,9 @@ internal class WindowShellView(context: Context, private val style: SceneStyle) 
         isFocusable = false
     }
 
-    fun render(frame: WindowSceneFrame, showEntryImage: Boolean = hasEntryImage) {
+    fun render(frame: WindowSceneFrame) {
         this.frame = frame
-        drawEntryImage = showEntryImage
+        drawEntryImage = frame.showEntryImage
         // SurfaceFrameSynchronizer schedules the draw after replacing its matching task frame.
     }
 
@@ -60,7 +64,7 @@ internal class WindowShellView(context: Context, private val style: SceneStyle) 
         val f = frame ?: return Region()
         if (f.alpha <= 0f) return Region()
         getLocationOnScreen(origin)
-        val o = f.outer.rounded()
+        val o = (f.fullscreen?.inputBounds ?: f.outer).rounded()
         val result = Region(o.left, o.top, o.right, o.bottom)
         if (f.acceptsContent) {
             val c = f.content.rounded()
@@ -84,6 +88,27 @@ internal class WindowShellView(context: Context, private val style: SceneStyle) 
         canvas.translate(-origin[0].toFloat(), -origin[1].toFloat())
         outer.set(f.outer.left, f.outer.top, f.outer.right, f.outer.bottom)
         content.set(f.content.left, f.content.top, f.content.right, f.content.bottom)
+        f.fullscreen?.let { bridge ->
+            val b = bridge.outline
+            bridgeBounds.set(b.left, b.top, b.right, b.bottom)
+            paint.style = Paint.Style.FILL
+            paint.color = Color.WHITE
+            paint.alpha = (bridge.outlineAlpha * f.alpha * 255f).roundToInt().coerceIn(0, 255)
+            canvas.drawRoundRect(bridgeBounds, bridge.outlineRadius, bridge.outlineRadius, paint)
+            paint.style = Paint.Style.STROKE
+            paint.strokeWidth = minOf(style.fullscreenOutlineWidth,
+                bridgeBounds.width() / 2f, bridgeBounds.height() / 2f).coerceAtLeast(0f)
+            // Canvas centers strokes on their path. Keep the whole border inside the scene
+            // bounds so it retains its thickness when the preview reaches the display edges.
+            val inset = paint.strokeWidth / 2f
+            bridgeBounds.inset(inset, inset)
+            val radius = (bridge.outlineRadius - inset).coerceAtLeast(0f)
+            paint.color = 0xFF999999.toInt()
+            paint.alpha = (bridge.outlineAlpha * f.alpha * style.fullscreenOutlineAlphaGain * 255f)
+                .roundToInt().coerceIn(0, 255)
+            canvas.drawRoundRect(bridgeBounds, radius, radius, paint)
+            paint.style = Paint.Style.FILL
+        }
         if (drawEntryImage) entryImage?.let { bitmap ->
             canvas.withSave {
                 imageClip.rewind()
@@ -101,14 +126,6 @@ internal class WindowShellView(context: Context, private val style: SceneStyle) 
         }
         for (i in 0..3) radii[i] = f.outerRadius
         for (i in 4..7) radii[i] = f.outerBottomRadius
-        if (f.fullscreenHint) {
-            ring.rewind()
-            ring.fillType = Path.FillType.EVEN_ODD
-            ring.addRect(0f, 0f, width.toFloat(), height.toFloat(), Path.Direction.CW)
-            ring.addRoundRect(outer, radii, Path.Direction.CW)
-            paint.color = 0x8C000000.toInt()
-            canvas.drawPath(ring, paint)
-        }
         ring.rewind()
         ring.fillType = Path.FillType.EVEN_ODD
         ring.addRoundRect(outer, radii, Path.Direction.CW)
@@ -139,13 +156,45 @@ internal class WindowShellView(context: Context, private val style: SceneStyle) 
             val halfWidth = style.handleThickness / 2f
             canvas.drawRoundRect(cx - halfWidth, cy - halfHeight, cx + halfWidth, cy + halfHeight, halfWidth, halfWidth, paint)
         }
-        if (f.fullscreenHint) {
-            paint.textSize = 16f * style.density
-            paint.textAlign = Paint.Align.CENTER
-            paint.color = Color.WHITE
-            canvas.drawText("松开以全屏显示", centerX, f.content.top + f.content.height / 2f, paint)
-        }
+        drawFullscreenBridge(canvas, f)
         paint.alpha = 255
         canvas.restoreToCount(save)
+    }
+
+    private fun drawFullscreenBridge(canvas: Canvas, frame: WindowSceneFrame) {
+        val bridge = frame.fullscreen ?: return
+        if (bridge.maskAlpha <= 0f) return
+        val alpha = (frame.alpha * bridge.maskAlpha * 255f).roundToInt().coerceIn(0, 255)
+        paint.style = Paint.Style.FILL
+        paint.color = 0xFFF2EFE6.toInt()
+        paint.alpha = alpha
+        canvas.drawRoundRect(outer, bridge.cornerRadius, bridge.cornerRadius, paint)
+        val cx = outer.centerX()
+        val cy = outer.centerY()
+        val size = minOf(44f * style.density, outer.width() * 0.23f, outer.height() * 0.23f)
+        val iconCy = cy - size * 0.35f
+        bridgeBounds.set(cx - size / 2f, iconCy - size / 2f, cx + size / 2f, iconCy + size / 2f)
+        paint.color = 0xFFFAF8F2.toInt()
+        paint.alpha = alpha
+        canvas.drawRoundRect(bridgeBounds, size * 0.28f, size * 0.28f, paint)
+        paint.color = 0xFFDCD9D0.toInt()
+        paint.alpha = alpha
+        paint.style = Paint.Style.STROKE
+        paint.strokeWidth = style.density * 0.6f
+        canvas.drawRoundRect(bridgeBounds, size * 0.28f, size * 0.28f, paint)
+        applicationIcon?.let { icon ->
+            val half = size * 0.30f
+            icon.setBounds((cx - half).roundToInt(), (iconCy - half).roundToInt(),
+                (cx + half).roundToInt(), (iconCy + half).roundToInt())
+            icon.alpha = alpha
+            icon.draw(canvas)
+            icon.alpha = 255
+        }
+        paint.style = Paint.Style.FILL
+        paint.color = 0xFF454545.toInt()
+        paint.alpha = alpha
+        paint.textAlign = Paint.Align.CENTER
+        paint.textSize = minOf(14f * style.density, size * 0.36f)
+        canvas.drawText("全屏", cx, iconCy + size * 1.05f, paint)
     }
 }

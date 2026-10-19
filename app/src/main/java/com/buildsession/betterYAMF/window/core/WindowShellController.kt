@@ -18,6 +18,8 @@ class WindowShellController(
     private var pressY = 0f
     private var dropActive: DropKind? = null
     private var lastBarTapMs: Long? = null
+    private var fullscreenArmed = false
+    private var barTravel = 0f
     /** 闭环（不变量 2）：模式迁移命令的指令计数与未决登记。 */
     private var nextCommandId = 1L
     private var pendingMiniCommandId = 0L
@@ -88,6 +90,8 @@ class WindowShellController(
         pressX = event.screenX
         pressY = event.screenY
         dropActive = null
+        fullscreenArmed = false
+        barTravel = 0f
         return when (event.region) {
             RegionId.RESIZE_HANDLE -> listOf(WindowCommand.ResizePreviewStart(windowId))
             else -> emptyList()
@@ -127,6 +131,8 @@ class WindowShellController(
     private fun onBarMove(event: WindowInputEvent.Move): List<WindowCommand> {
         val threshold = config.verticalDragThresholdDp * registration.density
         val diffY = event.screenY - pressY
+        updateBarTravel(event)
+        updateFullscreenArm(diffY, threshold)
         return if (diffY < 0) {
             listOf(
                 WindowCommand.VerticalDragPreview(
@@ -140,9 +146,9 @@ class WindowShellController(
             listOf(
                 WindowCommand.VerticalDragPreview(
                     windowId,
-                    (diffY / threshold).coerceIn(0f, 1f),
+                    (diffY / threshold).coerceAtLeast(0f),
                     downward = true,
-                    showFullscreenHint = diffY > threshold
+                    showFullscreenHint = fullscreenArmed
                 )
             )
         }
@@ -171,6 +177,7 @@ class WindowShellController(
         pressedRegion = null
         dropActive = null
         lastBarTapMs = null
+        fullscreenArmed = false
         return when (event.region) {
             RegionId.BODY_MASK, RegionId.HANDLE -> listOf(
                 WindowCommand.ClampToScreen(windowId, animated = true),
@@ -208,12 +215,14 @@ class WindowShellController(
         val slop = config.barTapSlopDp * registration.density
         val diffY = event.screenY - pressY
         val diffX = event.screenX - pressX
+        updateBarTravel(event)
+        updateFullscreenArm(diffY, threshold)
         when {
             diffY < -threshold -> out += WindowCommand.RequestClose(windowId, CloseOrigin.DRAG_UP_BAR)
-            diffY > threshold -> out += WindowCommand.RequestFullscreen(windowId, FullscreenOrigin.DRAG_DOWN_BAR)
+            fullscreenArmed -> out += WindowCommand.RequestFullscreen(windowId, FullscreenOrigin.DRAG_DOWN_BAR)
             else -> {
                 out += WindowCommand.ClearVerticalDragPreview(windowId)
-                if (abs(diffY) <= slop && abs(diffX) <= slop) {
+                if (barTravel <= slop && abs(diffY) <= slop && abs(diffX) <= slop) {
                     val previous = lastBarTapMs
                     if (previous != null && event.timeMs >= previous &&
                         event.timeMs - previous < config.doubleTapTimeoutMs) {
@@ -224,6 +233,17 @@ class WindowShellController(
             }
         }
         pressedRegion = null
+        fullscreenArmed = false
+    }
+
+    private fun updateBarTravel(event: WindowInputEvent.Pointer) {
+        barTravel = maxOf(barTravel, abs(event.screenX - pressX), abs(event.screenY - pressY))
+        if (barTravel > config.barTapSlopDp * registration.density) lastBarTapMs = null
+    }
+
+    private fun updateFullscreenArm(dy: Float, threshold: Float) {
+        fullscreenArmed = if (fullscreenArmed) dy >= threshold * FullscreenAnimPolicy.DISARM_FRACTION
+            else dy > threshold
     }
 
     private fun onTapConfirmed(): List<WindowCommand> = when (mode) {

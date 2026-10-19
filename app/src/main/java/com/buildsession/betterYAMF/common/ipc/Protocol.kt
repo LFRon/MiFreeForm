@@ -39,6 +39,7 @@ object Protocol {
     const val EXTRA_FROM_DROP_ZONE = "fromDropZone"
     const val EXTRA_DROP_X = "dropX"
     const val EXTRA_DROP_Y = "dropY"
+    const val EXTRA_LAUNCHER_ROTATION = "launcherRotation"
     const val EXTRA_SOURCE_BOUNDS = "sourceBounds"
     const val EXTRA_RECENTS_HANDOFF_COMPLETE = "recentsHandoffComplete"
     const val EXTRA_SOURCE_PACKAGE = "sourcePackage"

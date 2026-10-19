@@ -195,13 +195,35 @@ class WindowShellControllerTest {
         val c = controller()
         c.feed(press(RegionId.BAR_BOTTOM, 500f, 1900f))
         val preview = c.feed(move(RegionId.BAR_BOTTOM, 500f, 2062f)).single() as WindowCommand.VerticalDragPreview
-        assertEquals(1f, preview.progress, 0.0001f)
+        assertEquals(1.0125f, preview.progress, 0.0001f)
         assertTrue(preview.downward)
         assertTrue(preview.showFullscreenHint)
         assertEquals(
             listOf(WindowCommand.RequestFullscreen(1, FullscreenOrigin.DRAG_DOWN_BAR)),
             c.feed(up(RegionId.BAR_BOTTOM, 500f, 2062f))
         )
+    }
+
+    @Test fun fullscreenArmingHasHysteresisAndRetractionDisarmsIt() {
+        val c = controller()
+        c.feed(press(RegionId.BAR_BOTTOM, 500f, 1900f))
+        c.feed(move(RegionId.BAR_BOTTOM, 500f, 2100f))
+        val near = c.feed(move(RegionId.BAR_BOTTOM, 500f, 2050f)).single() as WindowCommand.VerticalDragPreview
+        assertTrue(near.showFullscreenHint)
+        val back = c.feed(move(RegionId.BAR_BOTTOM, 500f, 2020f)).single() as WindowCommand.VerticalDragPreview
+        assertFalse(back.showFullscreenHint)
+        assertEquals(listOf(WindowCommand.ClearVerticalDragPreview(1)), c.feed(up(RegionId.BAR_BOTTOM, 500f, 2020f)))
+    }
+
+    @Test fun returningADragToItsOriginDoesNotBecomeADoubleTap() {
+        val c = controller()
+        c.feed(press(RegionId.BAR_BOTTOM, 500f, 1900f, timeMs = 1000L))
+        c.feed(up(RegionId.BAR_BOTTOM, 500f, 1900f, timeMs = 1010L))
+        c.feed(press(RegionId.BAR_BOTTOM, 500f, 1900f, timeMs = 1100L))
+        c.feed(move(RegionId.BAR_BOTTOM, 500f, 2100f))
+        c.feed(move(RegionId.BAR_BOTTOM, 500f, 1900f))
+        assertEquals(listOf(WindowCommand.ClearVerticalDragPreview(1)),
+            c.feed(up(RegionId.BAR_BOTTOM, 500f, 1900f, timeMs = 1200L)))
     }
 
     @Test

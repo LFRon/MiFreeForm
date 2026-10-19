@@ -14,6 +14,8 @@ data class StartCmd(
     val awaitSourceRelease: Boolean = false,
     val sourcePackage: String? = null,
     val handoffId: Long = 0L,
-    val entrySnapshot: EntrySnapshot? = null
+    val entrySnapshot: EntrySnapshot? = null,
+    /** Destination Home rotation, supplied by Launcher's RecentsOrientedState; -1 = unknown. */
+    val launcherRotation: Int = -1
 )
 

@@ -26,6 +26,14 @@ private object NoopWindowBackend : WindowBackend {
     override fun initialize(callbacks: WindowBackendCallbacks) {}
     override fun openTask(taskId: Int, initialBounds: Rect?): Boolean = false
     override fun releaseTask(taskId: Int, toFront: Boolean): Boolean = false
+    override fun handoffFullscreen(
+        taskId: Int, onReleased: () -> Unit,
+        onComplete: (com.buildsession.betterYAMF.window.core.FullscreenHandoffResult) -> Unit
+    ): WindowOperation {
+        onComplete(com.buildsession.betterYAMF.window.core.FullscreenHandoffResult(
+            com.buildsession.betterYAMF.window.core.CommandStatus.FAILED, false))
+        return WindowOperation {}
+    }
     override fun applyGeometry(taskId: Int, physicalBounds: Rect) {}
     override fun preparePresentation(taskId: Int, normalBounds: Rect, onComplete: (com.buildsession.betterYAMF.window.core.CommandStatus) -> Unit): WindowOperation {
         onComplete(com.buildsession.betterYAMF.window.core.CommandStatus.FAILED)

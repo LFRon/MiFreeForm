@@ -438,7 +438,8 @@ object YAMFManager : IYAMFManager.Stub() {
 
             if (startCmd?.openAsMini == true) {
                 window.markOpenAsMini(startCmd.dropX, startCmd.dropY, startCmd.sourceBounds,
-                    startCmd.awaitSourceRelease, startCmd.sourcePackage, startCmd.handoffId, startCmd.entrySnapshot)
+                    startCmd.awaitSourceRelease, startCmd.sourcePackage, startCmd.handoffId, startCmd.entrySnapshot,
+                    startCmd.launcherRotation)
             }
 
             if (taskId != -1) {
@@ -572,6 +573,14 @@ object YAMFManager : IYAMFManager.Stub() {
         return released
     }
 
+    /** The native task is released while its existing host still owns the visual bridge. */
+    fun onHostTaskReleased(host: WindowHost) {
+        if (activeWindows[host.windowId] !== host) return
+        WindowSessions.hostedTasks.remove(host.currentTaskId)
+        WindowSessions.taskActivities.remove(host.currentTaskId)
+        broadcastManagedTaskIds()
+    }
+
     init {
         // log(TAG, "reYAMF service initialized")
     }
@@ -676,6 +685,8 @@ object YAMFManager : IYAMFManager.Stub() {
             val sourceBounds = intent.getParcelableExtra(Protocol.EXTRA_SOURCE_BOUNDS, android.graphics.Rect::class.java)
             val sourcePackage = intent.getStringExtra(Protocol.EXTRA_SOURCE_PACKAGE)
             val handoffId = intent.getLongExtra(Protocol.EXTRA_HANDOFF_ID, 0L)
+            val launcherRotation = intent.getIntExtra(Protocol.EXTRA_LAUNCHER_ROTATION, -1)
+                .takeIf { it in 0..3 } ?: -1
             val entrySnapshot = runCatching { com.buildsession.betterYAMF.xposed.hook.system.EntrySnapshotTransport.read(intent) }
                 .onFailure { log("reYAMF_EntryV2", "snapshot transfer failed task=$taskId handoff=$handoffId", it) }.getOrNull()
             if (intent.hasExtra(Protocol.EXTRA_ENTRY_SNAPSHOT_TOKEN) &&
@@ -694,7 +705,8 @@ object YAMFManager : IYAMFManager.Stub() {
             val startCmd = StartCmd(componentName, userId, taskId, openAsMini = fromDropZone,
                 dropX = dropX, dropY = dropY, sourceBounds = sourceBounds,
                 awaitSourceRelease = fromDropZone && (handoffComplete || entrySnapshot != null),
-                sourcePackage = sourcePackage, handoffId = handoffId, entrySnapshot = entrySnapshot)
+                sourcePackage = sourcePackage, handoffId = handoffId, entrySnapshot = entrySnapshot,
+                launcherRotation = launcherRotation)
             val proceed = {
                 runCatching { createWindow(startCmd) }.onFailure {
                     log("reYAMF_EntryV2", "window creation failed task=$taskId handoff=$handoffId", it)
