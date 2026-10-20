@@ -22,10 +22,10 @@ import com.buildsession.betterYAMF.ipc.IAppListCallback
 import com.buildsession.betterYAMF.ipc.IOpenCountListener
 import com.buildsession.betterYAMF.ipc.IYAMFManager
 import com.buildsession.betterYAMF.window.runtime.WindowRuntimes
-import com.buildsession.betterYAMF.xposed.hook.system.EntryProtocolIdentity
-import com.buildsession.betterYAMF.xposed.hook.system.EntrySnapshotTransport
-import com.buildsession.betterYAMF.xposed.hook.system.PendingEntryRequests
-import com.buildsession.betterYAMF.xposed.hook.system.UserScopedBroadcasts
+import com.buildsession.betterYAMF.xposed.adapters.common.system.EntryProtocolIdentity
+import com.buildsession.betterYAMF.xposed.adapters.common.system.EntrySnapshotTransport
+import com.buildsession.betterYAMF.xposed.adapters.common.system.PendingEntryRequests
+import com.buildsession.betterYAMF.xposed.adapters.common.system.UserScopedBroadcasts
 import com.buildsession.betterYAMF.window.api.CommandStatus
 import com.buildsession.betterYAMF.window.backend.WindowBackend
 import com.buildsession.betterYAMF.window.backend.WindowBackendCallbacks
@@ -33,7 +33,7 @@ import com.buildsession.betterYAMF.window.backend.WindowBackends
 import com.buildsession.betterYAMF.window.host.AppWindow
 import com.buildsession.betterYAMF.window.host.WindowHost
 import com.buildsession.betterYAMF.window.session.WindowSessions
-import com.buildsession.betterYAMF.xposed.hook.organizer.SmoothWindowBackend
+import com.buildsession.betterYAMF.xposed.adapters.SystemAdapters
 import com.buildsession.betterYAMF.xposed.utils.Instances
 import com.buildsession.betterYAMF.xposed.utils.Instances.systemContext
 import com.buildsession.betterYAMF.xposed.utils.Instances.systemUiContext
@@ -283,7 +283,7 @@ object YAMFManager : IYAMFManager.Stub() {
         Instances.init(activityManagerService)
         // 系统窗口后端（WindowBackend 端口）：安装 organizer/leash 实现并绑定回灌回调
         runCatching {
-            WindowBackends.install(SmoothWindowBackend)
+            WindowBackends.install(checkNotNull(SystemAdapters.current).windowBackend())
             WindowBackends.current().initialize(object : WindowBackendCallbacks {
                 override fun onPresentationInvalidated(taskId: Int) {
                     // Backend callbacks already leave WM's stack and validate their session on

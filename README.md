@@ -11,7 +11,7 @@
 
 ## 运行与安装
 
-工程声明的最低版本是 Android 13（API 33），当前原生交接与绘制同步的验证基线是 **LineageOS 24.0 的 Quickstep / Launcher3 与系统窗口后端**。最低 API、作用域中的包名或可找到的类名，都不能单独证明设备兼容。当前尚未完成 PixelOS / PixelLauncher 的适配验证。
+工程声明的最低版本是 Android 13（API 33），当前原生交接与绘制同步的验证基线是 **LineageOS 24.0 的 Quickstep / Launcher3 与系统窗口后端**。最低 API、作用域中的包名或可找到的类名，都不能单独证明设备兼容。当前 Android 17 / Pixel Launcher 17、907 仅为源码核对候选，尚未完成 PixelOS 真机验证；Android 15/16 的组合保留待适配入口。
 
 安装需要支持本工程 Xposed 接口的框架，例如 LSPosed。启用模块时，系统侧需要作用于 `android`，手势入口还需要作用于实际承担最近任务手势的 Launcher。侧边栏等应用侧浮层按界面提示授予悬浮窗权限。
 
@@ -58,14 +58,14 @@ app
 Launcher 手势的主要路径是：
 
 ```text
-HookLauncher / NativeHooks
-  → LauncherGestureAdapter
+HookLauncher → Android 大版本 / Launcher 安装入口
+  → NativeHooks / QuickstepHookInstaller → LauncherGestureAdapter
   → LauncherEntryHandle.onInput(EntryInput)
   → window-runtime → CORE
   → LauncherEntryPort → 原生投放提示或源交接预备
 ```
 
-[`NativeHooks`](app/src/main/java/com/buildsession/betterYAMF/xposed/hook/bridge/NativeHooks.kt) 封装方法注册、回调和原始方法调用；[`HookLauncher`](app/src/main/java/com/buildsession/betterYAMF/xposed/hook/HookLauncher.kt) 选择原生接入点；[`LauncherGestureAdapter`](app/src/main/java/com/buildsession/betterYAMF/xposed/hook/launcher/LauncherGestureAdapter.kt) 读取任务、手势和显示方向，将原生对象转换为公共值类型。
+[`NativeHooks`](app/src/main/java/com/buildsession/betterYAMF/xposed/hook/bridge/NativeHooks.kt) 封装方法注册、回调和原始方法调用；[`HookLauncher`](app/src/main/java/com/buildsession/betterYAMF/xposed/hook/HookLauncher.kt) 只选择组合入口，具体点位由所选适配实现安装；[`LauncherGestureAdapter`](app/src/main/java/com/buildsession/betterYAMF/xposed/adapters/common/launcher/LauncherGestureAdapter.kt) 读取任务、手势和显示方向，将原生对象转换为公共值类型。
 
 入口由 `LauncherEntries.create(scheduler, port)` 建立。适配器提交 `EntryInput`，并通过 `LauncherEntryPort` 提供候选任务、能力、投放区呈现和本地交接预备。是否满足触发条件、投放区位置与大小由 CORE 决定。
 
@@ -85,7 +85,7 @@ Launcher 的原始 UP 必须完整执行，保留最后位移更新与输入跟�
 | `SourceHandoffPort` | 通知源桥接帧结果，观察源释放后的目标旋转和原生过渡就绪 |
 | `WindowLifecyclePort` | 报告控制权释放与失败，最终清理本会话的浮层、监听器、像素和任务资源 |
 
-任务机制主要位于 [`SmoothWindowBackend`](app/src/main/java/com/buildsession/betterYAMF/xposed/hook/organizer/SmoothWindowBackend.kt) / `SmoothTaskOrganizer`；同帧提交由 [`SurfaceFrameSynchronizer`](app/src/main/java/com/buildsession/betterYAMF/xposed/hook/system/SurfaceFrameSynchronizer.kt) 落实；全屏交还由 [`FullscreenTaskHandoff`](app/src/main/java/com/buildsession/betterYAMF/xposed/hook/organizer/FullscreenTaskHandoff.kt) 观察真实控制权与重绘。
+任务机制主要位于 [`SmoothWindowBackend`](app/src/main/java/com/buildsession/betterYAMF/xposed/adapters/common/organizer/SmoothWindowBackend.kt) / `SmoothTaskOrganizer`；同帧提交由 [`SurfaceFrameSynchronizer`](app/src/main/java/com/buildsession/betterYAMF/xposed/adapters/common/system/SurfaceFrameSynchronizer.kt) 落实；全屏交还由 [`FullscreenTaskHandoff`](app/src/main/java/com/buildsession/betterYAMF/xposed/adapters/common/organizer/FullscreenTaskHandoff.kt) 观察真实控制权与重绘。
 
 `WindowBackend` 是 Android 内部后端接口，可以使用任务 token、leash 和事务。面向运行时的公共端口不携带这些对象，也不暴露 CORE 内部命令。更换 Android 原生机制时，应在适配器中满足同一端口保证。
 
@@ -115,6 +115,10 @@ Launcher 的原始 UP 必须完整执行，保留最后位移更新与输入跟�
 完整签名、线程要求、取消规则和完成条件见 **[事件与执行端口契约](window-api/README.md)**；新增或修改端口时，须同步维护实现、文档与契约测试。目前提供稳定的语义和源码接入边界，尚未发布独立二进制 SDK。
 
 ## 适配新的 Launcher 或 Android 版本
+
+具体实现以 **Android 大版本 + Launcher** 为独立目录和验收单位，共享机制集中在 `xposed/adapters/common`。每个组合提供普通 Kotlin Hook 安装入口，按精确 SDK / 包名 / 主进程选择；系统侧通过对应 Android 实现提供任务后端。未来 Android 版本和未登记 Launcher 不自动套用现有实现。
+
+完整目录、当前支持表、源码证据及新增步骤见 **[平台适配接入说明](app/src/main/java/com/buildsession/betterYAMF/xposed/adapters/README.md)**。AVIUM、Project Infinity X 等自带魔改小窗的 ROM 不在适配范围；公开构建信息中识别到相应标识时跳过 Hook。构建信息和方法签名都不能代替目标 ROM 的行为验收。
 
 | 变化来源 | 主要接入位置 | 需要核对 |
 |---|---|---|

@@ -36,7 +36,7 @@ fun Context.registerReceiver(action: String, onReceive: BroadcastReceiver.(Conte
     }
     val filter = android.content.IntentFilter(action)
     if (android.os.Process.myUid() == android.os.Process.SYSTEM_UID)
-        com.buildsession.betterYAMF.xposed.hook.system.UserScopedBroadcasts.registerSystemReceiver(this, receiver, filter)
+        com.buildsession.betterYAMF.xposed.adapters.common.system.UserScopedBroadcasts.registerSystemReceiver(this, receiver, filter)
     else registerReceiver(receiver, filter, TRUSTED_SENDER_PERMISSION, null, Context.RECEIVER_EXPORTED)
 }
 

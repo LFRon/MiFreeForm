@@ -112,4 +112,4 @@ Launcher 候选查询和交接预备期间也允许同步取消。取消后的�
 
 运行 `:window-core:test :window-runtime:test :app:testDebugUnitTest :app:testReleaseUnitTest` 验证公共策略、同步/异步端口、取消、过期结果、旋转、内容交接与架构依赖。源码边界测试禁止 Android、反射和系统时钟进入 JVM 模块，禁止 `app` 引用 CORE，禁止 Hook 回调类型逃出框架桥接。
 
-原生机制仍需根据目标源码和设备验证。当前迁移保留 LineageOS 24.0 上已验证的 Quickstep / organizer / HWUI 同步组合，并未实现或宣称 PixelOS / PixelLauncher 兼容。
+原生机制仍需根据目标源码和设备验证。当前按 Android 大版本 / Launcher 的独立适配入口保留 LineageOS 24.0 的 Quickstep / organizer / HWUI 基线；PixelOS 17 / Pixel Launcher 17、907 为源码核对候选，尚未完成真机验证。Android 15/16 目标入口处于待适配状态，不自动借用 Android 17 后端。具体匹配、原生机制和 ROM 排除规则见 `app/src/main/java/com/buildsession/betterYAMF/xposed/adapters/README.md`，这些信息不得进入本模块或 CORE。

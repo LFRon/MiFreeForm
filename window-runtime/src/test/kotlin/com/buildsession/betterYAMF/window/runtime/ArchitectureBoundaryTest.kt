@@ -35,7 +35,7 @@ class ArchitectureBoundaryTest {
     }
 
     @Test fun nativeHookCallbackAndInvocationTypesAreConfinedToTheFrameworkBridge() {
-        val violations = File(root, "app/src/main/java/com/buildsession/betterYAMF/xposed/hook")
+        val violations = File(root, "app/src/main/java/com/buildsession/betterYAMF/xposed")
             .walkTopDown().filter { it.extension == "kt" && "/bridge/" !in it.invariantSeparatorsPath }
             .filter { Regex("\\b(XC_MethodHook|XC_MethodReplacement|XposedBridge)\\b").containsMatchIn(source(it)) }
             .map { it.relativeTo(root).path }.toList()

@@ -1,88 +1,31 @@
 package com.buildsession.betterYAMF.xposed.hook
 
-import com.buildsession.betterYAMF.xposed.hook.bridge.NativeHooks
-
-import android.content.Intent
-import android.content.pm.IPackageManager
-import com.github.kyuubiran.ezxhelper.init.EzXHelperInit
-import com.github.kyuubiran.ezxhelper.utils.findMethod
-import com.buildsession.betterYAMF.xposed.hook.bridge.NativeHooks.hookAfter
-import com.buildsession.betterYAMF.xposed.hook.bridge.NativeHooks.hookBefore
-import com.buildsession.betterYAMF.BuildConfig
-import com.buildsession.betterYAMF.common.ipc.Protocol
-import com.buildsession.betterYAMF.xposed.hook.freeform.FreeformBackend
-import com.buildsession.betterYAMF.xposed.services.UserService
-import com.buildsession.betterYAMF.xposed.services.YAMFManager
+import com.buildsession.betterYAMF.xposed.adapters.AndroidEnvironment
+import com.buildsession.betterYAMF.xposed.adapters.SystemAdapters
 import com.buildsession.betterYAMF.xposed.utils.log
-import com.qauxv.util.Initiator
+import com.buildsession.betterYAMF.xposed.utils.logWarning
+import com.github.kyuubiran.ezxhelper.init.EzXHelperInit
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.IXposedHookZygoteInit
 import de.robv.android.xposed.callbacks.XC_LoadPackage
-import kotlin.concurrent.thread
 
-
+/** Framework entry only. Native hook points live in the selected Android implementation. */
 class HookSystem : IXposedHookZygoteInit, IXposedHookLoadPackage {
-    companion object {
-        private const val TAG = "reYAMF_HookSystem"
-    }
-
     override fun initZygote(startupParam: IXposedHookZygoteInit.StartupParam) {
         EzXHelperInit.initZygote(startupParam)
     }
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "android") return
-        // log(TAG, "xposed init")
-        // log(TAG, "buildtype: ${BuildConfig.VERSION_NAME}(${BuildConfig.VERSION_CODE}) ${BuildConfig.BUILD_TYPE}")
+        val adapter = SystemAdapters.current ?: run {
+            logWarning(TAG, "No system adapter in scope for SDK ${AndroidEnvironment.sdk}; skip native hooks")
+            return
+        }
         EzXHelperInit.initHandleLoadPackage(lpparam)
-        Initiator.init(lpparam.classLoader)
-        runCatching {
-            FreeformBackend.init(lpparam.classLoader)
-        }.onFailure {
-            log(TAG, "FreeformBackend init failed, but continuing for legacy support", it)
-        }
-
-         var serviceManagerHook: NativeHooks.Registration? = null
-         serviceManagerHook = findMethod("android.os.ServiceManager") {
-             name == "addService"
-         }.hookBefore { param ->
-             if (param.args[0] == "package") {
-                 serviceManagerHook?.unhook()
-                 val pms = param.args[1] as IPackageManager
-                 // log(TAG, "Got pms: $pms")
-                 thread {
-                     runCatching {
-                         UserService.register(pms)
-                         // log(TAG, "UserService started")
-                     }.onFailure {
-                         log(TAG, "UserService failed to start", it)
-                     }
-                 }
-             }
-         }
-
-         var activityManagerServiceSystemReadyHook: NativeHooks.Registration? = null
-         activityManagerServiceSystemReadyHook = findMethod("com.android.server.am.ActivityManagerService") {
-            name == "systemReady"
-        }.hookAfter {
-            activityManagerServiceSystemReadyHook?.unhook()
-            YAMFManager.activityManagerService = it.thisObject
-            YAMFManager.systemReady()
-            log(TAG) { "System ready, reYAMF services initialized." }
-            // log(TAG, "system ready")
-        }
-        // 注：LoS 24 的 checkBroadcastFromSystem 只存在于 BroadcastController（AMS 无此方法，
-        // 旧 AMS 版钩子每次开机都会失败，仅打日志——已删）。
-        runCatching {
-            findMethod("com.android.server.am.BroadcastController") {
-                name == "checkBroadcastFromSystem"
-            }.hookBefore {
-                val intent = it.args[0] as Intent
-                if (intent.action == Protocol.ACTION_RECEIVE_LAUNCHER_CONFIG)
-                    it.result = Unit
-            }
-        }.onFailure {
-            log(TAG, "BroadcastController checkBroadcastFromSystem failed", it)
-        }
+        runCatching { adapter.install(lpparam.classLoader) }
+            .onSuccess { log(TAG) { "selected system adapter: SDK ${adapter.sdk}, build=${com.buildsession.betterYAMF.BuildConfig.BUILD_TIME}" } }
+            .onFailure { logWarning(TAG, "System adapter initialization failed", it) }
     }
+
+    companion object { private const val TAG = "reYAMF_Adapters" }
 }

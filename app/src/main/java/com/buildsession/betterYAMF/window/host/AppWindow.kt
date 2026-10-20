@@ -27,11 +27,11 @@ import com.buildsession.betterYAMF.common.model.EntrySnapshot
 import com.buildsession.betterYAMF.window.api.*
 import com.buildsession.betterYAMF.window.runtime.WindowRuntimes
 import com.buildsession.betterYAMF.window.session.WindowSessions
-import com.buildsession.betterYAMF.xposed.hook.system.SurfaceFrameSynchronizer
-import com.buildsession.betterYAMF.xposed.hook.system.EntrySnapshotTransport
-import com.buildsession.betterYAMF.xposed.hook.system.UserScopedBroadcasts
-import com.buildsession.betterYAMF.xposed.hook.system.SystemBarMetrics
-import com.buildsession.betterYAMF.xposed.hook.system.ViewSurfaceOps
+import com.buildsession.betterYAMF.xposed.adapters.common.system.SurfaceFrameSynchronizer
+import com.buildsession.betterYAMF.xposed.adapters.common.system.EntrySnapshotTransport
+import com.buildsession.betterYAMF.xposed.adapters.common.system.UserScopedBroadcasts
+import com.buildsession.betterYAMF.xposed.adapters.common.system.SystemBarMetrics
+import com.buildsession.betterYAMF.xposed.adapters.common.system.ViewSurfaceOps
 import com.buildsession.betterYAMF.xposed.services.YAMFManager
 import com.buildsession.betterYAMF.xposed.services.YAMFManager.config
 import com.buildsession.betterYAMF.xposed.utils.Instances
