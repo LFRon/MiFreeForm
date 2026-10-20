@@ -1,5 +1,7 @@
 package com.buildsession.betterYAMF.xposed.hook.launcher
 
+import com.buildsession.betterYAMF.xposed.hook.bridge.NativeHooks
+
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -11,14 +13,13 @@ import android.os.SystemClock
 import android.view.MotionEvent
 import com.buildsession.betterYAMF.common.ipc.Protocol
 import com.buildsession.betterYAMF.common.model.EntrySnapshot
-import com.buildsession.betterYAMF.window.core.CommandStatus
+import com.buildsession.betterYAMF.window.api.CommandStatus
 import com.buildsession.betterYAMF.xposed.hook.system.EntrySnapshotTransport
+import com.buildsession.betterYAMF.xposed.hook.system.EntryProtocolIdentity
 import com.buildsession.betterYAMF.xposed.utils.log
 import com.buildsession.betterYAMF.xposed.utils.logWarning
 import com.buildsession.betterYAMF.xposed.utils.TRUSTED_SENDER_PERMISSION
 import com.buildsession.betterYAMF.xposed.utils.logError
-import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import java.lang.reflect.Method
 
@@ -32,6 +33,9 @@ internal object RecentsDropHandoff {
     private val handler = Handler(Looper.getMainLooper())
     private var installed = false
     private var bridgeSupported = false
+    private var backendEpoch = 0L
+    private var capabilityQueryId = 0L
+    fun bridgeAvailable(): Boolean = bridgeSupported
     private var application: Context? = null
     private val owners = HandoffOwners<Pending>()
     private val hookedEnds = mutableSetOf<Method>()
@@ -57,8 +61,16 @@ internal object RecentsDropHandoff {
             .onFailure { logWarning(TAG, "native source synchronization capability unavailable", it) }
         context.applicationContext.registerReceiver(object : BroadcastReceiver() {
             override fun onReceive(context: Context, intent: Intent) {
+                val sourceEpoch = intent.getLongExtra(Protocol.EXTRA_SOURCE_EPOCH, 0L)
+                if (sourceEpoch != 0L && sourceEpoch != EntryProtocolIdentity.epoch) return
                 if (intent.action == Protocol.ACTION_ENTRY_CAPABILITIES) {
-                    bridgeSupported = intent.getIntExtra(Protocol.EXTRA_ENTRY_PROTOCOL, 0) == Protocol.ENTRY_PROTOCOL
+                    val queryId = intent.getLongExtra(Protocol.EXTRA_CAPABILITY_QUERY_ID, 0L)
+                    if (queryId != 0L && queryId != capabilityQueryId) return
+                    val nextEpoch = intent.getLongExtra(Protocol.EXTRA_DESTINATION_EPOCH, 0L)
+                    if (backendEpoch != 0L && nextEpoch != 0L && nextEpoch != backendEpoch) dispose()
+                    backendEpoch = nextEpoch
+                    bridgeSupported = intent.getIntExtra(Protocol.EXTRA_ENTRY_PROTOCOL, 0) == Protocol.ENTRY_PROTOCOL &&
+                        intent.getBooleanExtra(Protocol.EXTRA_ASYNC_SNAPSHOT, false)
                     log(TAG) { "backend protocol ready=$bridgeSupported" }
                     return
                 }
@@ -92,7 +104,10 @@ internal object RecentsDropHandoff {
     private fun queryCapabilities() {
         val context = application ?: return
         context.sendBroadcast(Intent(Protocol.ACTION_QUERY_ENTRY_CAPABILITIES).setPackage("android")
-            .putExtra(Protocol.EXTRA_SOURCE_PACKAGE, context.packageName))
+            .putExtra(Protocol.EXTRA_SOURCE_PACKAGE, context.packageName)
+            .putExtra(Protocol.EXTRA_SOURCE_EPOCH, EntryProtocolIdentity.epoch)
+            .putExtra(Protocol.EXTRA_ASYNC_SNAPSHOT, true)
+            .putExtra(Protocol.EXTRA_CAPABILITY_QUERY_ID, ++capabilityQueryId))
     }
 
     /** Runs before native DOWN can reuse the shared Launcher StateManager. */
@@ -180,6 +195,8 @@ internal object RecentsDropHandoff {
             pending.pixels = EntrySnapshotTransport.Lease(snapshot)
             val request = Intent(pending.intent).apply {
                 putExtra(Protocol.EXTRA_ENTRY_PROTOCOL, Protocol.ENTRY_PROTOCOL)
+                putExtra(Protocol.EXTRA_SOURCE_EPOCH, EntryProtocolIdentity.epoch)
+                putExtra(Protocol.EXTRA_DESTINATION_EPOCH, backendEpoch)
                 putExtra(Protocol.EXTRA_SOURCE_PACKAGE, pending.context.packageName)
                 putExtra(Protocol.EXTRA_HANDOFF_ID, handoff.id)
                 putExtra(Protocol.EXTRA_LAUNCHER_ROTATION, handoff.launcherRotation)
@@ -261,7 +278,10 @@ internal object RecentsDropHandoff {
         if (pending.cancelDestination || status != CommandStatus.DONE) cancelDestination(pending)
         else pending.context.sendBroadcast(Intent(Protocol.ACTION_SOURCE_RELEASED).setPackage("android")
             .putExtra(Protocol.EXTRA_TASK_ID, pending.handoff.taskId)
-            .putExtra(Protocol.EXTRA_HANDOFF_ID, pending.handoff.id))
+            .putExtra(Protocol.EXTRA_HANDOFF_ID, pending.handoff.id)
+            .putExtra(Protocol.EXTRA_SOURCE_PACKAGE, pending.context.packageName)
+            .putExtra(Protocol.EXTRA_SOURCE_EPOCH, EntryProtocolIdentity.epoch)
+            .putExtra(Protocol.EXTRA_DESTINATION_EPOCH, backendEpoch))
     }
 
     private fun abortBeforeFinish(owner: HandoffOwners.Owner<Pending>, reason: String) {
@@ -285,7 +305,10 @@ internal object RecentsDropHandoff {
         runCatching {
             pending.context.sendBroadcast(Intent(Protocol.ACTION_CANCEL_RECENTS_ENTRY).setPackage("android")
                 .putExtra(Protocol.EXTRA_TASK_ID, pending.handoff.taskId)
-                .putExtra(Protocol.EXTRA_HANDOFF_ID, pending.handoff.id))
+                .putExtra(Protocol.EXTRA_HANDOFF_ID, pending.handoff.id)
+                .putExtra(Protocol.EXTRA_SOURCE_PACKAGE, pending.context.packageName)
+                .putExtra(Protocol.EXTRA_SOURCE_EPOCH, EntryProtocolIdentity.epoch)
+                .putExtra(Protocol.EXTRA_DESTINATION_EPOCH, backendEpoch))
         }.onFailure { log(TAG, "cancel bridge failed", it) }
     }
 
@@ -301,8 +324,8 @@ internal object RecentsDropHandoff {
                         PointF::class.java, Boolean::class.javaPrimitiveType))
             }
         if (method !in hookedEnds) {
-            XposedBridge.hookMethod(method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
+            NativeHooks.hookMethod(method, object : NativeHooks.Callback() {
+                override fun beforeHookedMethod(param: NativeHooks.Call) {
                     val owner = owners.all().firstOrNull { it.value.handoff.swipeHandler === param.thisObject } ?: return
                     val pending = owner.value
                     val originalMethod = param.method
@@ -310,7 +333,7 @@ internal object RecentsDropHandoff {
                     val arguments = param.args.clone()
                     val velocity = PointF(param.args[1] as PointF)
                     arguments[1] = PointF(velocity)
-                    if (pending.nativeFinishRequested || pending.gestureEnd.defer { XposedBridge.invokeOriginalMethod(originalMethod, receiver, arguments) }) {
+                    if (pending.nativeFinishRequested || pending.gestureEnd.defer { NativeHooks.invokeOriginalMethod(originalMethod, receiver, arguments) }) {
                         log(TAG) { "native UP deferred task=${pending.handoff.taskId} handoff=${pending.handoff.id}" }
                         param.result = null
                         if (pending.endReceived) return

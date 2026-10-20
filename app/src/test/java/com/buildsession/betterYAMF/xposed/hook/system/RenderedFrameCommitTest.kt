@@ -1,6 +1,6 @@
 package com.buildsession.betterYAMF.xposed.hook.system
 
-import com.buildsession.betterYAMF.window.core.CommandStatus
+import com.buildsession.betterYAMF.window.api.CommandStatus
 import org.junit.Assert.*
 import org.junit.Test
 

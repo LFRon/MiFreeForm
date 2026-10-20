@@ -1,16 +1,14 @@
 package com.buildsession.betterYAMF.window.backend
 
+import com.buildsession.betterYAMF.window.api.WindowOperation
 import android.app.ActivityManager
 import android.content.ComponentName
 import android.graphics.Rect
-import com.buildsession.betterYAMF.window.core.CommandStatus
-import com.buildsession.betterYAMF.window.core.ContentAlignment
-import com.buildsession.betterYAMF.window.core.FullscreenHandoffResult
+import com.buildsession.betterYAMF.window.api.CommandStatus
+import com.buildsession.betterYAMF.window.api.ContentAlignment
+import com.buildsession.betterYAMF.window.api.FullscreenHandoffResult
 
 /** Cancels an outstanding command; its callback still completes once with SUPERSEDED. */
-fun interface WindowOperation {
-    fun cancel()
-}
 
 /**
  * Android 内部后端接口：宿主/流程 ↔ 系统侧任务与表面机制。
@@ -28,6 +26,7 @@ fun interface WindowOperation {
  * WindowOrganizerController / Task / SurfaceControl 等系统细节。**
  */
 interface WindowBackend {
+    fun existingLogicalViewport(taskId: Int): Rect? = null
     /** Can retain source pixels while preparing an initially hidden live task. */
     val supportsRetainedEntry: Boolean get() = false
 
@@ -38,7 +37,7 @@ interface WindowBackend {
      * 打开：把任务认领为平滑窗口（freeform + 承载根 + 变换接管），
      * 置前并恢复可聚焦。返回是否成功认领。
      */
-    fun openTask(taskId: Int, initialBounds: Rect? = null): Boolean
+    fun openTask(taskId: Int, initialBounds: Rect? = null, logicalBounds: Rect? = null): Boolean
 
     /**
      * 关闭/释放：任务回到全屏并交还系统管理（含表面变换复位与焦点恢复）。
@@ -189,7 +188,7 @@ interface WindowBackend {
     fun windowingModeOf(taskInfo: ActivityManager.RunningTaskInfo): Int
 
     /** 该任务是否属于 Home（宿主置顶/让路判定用；实现封装系统判定细节）。 */
-    fun isHomeTask(taskInfo: ActivityManager.RunningTaskInfo): Boolean
+    fun isHomeTask(taskInfo: android.app.TaskInfo): Boolean
 
     /** 是否正有手指按在屏幕上（用于把回置顶推迟到手势结束）。 */
     fun isTouchActive(): Boolean
@@ -221,8 +220,10 @@ interface WindowBackendCallbacks {
     /** 任务已被接管且承载句柄就绪（宿主可摆位）。 */
     fun onTaskAdopted(taskId: Int)
 
-    /** 任务已消失／被系统回收（宿主应销毁对应外壳）。 */
-    fun onTaskVanished(taskId: Int)
+    /** Current native ownership was lost (including removal/organizer migration). The backend
+     * retires its resources and reconciles still-owned overrides; the host must not release again.
+     */
+    fun onTaskOwnershipLost(taskId: Int)
 
     /**
      * 任务可见性翻转（熄屏/亮屏、锁屏解锁、后台往返等**不产生"置前"事件**的场景）。

@@ -1,5 +1,6 @@
 package com.buildsession.betterYAMF.window.backend
 
+import com.buildsession.betterYAMF.window.api.WindowOperation
 import android.app.ActivityManager
 import android.content.ComponentName
 import android.graphics.Rect
@@ -24,25 +25,25 @@ object WindowBackends {
 
 private object NoopWindowBackend : WindowBackend {
     override fun initialize(callbacks: WindowBackendCallbacks) {}
-    override fun openTask(taskId: Int, initialBounds: Rect?): Boolean = false
+    override fun openTask(taskId: Int, initialBounds: Rect?, logicalBounds: Rect?): Boolean = false
     override fun releaseTask(taskId: Int, toFront: Boolean): Boolean = false
     override fun handoffFullscreen(
         taskId: Int, onReleased: () -> Unit,
-        onComplete: (com.buildsession.betterYAMF.window.core.FullscreenHandoffResult) -> Unit
+        onComplete: (com.buildsession.betterYAMF.window.api.FullscreenHandoffResult) -> Unit
     ): WindowOperation {
-        onComplete(com.buildsession.betterYAMF.window.core.FullscreenHandoffResult(
-            com.buildsession.betterYAMF.window.core.CommandStatus.FAILED, false))
+        onComplete(com.buildsession.betterYAMF.window.api.FullscreenHandoffResult(
+            com.buildsession.betterYAMF.window.api.CommandStatus.FAILED, false))
         return WindowOperation {}
     }
     override fun applyGeometry(taskId: Int, physicalBounds: Rect) {}
-    override fun preparePresentation(taskId: Int, normalBounds: Rect, onComplete: (com.buildsession.betterYAMF.window.core.CommandStatus) -> Unit): WindowOperation {
-        onComplete(com.buildsession.betterYAMF.window.core.CommandStatus.FAILED)
+    override fun preparePresentation(taskId: Int, normalBounds: Rect, onComplete: (com.buildsession.betterYAMF.window.api.CommandStatus) -> Unit): WindowOperation {
+        onComplete(com.buildsession.betterYAMF.window.api.CommandStatus.FAILED)
         return WindowOperation {}
     }
     override fun writePresentationInto(
         tx: android.view.SurfaceControl.Transaction, taskId: Int, physicalBounds: Rect,
         cornerRadiusPx: Float, alpha: Float,
-        contentAlignment: com.buildsession.betterYAMF.window.core.ContentAlignment
+        contentAlignment: com.buildsession.betterYAMF.window.api.ContentAlignment
     ): Boolean = false
     override fun writeGeometryInto(
         tx: android.view.SurfaceControl.Transaction,
@@ -64,10 +65,10 @@ private object NoopWindowBackend : WindowBackend {
     override fun forgetTask(taskId: Int) {}
     override fun requestSnapshotRefresh(taskId: Int) {}
     override fun windowingModeOf(taskInfo: ActivityManager.RunningTaskInfo): Int = 0
-    override fun isHomeTask(taskInfo: ActivityManager.RunningTaskInfo): Boolean = false
+    override fun isHomeTask(taskInfo: android.app.TaskInfo): Boolean = false
     override fun isTouchActive(): Boolean = false
     override fun suppressRecentsGestureFor(durationMs: Long) {}
-    override fun isTaskSurfaceStable(taskId: Int): Boolean = true
+    override fun isTaskSurfaceStable(taskId: Int): Boolean = false
     override fun recentsGestureSuppressUntilMs(): Long = 0L
     override fun injectHomeKey(): Boolean = false
 

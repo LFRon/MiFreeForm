@@ -25,4 +25,4 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = "BetterYAMF"
-include(":app", ":android-stub")
+include(":app", ":android-stub", ":window-api", ":window-core", ":window-runtime")

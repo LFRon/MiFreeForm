@@ -1,17 +1,31 @@
 package com.buildsession.betterYAMF.xposed.hook.launcher
 
-import com.buildsession.betterYAMF.window.core.RecentsGesturePolicy
-import com.buildsession.betterYAMF.window.core.WindowRect
+import com.buildsession.betterYAMF.window.runtime.LauncherEntries
+import com.buildsession.betterYAMF.window.api.*
+import com.buildsession.betterYAMF.window.api.WindowRect
 
 import org.junit.Assert.*
 import org.junit.Test
 
 class LauncherCoordinateMapperTest {
+    private val entry = LauncherEntries.create(object : RuntimeScheduler {
+        override fun isCurrentThread() = true
+        override fun post(work: () -> Unit) = work()
+        override fun after(delayMs: Long, work: () -> Unit) = WindowOperation {}
+        override fun nextFrame(work: (Long) -> Unit) = WindowOperation {}
+    }, object : LauncherEntryPort {
+        override val capabilities = LauncherEntryCapabilities(false, false)
+        override fun candidate(): EntryCandidate? = null
+        override fun present(frame: EntryTargetFrame) {}
+        override fun beginRetained(drop: EntryDrop) = false
+        override fun queueLegacy(drop: EntryDrop) {}
+        override fun suppressNativeGesture(durationMs: Long) {}
+    })
     private fun WindowRect.contains(point: LauncherCoordinateMapper.Point) =
         point.x >= left && point.x < right && point.y >= top && point.y < bottom
 
     @Test fun bothLandscapeRotationsRecognizeThePhysicalUpperRight() {
-        val zone = RecentsGesturePolicy.dropZone(2780, 1264)
+        val zone = entry.targetBounds(2780, 1264)
         val right = LauncherCoordinateMapper.rotatePoint(1100f, 2480f, 0, 1, 2780, 1264)
         assertEquals(LauncherCoordinateMapper.Point(2480f, 164f), right)
         assertTrue(zone.contains(right))
@@ -47,7 +61,7 @@ class LauncherCoordinateMapperTest {
         for (viewportRotation in 0..3) {
             val width = if (viewportRotation % 2 == 0) 1264 else 2780
             val height = if (viewportRotation % 2 == 0) 2780 else 1264
-            val zone = RecentsGesturePolicy.dropZone(width, height)
+            val zone = entry.targetBounds(width, height)
             assertEquals(width, zone.right)
             assertEquals(0, zone.top)
             for (inputRotation in 0..3) {
@@ -66,7 +80,7 @@ class LauncherCoordinateMapperTest {
         val oldPortraitCorner = LauncherCoordinateMapper.Point(1263f, 1f)
         val mappedOldCorner = LauncherCoordinateMapper.rotatePoint(oldPortraitCorner.x, oldPortraitCorner.y,
             0, 1, 2780, 1264)
-        val current = RecentsGesturePolicy.dropZone(2780, 1264)
+        val current = entry.targetBounds(2780, 1264)
         assertFalse(current.contains(mappedOldCorner))
         assertTrue(current.contains(LauncherCoordinateMapper.Point(2779f, 1f)))
     }

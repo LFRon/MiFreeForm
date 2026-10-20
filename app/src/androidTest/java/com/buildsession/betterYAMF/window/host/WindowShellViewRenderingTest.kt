@@ -9,11 +9,12 @@ import android.hardware.HardwareBuffer
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.filters.SdkSuppress
 import androidx.test.platform.app.InstrumentationRegistry
-import com.buildsession.betterYAMF.window.core.ContentAlignment
-import com.buildsession.betterYAMF.window.core.EntryTransitionPolicy
-import com.buildsession.betterYAMF.window.core.SceneRect
-import com.buildsession.betterYAMF.window.core.SceneStyle
-import com.buildsession.betterYAMF.window.core.WindowSceneFrame
+import com.buildsession.betterYAMF.window.api.ContentAlignment
+import com.buildsession.betterYAMF.window.api.EntryImageVisual
+import com.buildsession.betterYAMF.window.api.SceneRect
+import com.buildsession.betterYAMF.window.api.SceneMetrics
+import com.buildsession.betterYAMF.window.api.SceneStyle
+import com.buildsession.betterYAMF.window.api.WindowSceneFrame
 import org.junit.Assert.*
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -43,9 +44,10 @@ class WindowShellViewRenderingTest {
                 view.retainEntryImage(source)
                 view.render(WindowSceneFrame(viewport, viewport, 1f, 1f, 0f, 0f,
                     0f, false, true, showEntryImage = true,
-                    entryImage = EntryTransitionPolicy.sourceVisual(viewport,
-                        source.width.toFloat() / source.height, remaining),
-                    contentAlignment = ContentAlignment.TOP))
+                    entryImage = EntryImageVisual(viewport.coverTop(source.width.toFloat() / source.height),
+                        viewport.copy(height = viewport.height * remaining),
+                        if (remaining in 0.01f..0.99f) 2f else 0f),
+                    contentAlignment = ContentAlignment.TOP, coordinateSpace = SceneMetrics(112, 112, 0, 0)))
                 val canvas = node?.beginRecording() ?: Canvas(output!!)
                 try {
                     canvas.drawColor(Color.GREEN) // Represents the opaque live task underneath.

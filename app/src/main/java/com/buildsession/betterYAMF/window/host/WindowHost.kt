@@ -13,7 +13,10 @@ interface WindowHost {
     val windowId: Int
 
     /** 当前承载的任务 id（流程在认领时写入；-1 = 尚未认领）。 */
-    var currentTaskId: Int
+    val currentTaskId: Int
+
+    /** Bind exactly once before invoking native task adoption. */
+    fun bindTask(taskId: Int)
 
     /** 「打开即 mini」：任务就绪后由宿主请求进入角落 mini。 */
     fun markOpenAsMini(
@@ -21,7 +24,7 @@ interface WindowHost {
         sourceBounds: android.graphics.Rect? = null, awaitSourceRelease: Boolean = false,
         sourcePackage: String? = null, handoffId: Long = 0L,
         entrySnapshot: com.buildsession.betterYAMF.common.model.EntrySnapshot? = null,
-        launcherRotation: Int = -1
+        launcherRotation: Int = -1, sourceEpoch: Long = 0L, sourceUserId: Int = 0
     )
 
     /** Adopt using the core's normal viewport; a staged source is displayed before this call. */
@@ -31,6 +34,7 @@ interface WindowHost {
     /** The source has relinquished its visible card after our first frame was committed. */
     fun onSourceReleased(handoffId: Long)
     fun onPresentationInvalidated()
+    fun onTaskOwnershipLost()
 
     /** organizer 路径：任务 leash 已就绪，按当前几何摆放。 */
     fun onOrganizerLeash()

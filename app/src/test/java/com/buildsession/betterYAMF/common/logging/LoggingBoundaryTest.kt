@@ -7,11 +7,14 @@ import java.io.File
 /** Keep every project-owned log writer behind the build-variant/severity policy. */
 class LoggingBoundaryTest {
     @Test fun allProjectLoggingUsesTheCommonPolicy() {
-        val root = listOf(File("src/main/java"), File("app/src/main/java"))
-            .firstOrNull { it.isDirectory } ?: error("Cannot locate application sources")
+        val root = generateSequence(File(".").canonicalFile) { it.parentFile }
+            .first { File(it, "settings.gradle.kts").isFile }
+        val sources = listOf("app/src/main/java", "window-api/src/main/kotlin",
+            "window-core/src/main/kotlin", "window-runtime/src/main/kotlin").map { File(root, it) }
         val violations = mutableListOf<String>()
         val writers = Regex("android\\.util\\.Log|XposedBridge\\s*\\.\\s*log\\s*\\(|\\bprintln\\s*\\(|\\bprintStackTrace\\s*\\(|System\\.(out|err)\\b")
-        root.walkTopDown().filter { it.isFile && it.extension in setOf("kt", "java") }
+        sources.asSequence().flatMap { it.walkTopDown().asSequence() }
+            .filter { it.isFile && it.extension in setOf("kt", "java") }
             .filterNot { it.invariantSeparatorsPath.endsWith("/common/logging/AppLog.kt") }
             .forEach { file ->
                 val source = file.readText()

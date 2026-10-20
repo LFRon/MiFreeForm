@@ -1,8 +1,7 @@
 package com.buildsession.betterYAMF.xposed.hook.organizer
 
-import com.buildsession.betterYAMF.window.core.ContentAlignment
-import com.buildsession.betterYAMF.window.core.EntryTransitionPolicy
-import com.buildsession.betterYAMF.window.core.SceneRect
+import com.buildsession.betterYAMF.window.api.ContentAlignment
+import com.buildsession.betterYAMF.window.api.SceneRect
 import org.junit.Assert.*
 import org.junit.Test
 
@@ -12,7 +11,7 @@ class ViewportTransformTest {
             for ((logicalWidth, logicalHeight) in listOf(1264 to 2780, 1264 to 1605, 2780 to 1264)) {
                 val f = ViewportTransform.compute(logicalWidth, logicalHeight,
                     80, 120, width, height, 20f, ContentAlignment.TOP)!!
-                val image = EntryTransitionPolicy.cover(SceneRect(80f, 120f, width.toFloat(), height.toFloat()),
+                val image = SceneRect(80f, 120f, width.toFloat(), height.toFloat()).coverTop(
                     logicalWidth.toFloat() / logicalHeight)
                 assertEquals(0f, f.cropTop, 0f)
                 assertEquals(120f, f.y, 0.001f)

@@ -29,6 +29,11 @@ object Protocol {
     const val EXTRA_ENTRY_PROTOCOL = "entryProtocol"
     const val EXTRA_ENTRY_SNAPSHOT_TOKEN = "entrySnapshotToken"
     const val ENTRY_PROTOCOL = 2
+    // Optional v2 negotiation fields. No existing action, status or parcel order is changed.
+    const val EXTRA_SOURCE_EPOCH = "entrySourceEpoch"
+    const val EXTRA_DESTINATION_EPOCH = "entryDestinationEpoch"
+    const val EXTRA_CAPABILITY_QUERY_ID = "entryCapabilityQueryId"
+    const val EXTRA_ASYNC_SNAPSHOT = "entryAsyncSnapshot"
 
     // —— extras ——
     const val EXTRA_COMPONENT_NAME = "componentName"

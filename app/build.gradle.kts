@@ -68,6 +68,7 @@ android {
 }
 
 dependencies {
+    implementation(project(":window-runtime"))
 
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.appcompat)
@@ -149,30 +150,3 @@ val isDirty: Boolean
         }
         return out.size() != 0
     }
-
-// Compile the pure event loop with only the JVM standard library. An accidental Android / hook
-// dependency must fail the build, even though the app's normal Kotlin compilation has android.jar.
-val coreBoundaryCompiler by configurations.creating
-val coreBoundaryStdlib by configurations.creating
-dependencies {
-    coreBoundaryCompiler("org.jetbrains.kotlin:kotlin-compiler-embeddable:${libs.versions.kotlin.get()}")
-    coreBoundaryStdlib("org.jetbrains.kotlin:kotlin-stdlib:${libs.versions.kotlin.get()}")
-}
-val compileWindowCoreBoundary by tasks.registering(JavaExec::class) {
-    val sources = fileTree("src/main/java/com/buildsession/betterYAMF/window/core") { include("**/*.kt") }
-    val destination = layout.buildDirectory.dir("window-core-boundary")
-    inputs.files(sources)
-    inputs.files(coreBoundaryStdlib)
-    outputs.dir(destination)
-    classpath = coreBoundaryCompiler + coreBoundaryStdlib
-    mainClass.set("org.jetbrains.kotlin.cli.jvm.K2JVMCompiler")
-    doFirst {
-        destination.get().asFile.mkdirs()
-        setArgs(listOf("-no-stdlib", "-no-reflect", "-jvm-target", "11", "-classpath",
-            coreBoundaryStdlib.asPath, "-d", destination.get().asFile.absolutePath) +
-            sources.files.sortedBy { it.path }.map { it.absolutePath })
-    }
-}
-tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>().configureEach {
-    dependsOn(compileWindowCoreBoundary)
-}

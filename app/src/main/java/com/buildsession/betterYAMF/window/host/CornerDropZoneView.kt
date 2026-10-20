@@ -6,28 +6,17 @@ import android.graphics.Color
 import android.graphics.DashPathEffect
 import android.graphics.Paint
 import android.graphics.RectF
-import android.util.DisplayMetrics
 import android.view.View
 import com.buildsession.betterYAMF.common.ui.dpToPx
-import com.buildsession.betterYAMF.window.core.DropKind
-import com.buildsession.betterYAMF.window.core.DropTargetCalculator
+import com.buildsession.betterYAMF.window.api.DropKind
+import com.buildsession.betterYAMF.window.api.DropTargetVisual
 
 internal class CornerDropZoneView(context: Context) : View(context) {
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val dashPaint = Paint(Paint.ANTI_ALIAS_FLAG)
 
-    private fun getRealScreenMetrics(): DisplayMetrics {
-        val dm = DisplayMetrics()
-        context.display?.getRealMetrics(dm)
-        return dm
-    }
-
-    private val radius: Float
-        get() {
-            val dm = getRealScreenMetrics()
-            // 与命中策略同源（core.DropTargetCalculator）：避免两处常量各自漂移
-            return minOf(dm.widthPixels, dm.heightPixels) * DropTargetCalculator.CORNER_RADIUS_RATIO
-        }
+    private var visual: DropTargetVisual? = null
+    private val radius: Float get() = visual?.cornerRadiusPx ?: 0f
 
     private var currentCorner = -1 // -1: none, 0: TL, 1: TR, 2: BL, 3: BR
     private var isInsideActiveZone = false
@@ -39,7 +28,10 @@ internal class CornerDropZoneView(context: Context) : View(context) {
         dashPaint.pathEffect = DashPathEffect(floatArrayOf(10f.dpToPx(), 10f.dpToPx()), 0f)
     }
 
-    fun render(hover: DropKind?, active: Boolean) {
+    fun render(value: DropTargetVisual) {
+        visual = value
+        val hover = value.kind
+        val active = value.active
         currentCorner = when (hover) {
             DropKind.CORNER_TL -> 0
             DropKind.CORNER_TR -> 1
@@ -54,9 +46,9 @@ internal class CornerDropZoneView(context: Context) : View(context) {
     }
 
     override fun onDraw(canvas: Canvas) {
-        val dm = getRealScreenMetrics()
-        val w = dm.widthPixels.toFloat()
-        val h = dm.heightPixels.toFloat()
+        val metrics = visual?.coordinateSpace ?: return
+        val w = metrics.width.toFloat()
+        val h = metrics.height.toFloat()
         if (w == 0f || h == 0f || currentCorner == -1) return
 
         when (currentCorner) {
@@ -64,17 +56,10 @@ internal class CornerDropZoneView(context: Context) : View(context) {
             1 -> drawCorner(canvas, w, 0f, 90f, 90f) // TR
             2 -> drawCorner(canvas, 0f, h, 270f, 90f) // BL
             3 -> drawCorner(canvas, w, h, 180f, 90f) // BR
-            4 -> drawSide( // Left
-                canvas, 0f,
-                h * DropTargetCalculator.SIDE_HEIGHT_START_RATIO,
-                w * DropTargetCalculator.SIDE_WIDTH_RATIO,
-                h * DropTargetCalculator.SIDE_HEIGHT_END_RATIO
-            )
-            5 -> drawSide( // Right
-                canvas, w * (1f - DropTargetCalculator.SIDE_WIDTH_RATIO),
-                h * DropTargetCalculator.SIDE_HEIGHT_START_RATIO,
-                w, h * DropTargetCalculator.SIDE_HEIGHT_END_RATIO
-            )
+            4, 5 -> {
+                val box = (if (currentCorner == 4) visual?.sideLeft else visual?.sideRight) ?: return
+                drawSide(canvas, box.left, box.top, box.right, box.bottom)
+            }
         }
     }
 

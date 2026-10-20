@@ -1,13 +1,13 @@
 package com.buildsession.betterYAMF.xposed.hook.launcher
 
+import com.buildsession.betterYAMF.xposed.hook.bridge.NativeHooks
+
 import android.annotation.SuppressLint
 import android.graphics.Rect
 import android.graphics.RectF
 import android.os.Handler
 import android.os.Looper
 import android.view.SurfaceControl
-import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XposedBridge
 import java.util.IdentityHashMap
 import java.util.concurrent.Executor
 
@@ -120,17 +120,17 @@ internal class RecentsSourceFrame private constructor(
             check(methods.contains(apply) && getTransaction.returnType == SurfaceControl.Transaction::class.java &&
                 submit.returnType == Void.TYPE && bounds.returnType == RectF::class.java &&
                 crop.returnType == RectF::class.java && radius.returnType == Float::class.javaPrimitiveType)
-            val hooks = mutableListOf<XC_MethodHook.Unhook>()
+            val hooks = mutableListOf<NativeHooks.Registration>()
             try {
                 methods.forEach { method ->
-                    hooks += XposedBridge.hookMethod(method, object : XC_MethodHook() {
-                        override fun beforeHookedMethod(param: MethodHookParam) {
+                    hooks += NativeHooks.hookMethod(method, object : NativeHooks.Callback() {
+                        override fun beforeHookedMethod(param: NativeHooks.Call) {
                             if (simulators[param.thisObject]?.fence?.frozen == true) param.result = null
                         }
                     })
                 }
-                hooks += XposedBridge.hookMethod(submit, object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
+                hooks += NativeHooks.hookMethod(submit, object : NativeHooks.Callback() {
+                    override fun beforeHookedMethod(param: NativeHooks.Call) {
                         transactions[param.thisObject]?.let { source ->
                             source.submitting(getTransaction.invoke(param.args[0]) as SurfaceControl.Transaction)
                         }

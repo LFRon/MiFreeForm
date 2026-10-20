@@ -1,6 +1,6 @@
 package com.buildsession.betterYAMF.xposed.hook.system
 
-import com.buildsession.betterYAMF.window.core.CommandStatus
+import com.buildsession.betterYAMF.window.api.CommandStatus
 
 /** HWUI production and SF transaction commit can arrive in either order. Both are required. */
 internal class RenderedFrameCommit {

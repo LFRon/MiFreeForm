@@ -1,11 +1,13 @@
 package com.buildsession.betterYAMF.xposed.hook
 
+import com.buildsession.betterYAMF.xposed.hook.bridge.NativeHooks
+
 import android.content.Intent
 import android.content.pm.IPackageManager
 import com.github.kyuubiran.ezxhelper.init.EzXHelperInit
 import com.github.kyuubiran.ezxhelper.utils.findMethod
-import com.github.kyuubiran.ezxhelper.utils.hookAfter
-import com.github.kyuubiran.ezxhelper.utils.hookBefore
+import com.buildsession.betterYAMF.xposed.hook.bridge.NativeHooks.hookAfter
+import com.buildsession.betterYAMF.xposed.hook.bridge.NativeHooks.hookBefore
 import com.buildsession.betterYAMF.BuildConfig
 import com.buildsession.betterYAMF.common.ipc.Protocol
 import com.buildsession.betterYAMF.xposed.hook.freeform.FreeformBackend
@@ -15,7 +17,6 @@ import com.buildsession.betterYAMF.xposed.utils.log
 import com.qauxv.util.Initiator
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.IXposedHookZygoteInit
-import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 import kotlin.concurrent.thread
 
@@ -41,7 +42,7 @@ class HookSystem : IXposedHookZygoteInit, IXposedHookLoadPackage {
             log(TAG, "FreeformBackend init failed, but continuing for legacy support", it)
         }
 
-         var serviceManagerHook: XC_MethodHook.Unhook? = null
+         var serviceManagerHook: NativeHooks.Registration? = null
          serviceManagerHook = findMethod("android.os.ServiceManager") {
              name == "addService"
          }.hookBefore { param ->
@@ -60,7 +61,7 @@ class HookSystem : IXposedHookZygoteInit, IXposedHookLoadPackage {
              }
          }
 
-         var activityManagerServiceSystemReadyHook: XC_MethodHook.Unhook? = null
+         var activityManagerServiceSystemReadyHook: NativeHooks.Registration? = null
          activityManagerServiceSystemReadyHook = findMethod("com.android.server.am.ActivityManagerService") {
             name == "systemReady"
         }.hookAfter {

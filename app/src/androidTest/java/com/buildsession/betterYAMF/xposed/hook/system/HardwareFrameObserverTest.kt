@@ -13,7 +13,7 @@ import android.view.ViewTreeObserver
 import android.view.WindowManager
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
-import com.buildsession.betterYAMF.window.core.CommandStatus
+import com.buildsession.betterYAMF.window.api.CommandStatus
 import com.buildsession.betterYAMF.xposed.hook.launcher.SourceCommitFence
 import org.junit.Assert.*
 import org.junit.Test

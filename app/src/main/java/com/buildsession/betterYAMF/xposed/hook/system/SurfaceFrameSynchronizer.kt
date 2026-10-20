@@ -7,7 +7,7 @@ import android.view.SurfaceControl
 import android.view.View
 import android.view.ViewTreeObserver
 import android.view.WindowManager
-import com.buildsession.betterYAMF.window.core.CommandStatus
+import com.buildsession.betterYAMF.window.api.CommandStatus
 import com.buildsession.betterYAMF.xposed.utils.log
 import com.buildsession.betterYAMF.xposed.utils.logError
 import de.robv.android.xposed.XposedHelpers

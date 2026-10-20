@@ -1,6 +1,5 @@
 package com.buildsession.betterYAMF.xposed.hook.system
 
-import android.app.ActivityManager
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.SystemClock
@@ -40,7 +39,7 @@ object TaskSystemOps {
     }.getOrDefault(0)
 
     /** 任务是否 Home（主路径 = windowConfiguration.getActivityType；兜底 = 包名启发式）。 */
-    fun isHomeTask(taskInfo: ActivityManager.RunningTaskInfo): Boolean {
+    fun isHomeTask(taskInfo: android.app.TaskInfo): Boolean {
         val activityType = runCatching {
             val config = taskInfo.getObject("configuration")
             val windowConfig = config.getObject("windowConfiguration")

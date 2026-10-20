@@ -6,10 +6,10 @@ import android.content.ComponentName
 import android.content.Intent
 import android.graphics.Rect
 import com.buildsession.betterYAMF.window.backend.WindowBackend
-import com.buildsession.betterYAMF.window.backend.WindowOperation
-import com.buildsession.betterYAMF.window.core.CommandStatus
-import com.buildsession.betterYAMF.window.core.ContentAlignment
-import com.buildsession.betterYAMF.window.core.FullscreenHandoffResult
+import com.buildsession.betterYAMF.window.api.WindowOperation
+import com.buildsession.betterYAMF.window.api.CommandStatus
+import com.buildsession.betterYAMF.window.api.ContentAlignment
+import com.buildsession.betterYAMF.window.api.FullscreenHandoffResult
 import com.buildsession.betterYAMF.window.backend.WindowBackendCallbacks
 import com.buildsession.betterYAMF.xposed.hook.freeform.FreeformBackend
 import com.buildsession.betterYAMF.xposed.hook.system.SystemSignals
@@ -34,6 +34,7 @@ import java.util.concurrent.ConcurrentHashMap
  * - 未接管的平滑任务走旧 WCT 释放兜底。
  */
 object SmoothWindowBackend : WindowBackend {
+    override fun existingLogicalViewport(taskId: Int): Rect? = SmoothTaskOrganizer.currentLogicalViewport(taskId)
     private const val TAG = "reYAMF_Backend"
     private const val WINDOWING_MODE_FULLSCREEN = 1
     private const val WINDOWING_MODE_FREEFORM = 5
@@ -54,6 +55,8 @@ object SmoothWindowBackend : WindowBackend {
     private val frameSynchronizedTasks = ConcurrentHashMap.newKeySet<Int>()
     private val invalidatedPresentations = ConcurrentHashMap.newKeySet<Int>()
     private val preparations = ConcurrentHashMap<Int, Preparation>()
+    /** Native ownership fact, recorded before the serial host receives its notification. */
+    private val lostNativeTasks = ConcurrentHashMap.newKeySet<Int>()
     private val mainHandler by lazy { android.os.Handler(android.os.Looper.getMainLooper()) }
     private val taskCallbacks = TaskCallbackDispatcher { work -> mainHandler.post { work() } }
     private val visibilityRefresh by lazy {
@@ -103,12 +106,13 @@ object SmoothWindowBackend : WindowBackend {
     // Installed exclusively by YAMFManager.systemReady in system_server, using its system-UID
     // ActivityManager instance; permissions belong to that process, not the module APK manifest.
     @SuppressLint("MissingPermission")
-    override fun openTask(taskId: Int, initialBounds: Rect?): Boolean {
+    override fun openTask(taskId: Int, initialBounds: Rect?, logicalBounds: Rect?): Boolean {
         if (taskId <= 0 || SmoothTaskOrganizer.isFloatingRootTask(taskId)) {
             logWarning(TAG, "refuse application adoption for internal/invalid task=$taskId")
             return false
         }
         FullscreenTaskHandoff.cancel(taskId)
+        lostNativeTasks.remove(taskId)
         taskCallbacks.begin(taskId)
         // 认领 + 置前；不施加任何密度覆盖——小窗不改应用 DPI。
         if (initialBounds != null) {
@@ -116,7 +120,7 @@ object SmoothWindowBackend : WindowBackend {
             appearanceByTask[taskId] = Appearance(alpha = 0f)
         }
         setTaskFocusable(taskId, true)
-        val adopted = SmoothTaskOrganizer.adoptTask(taskId, initialBounds)
+        val adopted = SmoothTaskOrganizer.adoptTask(taskId, initialBounds, logicalBounds)
         // reparent(onTop) + reorder(root,onTop) already resumes the task. A second moveTaskToFront
         // starts an unrelated TO_FRONT/snapshot transition after recents has just finished.
         val moved = if (adopted && initialBounds == null) runCatching {
@@ -133,6 +137,12 @@ object SmoothWindowBackend : WindowBackend {
         if (taskId <= 0 || SmoothTaskOrganizer.isFloatingRootTask(taskId)) {
             logWarning(TAG, "refuse application release for internal/invalid task=$taskId")
             return false
+        }
+        if (lostNativeTasks.contains(taskId)) {
+            // A queued old failure may race the ownership-lost event. Resource disposal is
+            // allowed; the task now belongs to somebody else and must not enter legacy WCT.
+            forgetGeometry(taskId)
+            return true
         }
         // 会话几何先清：无论走 organizer 释放还是旧路径兜底，几何缓存都不应残留
         forgetGeometry(taskId)
@@ -480,7 +490,7 @@ object SmoothWindowBackend : WindowBackend {
     override fun windowingModeOf(taskInfo: ActivityManager.RunningTaskInfo): Int =
         TaskSystemOps.windowingMode(taskInfo)
 
-    override fun isHomeTask(taskInfo: ActivityManager.RunningTaskInfo): Boolean =
+    override fun isHomeTask(taskInfo: android.app.TaskInfo): Boolean =
         TaskSystemOps.isHomeTask(taskInfo)
 
     override fun isTouchActive(): Boolean = SystemSignals.isTouchActive()
@@ -504,8 +514,24 @@ object SmoothWindowBackend : WindowBackend {
         }
     }
 
-    fun notifyTaskVanished(taskId: Int) {
-        taskCallbacks.dispatch(taskId) { callbacks?.onTaskVanished(taskId) }
+    internal fun notifyTaskVanished(taskId: Int, layout: TaskOverrideLease? = null) {
+        lostNativeTasks.add(taskId)
+        taskCallbacks.dispatch(taskId) {
+            if (SmoothTaskOrganizer.isLeashManaged(taskId)) return@dispatch
+            // Deliver the ownership fact BEFORE cancellation can synchronously complete an old
+            // preparation/fullscreen command. Otherwise its failure would request release again.
+            try { callbacks?.onTaskOwnershipLost(taskId) } finally {
+                if (!SmoothTaskOrganizer.isLeashManaged(taskId)) {
+                    forgetGeometry(taskId)
+                }
+            }
+        }
+        // Resource retirement must also run if the old host already closed and invalidated its
+        // notification ticket. The lease/current-native checks protect a replacement owner.
+        mainHandler.post {
+            runCatching { SmoothTaskOrganizer.reconcileLostOwnership(taskId, layout) }
+                .onFailure { logError(TAG, "lost task layout cleanup failed task=$taskId", it) }
+        }
     }
 
     /** 任务可见性翻转回灌（组织者 onTaskInfoChanged 驱动；见接口注释）。 */

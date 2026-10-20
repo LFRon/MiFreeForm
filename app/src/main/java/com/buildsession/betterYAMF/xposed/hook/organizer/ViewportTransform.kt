@@ -1,6 +1,6 @@
 package com.buildsession.betterYAMF.xposed.hook.organizer
 
-import com.buildsession.betterYAMF.window.core.ContentAlignment
+import com.buildsession.betterYAMF.window.api.ContentAlignment
 
 /** Platform-independent arithmetic for the adapter's uniform-scale / cover-crop contract. */
 internal data class ViewportTransform(

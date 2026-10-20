@@ -7,6 +7,8 @@ import android.content.Context
 import android.content.Intent
 import android.os.Process
 import android.os.SystemClock
+import android.os.Handler
+import android.os.Looper
 import com.buildsession.betterYAMF.BuildConfig
 import com.buildsession.betterYAMF.common.gson
 import com.buildsession.betterYAMF.common.model.AppInfo
@@ -19,7 +21,12 @@ import com.buildsession.betterYAMF.ipc.IAppIconCallback
 import com.buildsession.betterYAMF.ipc.IAppListCallback
 import com.buildsession.betterYAMF.ipc.IOpenCountListener
 import com.buildsession.betterYAMF.ipc.IYAMFManager
-import com.buildsession.betterYAMF.xposed.hook.HookLauncher
+import com.buildsession.betterYAMF.window.runtime.WindowRuntimes
+import com.buildsession.betterYAMF.xposed.hook.system.EntryProtocolIdentity
+import com.buildsession.betterYAMF.xposed.hook.system.EntrySnapshotTransport
+import com.buildsession.betterYAMF.xposed.hook.system.PendingEntryRequests
+import com.buildsession.betterYAMF.xposed.hook.system.UserScopedBroadcasts
+import com.buildsession.betterYAMF.window.api.CommandStatus
 import com.buildsession.betterYAMF.window.backend.WindowBackend
 import com.buildsession.betterYAMF.window.backend.WindowBackendCallbacks
 import com.buildsession.betterYAMF.window.backend.WindowBackends
@@ -49,6 +56,8 @@ object YAMFManager : IYAMFManager.Stub() {
     private const val LEGACY_DEFAULT_WINDOW_HEIGHT = 380
 
     private val activeWindows = mutableMapOf<Int, WindowHost>()
+    private val entryHandler by lazy { Handler(Looper.getMainLooper()) }
+    private val entryRequests = PendingEntryRequests { logError("reYAMF_EntryV2", "pending entry cleanup failed", it) }
     val pendingSmoothFreeformApps = mutableMapOf<ComponentName, WindowHost>()
 
     lateinit var config: Config
@@ -113,7 +122,7 @@ object YAMFManager : IYAMFManager.Stub() {
                                     // Trigger a config change to apply spoofing/scaling immediately
                                     // ⚠ 次序铁律（同 createWindow）：currentTaskId 先于同步认领赋值，
                                     // 否则 adoptTask 的同步回灌会被 onOrganizerTaskAppeared 过滤跳过。
-                                    pendingWindow.currentTaskId = taskInfo.taskId
+                                    pendingWindow.bindTask(taskInfo.taskId)
                                     activateWindowTask(pendingWindow)
                                     pendingWindow.onTaskMovedToFront(taskInfo)
                                 }
@@ -286,7 +295,7 @@ object YAMFManager : IYAMFManager.Stub() {
                     onOrganizerTaskAppeared(taskId)
                 }
 
-                override fun onTaskVanished(taskId: Int) {
+                override fun onTaskOwnershipLost(taskId: Int) {
                     onOrganizerTaskVanished(taskId)
                 }
 
@@ -300,19 +309,37 @@ object YAMFManager : IYAMFManager.Stub() {
         }.onFailure { log("reYAMF_debug", "window backend init failed", it) }
         systemContext.registerReceiver(Protocol.ACTION_OPEN_IN_YAMF, OpenInYAMFBroadcastReceiver)
         systemContext.registerReceiver(Protocol.ACTION_SOURCE_RELEASED) { _, intent ->
+            val user = UserScopedBroadcasts.deliveryUser(this)
+            if (!EntryProtocolIdentity.acceptsDestination(intent, user)) return@registerReceiver
             val taskId = intent.getIntExtra(Protocol.EXTRA_TASK_ID, -1)
             val handoffId = intent.getLongExtra(Protocol.EXTRA_HANDOFF_ID, 0L)
-            runMain { activeWindows.values.firstOrNull { it.currentTaskId == taskId }?.onSourceReleased(handoffId) }
+            activeWindows.values.firstOrNull { it.currentTaskId == taskId }?.onSourceReleased(handoffId)
         }
         systemContext.registerReceiver(Protocol.ACTION_CANCEL_RECENTS_ENTRY) { _, intent ->
+            val user = UserScopedBroadcasts.deliveryUser(this)
+            if (!EntryProtocolIdentity.acceptsDestination(intent, user)) return@registerReceiver
             val taskId = intent.getIntExtra(Protocol.EXTRA_TASK_ID, -1)
             val handoffId = intent.getLongExtra(Protocol.EXTRA_HANDOFF_ID, 0L)
-            runMain { activeWindows.values.firstOrNull { it.currentTaskId == taskId }?.onEntryCancelled(handoffId) }
+            intent.getStringExtra(Protocol.EXTRA_SOURCE_PACKAGE)?.let { source ->
+                entryRequests.cancel(PendingEntryRequests.Key(source, user,
+                    intent.getLongExtra(Protocol.EXTRA_SOURCE_EPOCH, 0L), taskId, handoffId))
+            }
+            activeWindows.values.firstOrNull { it.currentTaskId == taskId }?.onEntryCancelled(handoffId)
         }
         systemContext.registerReceiver(Protocol.ACTION_QUERY_ENTRY_CAPABILITIES) { _, intent ->
-            val sourcePackage = intent.getStringExtra(Protocol.EXTRA_SOURCE_PACKAGE) ?: return@registerReceiver
-            systemContext.sendBroadcast(Intent(Protocol.ACTION_ENTRY_CAPABILITIES).setPackage(sourcePackage)
-                .putExtra(Protocol.EXTRA_ENTRY_PROTOCOL, if (windowBackend.supportsRetainedEntry) Protocol.ENTRY_PROTOCOL else 0))
+            val sender = launcherSender(this, intent) ?: return@registerReceiver
+            val sourcePackage = sender.packageName
+            val sourceEpoch = intent.getLongExtra(Protocol.EXTRA_SOURCE_EPOCH, 0L)
+            val async = intent.getBooleanExtra(Protocol.EXTRA_ASYNC_SNAPSHOT, false)
+            if (!EntryProtocolIdentity.peers.register(sourcePackage, sourceEpoch, sender.userId, sender.uid, async)) return@registerReceiver
+            entryRequests.peerChanged(sourcePackage, sender.userId, sourceEpoch)
+            UserScopedBroadcasts.send(systemContext, Intent(Protocol.ACTION_ENTRY_CAPABILITIES).setPackage(sourcePackage)
+                .putExtra(Protocol.EXTRA_ENTRY_PROTOCOL, if (windowBackend.supportsRetainedEntry && async) Protocol.ENTRY_PROTOCOL else 0)
+                .putExtra(Protocol.EXTRA_ASYNC_SNAPSHOT, true)
+                .putExtra(Protocol.EXTRA_SOURCE_EPOCH, sourceEpoch)
+                .putExtra(Protocol.EXTRA_DESTINATION_EPOCH, EntryProtocolIdentity.epoch)
+                .putExtra(Protocol.EXTRA_CAPABILITY_QUERY_ID, intent.getLongExtra(Protocol.EXTRA_CAPABILITY_QUERY_ID, 0L)), sender.userId)
+            broadcastManagedTaskIds()
             log("reYAMF_EntryV2") { "capabilities retained=${windowBackend.supportsRetainedEntry} loadedBuild=${com.buildsession.betterYAMF.BuildConfig.BUILD_TIME}" }
         }
         systemContext.registerReceiver(Protocol.ACTION_RECENTS_GESTURE) { _, intent ->
@@ -322,7 +349,10 @@ object YAMFManager : IYAMFManager.Stub() {
                 log("reYAMF_debug") { "recents gesture suppress ${suppressMs}ms" }
             }
         }
-        systemContext.registerReceiver(Protocol.ACTION_QUERY_MANAGED_TASKS) { _, _ ->
+        systemContext.registerReceiver(Protocol.ACTION_QUERY_MANAGED_TASKS) { _, intent ->
+            val sender = launcherSender(this, intent) ?: return@registerReceiver
+            EntryProtocolIdentity.peers.register(sender.packageName,
+                intent.getLongExtra(Protocol.EXTRA_SOURCE_EPOCH, 0L), sender.userId, sender.uid)
             broadcastManagedTaskIds()
         }
         systemContext.registerReceiver(Protocol.ACTION_DUMP_GEOMETRY) { _, _ ->
@@ -336,16 +366,16 @@ object YAMFManager : IYAMFManager.Stub() {
         systemContext.registerReceiver(Protocol.ACTION_OPEN_APP) { _, intent ->
             val componentName = intent.getParcelableExtra<ComponentName>(Protocol.EXTRA_COMPONENT_NAME)
                 ?: return@registerReceiver
-            val userId = intent.getIntExtra(Protocol.EXTRA_USER_ID, 0)
+            val userId = intent.getIntExtra(Protocol.EXTRA_USER_ID, UserScopedBroadcasts.deliveryUser(this))
             createWindow(StartCmd(componentName = componentName, userId = userId))
         }
         systemContext.registerReceiver(Protocol.ACTION_GET_LAUNCHER_CONFIG) { _, intent ->
-            ActivityManagerApis.broadcastIntent(Intent(Protocol.ACTION_RECEIVE_LAUNCHER_CONFIG).apply {
+            UserScopedBroadcasts.send(systemContext, Intent(Protocol.ACTION_RECEIVE_LAUNCHER_CONFIG).apply {
                 // log(TAG, "send config: ${config.hookLauncher}")
                 putExtra(Protocol.EXTRA_HOOK_RECENT, config.hookLauncher.hookRecents)
                 putExtra(Protocol.EXTRA_HOOK_TASKBAR, config.hookLauncher.hookTaskbar)
                 `package` = intent.getStringExtra("sender")
-            }, 0)
+            }, UserScopedBroadcasts.deliveryUser(this))
         }
 
         configFile.createNewFile()
@@ -414,17 +444,16 @@ object YAMFManager : IYAMFManager.Stub() {
     }
 
     fun createWindow(startCmd: StartCmd?) {
+        val taskId = startCmd?.taskId?.takeIf { it > 0 } ?: -1
+        if (taskId == -1 && startCmd?.componentName == null) {
+            logWarning(TAG, "reject window request without an existing task or component")
+            rejectEntry(startCmd)
+            return
+        }
         Instances.iStatusBarService.collapsePanels()
 
-        val taskId = startCmd?.taskId ?: -1
         if (taskId != -1) {
-            // 同一任务已在小窗中：静默销毁旧壳（不释放任务），避免双壳互抢
-            activeWindows.values.toList().forEach { w ->
-                if (w.currentTaskId == taskId) {
-                    log("reYAMF_debug") { "dedupe old shell window=${w.windowId} task=$taskId" }
-                    runCatching { w.onDestroy(releaseTask = false) }
-                }
-            }
+            WindowRuntimes.prepareOpenTask(taskId)
             if (startCmd?.entrySnapshot == null) WindowSessions.hostedTasks.add(taskId)
         }
 
@@ -433,13 +462,13 @@ object YAMFManager : IYAMFManager.Stub() {
             CommonContextWrapper.createAppCompatContext(systemUiContext.createContext())
         ) { window, _ ->
             addWindow(window)
-            if (taskId != -1) window.currentTaskId = taskId
+            if (taskId != -1) window.bindTask(taskId)
             initialized = true
 
             if (startCmd?.openAsMini == true) {
                 window.markOpenAsMini(startCmd.dropX, startCmd.dropY, startCmd.sourceBounds,
                     startCmd.awaitSourceRelease, startCmd.sourcePackage, startCmd.handoffId, startCmd.entrySnapshot,
-                    startCmd.launcherRotation)
+                    startCmd.launcherRotation, startCmd.sourceEpoch, startCmd.sourceUserId)
             }
 
             if (taskId != -1) {
@@ -452,7 +481,7 @@ object YAMFManager : IYAMFManager.Stub() {
                 // onOrganizerTaskAppeared 以 `w.currentTaskId == taskId` 过滤宿主并点火
                 // onOrganizerLeash（托管/回退/淡入的唯一触发点）。反序会让回灌被过滤跳过，
                 // 壳既不托管也不回退（真机实证：壳完全消失、内容不落变换）。
-                window.currentTaskId = taskId
+                window.bindTask(taskId)
                 activateWindowTask(window)
             } else if (startCmd?.componentName != null) {
                 // A replaced or rejected launch must not leave an unclaimable transparent host.
@@ -474,11 +503,16 @@ object YAMFManager : IYAMFManager.Stub() {
 
     private fun rejectEntry(startCmd: StartCmd?) {
         startCmd?.entrySnapshot?.close()
+        reportEntry(startCmd, CommandStatus.FAILED)
+    }
+
+    private fun reportEntry(startCmd: StartCmd?, status: CommandStatus) {
         startCmd?.sourcePackage?.let { destination ->
-            systemContext.sendBroadcast(Intent(Protocol.ACTION_WINDOW_PRESENTED).setPackage(destination)
+            UserScopedBroadcasts.send(systemContext, Intent(Protocol.ACTION_WINDOW_PRESENTED).setPackage(destination)
                 .putExtra(Protocol.EXTRA_TASK_ID, startCmd.taskId ?: -1)
                 .putExtra(Protocol.EXTRA_HANDOFF_ID, startCmd.handoffId)
-                .putExtra(Protocol.EXTRA_COMMAND_STATUS, com.buildsession.betterYAMF.window.core.CommandStatus.FAILED.name))
+                .putExtra(Protocol.EXTRA_SOURCE_EPOCH, startCmd.sourceEpoch)
+                .putExtra(Protocol.EXTRA_COMMAND_STATUS, status.name), startCmd.sourceUserId)
         }
     }
 
@@ -499,11 +533,11 @@ object YAMFManager : IYAMFManager.Stub() {
         broadcastManagedTaskIds()
     }
 
-    /** organizer 路径：任务已消失（含最近任务划掉），销毁对应外壳 */
+    /** Native ownership ended; cleanup must not issue a second release on the next owner's task. */
     fun onOrganizerTaskVanished(taskId: Int) {
         activeWindows.values.toList().forEach { w ->
             if (w.currentTaskId == taskId) {
-                runCatching { w.onDestroy(releaseTask = true) }
+                runCatching { w.onTaskOwnershipLost() }
             }
         }
         broadcastManagedTaskIds()
@@ -521,10 +555,10 @@ object YAMFManager : IYAMFManager.Stub() {
     fun broadcastManagedTaskIds() {
         runCatching {
             val ids = windowBackend.managedTaskIds()
-            val intent = Intent(Protocol.ACTION_MANAGED_TASKS)
-                .setPackage("com.android.launcher3")
-                .putExtra(Protocol.EXTRA_MANAGED_TASK_IDS, ids)
-            systemContext.sendBroadcast(intent)
+            EntryProtocolIdentity.peers.recipients().forEach { target ->
+                UserScopedBroadcasts.send(systemContext, Intent(Protocol.ACTION_MANAGED_TASKS).setPackage(target.packageName)
+                    .putExtra(Protocol.EXTRA_MANAGED_TASK_IDS, ids), target.userId)
+            }
             if (BuildConfig.DEBUG) {
                 log("reYAMF_debug") { "managed tasks -> launcher: [${ids.joinToString()}]" }
             }
@@ -533,7 +567,7 @@ object YAMFManager : IYAMFManager.Stub() {
         }
     }
 
-    fun switchToSmoothFreeform(taskId: Int, initialBounds: android.graphics.Rect? = null): Boolean {
+    fun switchToSmoothFreeform(taskId: Int, initialBounds: android.graphics.Rect? = null, logicalBounds: android.graphics.Rect? = null): Boolean {
         log("reYAMF_debug") { "switchToSmoothFreeform task=$taskId" }
         WindowSessions.hostedTasks.add(taskId)
 
@@ -550,7 +584,7 @@ object YAMFManager : IYAMFManager.Stub() {
 
         // 系统窗口后端：认领（organizer/leash）+ 置前 + 恢复可聚焦；小窗不改应用 DPI，
         // 不施加任何密度覆盖。只走后端路径，失败大声报错，不再悄悄回退旧行为
-        val opened = windowBackend.openTask(taskId, initialBounds)
+        val opened = windowBackend.openTask(taskId, initialBounds, logicalBounds)
         if (!opened) {
             logError("reYAMF_debug", "ERROR organizer adopt failed task=$taskId (no fallback)")
         }
@@ -635,7 +669,7 @@ object YAMFManager : IYAMFManager.Stub() {
         runMain {
             // The always-on-top presentation root is visible too; it is never an app candidate.
             val task = getTopRootTask(0, windowBackend.managedTaskIds().toSet()) ?: return@runMain
-            if (task.baseActivity?.packageName != "com.android.launcher3") {
+            if (!windowBackend.isHomeTask(task)) {
                 createWindow(StartCmd(taskId = task.taskId))
             }
         }
@@ -644,7 +678,7 @@ object YAMFManager : IYAMFManager.Stub() {
     override fun resetAllWindow() {
         runMain {
             Instances.iStatusBarService.collapsePanels()
-            systemContext.sendBroadcast(Intent(Protocol.ACTION_RESET_ALL_WINDOW).setPackage(systemContext.packageName))
+            UserScopedBroadcasts.send(systemContext, Intent(Protocol.ACTION_RESET_ALL_WINDOW).setPackage(systemContext.packageName), 0)
         }
     }
 
@@ -671,58 +705,96 @@ object YAMFManager : IYAMFManager.Stub() {
         }
     }
 
+    private fun launcherSender(receiver: BroadcastReceiver, intent: Intent): UserScopedBroadcasts.Sender? =
+        runCatching { UserScopedBroadcasts.sender(systemContext, receiver, intent.getStringExtra(Protocol.EXTRA_SOURCE_PACKAGE)) }
+            .onFailure { logWarning("reYAMF_EntryV2", "cannot verify launcher transport address", it) }.getOrNull()
+
     private val OpenInYAMFBroadcastReceiver: BroadcastReceiver.(Context, Intent) -> Unit =
         entryReceiver@ { _: Context, intent: Intent ->
-            val taskId = intent.getIntExtra(Protocol.EXTRA_TASK_ID, 0)
-            val componentName =
-                intent.getParcelableExtra(Protocol.EXTRA_COMPONENT_NAME, ComponentName::class.java)
-            val userId = intent.getIntExtra(Protocol.EXTRA_USER_ID, 0)
-            val source = intent.getIntExtra(Protocol.EXTRA_SOURCE, Protocol.SOURCE_UNSPECIFIED)
-            val fromDropZone = intent.getBooleanExtra(Protocol.EXTRA_FROM_DROP_ZONE, false)
-            val dropX = intent.getIntExtra(Protocol.EXTRA_DROP_X, -1)
-            val dropY = intent.getIntExtra(Protocol.EXTRA_DROP_Y, -1)
-            val handoffComplete = intent.getBooleanExtra(Protocol.EXTRA_RECENTS_HANDOFF_COMPLETE, false)
-            val sourceBounds = intent.getParcelableExtra(Protocol.EXTRA_SOURCE_BOUNDS, android.graphics.Rect::class.java)
+            val sourceUser = UserScopedBroadcasts.deliveryUser(this)
+            val taskId = intent.getIntExtra(Protocol.EXTRA_TASK_ID, -1)
             val sourcePackage = intent.getStringExtra(Protocol.EXTRA_SOURCE_PACKAGE)
             val handoffId = intent.getLongExtra(Protocol.EXTRA_HANDOFF_ID, 0L)
-            val launcherRotation = intent.getIntExtra(Protocol.EXTRA_LAUNCHER_ROTATION, -1)
-                .takeIf { it in 0..3 } ?: -1
-            val entrySnapshot = runCatching { com.buildsession.betterYAMF.xposed.hook.system.EntrySnapshotTransport.read(intent) }
-                .onFailure { log("reYAMF_EntryV2", "snapshot transfer failed task=$taskId handoff=$handoffId", it) }.getOrNull()
-            if (intent.hasExtra(Protocol.EXTRA_ENTRY_SNAPSHOT_TOKEN) &&
-                (entrySnapshot == null || !fromDropZone || taskId <= 0 || handoffId == 0L || sourcePackage == null ||
-                    !windowBackend.supportsRetainedEntry ||
-                    intent.getIntExtra(Protocol.EXTRA_ENTRY_PROTOCOL, 0) != Protocol.ENTRY_PROTOCOL)) {
-                entrySnapshot?.close()
-                logWarning("reYAMF_EntryV2", "reject entry buffer task=$taskId handoff=$handoffId")
-                if (sourcePackage != null) systemContext.sendBroadcast(Intent(Protocol.ACTION_WINDOW_PRESENTED)
-                    .setPackage(sourcePackage).putExtra(Protocol.EXTRA_TASK_ID, taskId)
-                    .putExtra(Protocol.EXTRA_HANDOFF_ID, handoffId)
-                    .putExtra(Protocol.EXTRA_COMMAND_STATUS, com.buildsession.betterYAMF.window.core.CommandStatus.FAILED.name))
+            val base = StartCmd(
+                componentName = intent.getParcelableExtra(Protocol.EXTRA_COMPONENT_NAME, ComponentName::class.java),
+                userId = intent.getIntExtra(Protocol.EXTRA_USER_ID, sourceUser), taskId = taskId,
+                openAsMini = intent.getBooleanExtra(Protocol.EXTRA_FROM_DROP_ZONE, false),
+                dropX = intent.getIntExtra(Protocol.EXTRA_DROP_X, -1), dropY = intent.getIntExtra(Protocol.EXTRA_DROP_Y, -1),
+                sourceBounds = intent.getParcelableExtra(Protocol.EXTRA_SOURCE_BOUNDS, android.graphics.Rect::class.java),
+                sourcePackage = sourcePackage, handoffId = handoffId,
+                launcherRotation = intent.getIntExtra(Protocol.EXTRA_LAUNCHER_ROTATION, -1).takeIf { it in 0..3 } ?: -1,
+                sourceEpoch = intent.getLongExtra(Protocol.EXTRA_SOURCE_EPOCH, 0L), sourceUserId = sourceUser)
+            if (!EntryProtocolIdentity.acceptsDestination(intent, sourceUser)) {
+                logWarning("reYAMF_EntryV2", "reject stale destination/peer entry")
+                reportEntry(base, CommandStatus.FAILED)
                 return@entryReceiver
             }
-            log("reYAMF_debug") { "openInYAMF task=$taskId source=$source fromZone=$fromDropZone drop=($dropX,$dropY) component=$componentName" }
-            val startCmd = StartCmd(componentName, userId, taskId, openAsMini = fromDropZone,
-                dropX = dropX, dropY = dropY, sourceBounds = sourceBounds,
-                awaitSourceRelease = fromDropZone && (handoffComplete || entrySnapshot != null),
-                sourcePackage = sourcePackage, handoffId = handoffId, entrySnapshot = entrySnapshot,
-                launcherRotation = launcherRotation)
-            val proceed = {
-                runCatching { createWindow(startCmd) }.onFailure {
+            val source = intent.getIntExtra(Protocol.EXTRA_SOURCE, Protocol.SOURCE_UNSPECIFIED)
+            val handoffComplete = intent.getBooleanExtra(Protocol.EXTRA_RECENTS_HANDOFF_COMPLETE, false)
+            fun proceed(command: StartCmd) {
+                runCatching { createWindow(command) }.onFailure {
                     log("reYAMF_EntryV2", "window creation failed task=$taskId handoff=$handoffId", it)
-                    rejectEntry(startCmd)
+                    rejectEntry(command)
                 }
             }
-            if (source == Protocol.SOURCE_RECENT && !handoffComplete && entrySnapshot == null) {
-                // Capability fallback / legacy menu entry: close the source BEFORE adoption,
-                // and observe its transition. Never inject HOME after our animation has begun.
-                windowBackend.injectHomeKey()
-                awaitTaskSurfaceStable(taskId) { stable ->
-                    if (stable) proceed()
-                    else logWarning("reYAMF_debug", "cancel recents entry: task=$taskId still belongs to a system transition")
+            if (intent.hasExtra(Protocol.EXTRA_ENTRY_SNAPSHOT_TOKEN)) {
+                // Validate metadata/capability/address BEFORE asking another process for pixels.
+                val sender = launcherSender(this, intent)
+                val peer = sourcePackage?.let { EntryProtocolIdentity.peers.peer(it, sourceUser) }
+                if (sender == null || peer?.asyncSnapshot != true || !base.openAsMini || taskId <= 0 || handoffId <= 0L ||
+                    base.sourceBounds?.isEmpty != false || !windowBackend.supportsRetainedEntry ||
+                    !intent.getBooleanExtra(Protocol.EXTRA_ASYNC_SNAPSHOT, false) ||
+                    intent.getIntExtra(Protocol.EXTRA_ENTRY_PROTOCOL, 0) != Protocol.ENTRY_PROTOCOL) {
+                    logWarning("reYAMF_EntryV2", "reject entry transport task=$taskId handoff=$handoffId")
+                    reportEntry(base, CommandStatus.FAILED)
+                    return@entryReceiver
+                }
+                val key = PendingEntryRequests.Key(sender.packageName, sender.userId, base.sourceEpoch, taskId, handoffId)
+                val ticket = entryRequests.begin(key) { reportEntry(base, CommandStatus.SUPERSEDED) }
+                    ?: return@entryReceiver // Already cancelled, superseded or delivered.
+                try {
+                    val operation = EntrySnapshotTransport.request(intent, sender.uid, entryHandler) { value ->
+                        if (!entryRequests.take(ticket)) {
+                            if (value is EntrySnapshotTransport.Result.Ready) value.frame.close()
+                            return@request
+                        }
+                        when (value) {
+                            is EntrySnapshotTransport.Result.Ready -> {
+                                val frame = value.frame
+                                val age = SystemClock.elapsedRealtimeNanos() - frame.capturedAtNanos
+                                if (!EntryProtocolIdentity.acceptsDestination(intent, sourceUser) ||
+                                    frame.bounds != base.sourceBounds || age !in 0L..5_000_000_000L) {
+                                    frame.close()
+                                    reportEntry(base, CommandStatus.SUPERSEDED)
+                                } else {
+                                    log("reYAMF_EntryV2") { "snapshot received task=$taskId handoff=$handoffId user=$sourceUser ageMs=${age / 1_000_000L}" }
+                                    proceed(base.copy(entrySnapshot = frame, awaitSourceRelease = true))
+                                }
+                            }
+                            is EntrySnapshotTransport.Result.Failed -> {
+                                logError("reYAMF_EntryV2", "snapshot transfer failed task=$taskId handoff=$handoffId", value.error)
+                                reportEntry(base, CommandStatus.FAILED)
+                            }
+                            EntrySnapshotTransport.Result.Superseded -> reportEntry(base, CommandStatus.SUPERSEDED)
+                        }
+                    }
+                    entryRequests.attach(ticket, operation)
+                } catch (error: Throwable) {
+                    if (entryRequests.take(ticket)) {
+                        logError("reYAMF_EntryV2", "snapshot request failed task=$taskId handoff=$handoffId", error)
+                        reportEntry(base, CommandStatus.FAILED)
+                    }
                 }
             } else {
-                proceed()
+                val command = base.copy(awaitSourceRelease = base.openAsMini && handoffComplete)
+                if (source == Protocol.SOURCE_RECENT && !handoffComplete) {
+                    // Negotiated legacy fallback completes native UP before requesting entry.
+                    windowBackend.injectHomeKey()
+                    awaitTaskSurfaceStable(taskId) { stable ->
+                        if (stable) proceed(command)
+                        else logWarning("reYAMF_debug", "cancel recents entry: task=$taskId still belongs to a system transition")
+                    }
+                } else proceed(command)
             }
         }
 
@@ -738,7 +810,7 @@ object YAMFManager : IYAMFManager.Stub() {
         val handler = android.os.Handler(android.os.Looper.getMainLooper())
         val startAt = android.os.SystemClock.uptimeMillis()
         fun poll() {
-            val stable = runCatching { windowBackend.isTaskSurfaceStable(taskId) }.getOrDefault(true)
+            val stable = runCatching { windowBackend.isTaskSurfaceStable(taskId) }.getOrDefault(false)
             val elapsed = android.os.SystemClock.uptimeMillis() - startAt
             if (stable || elapsed >= timeoutMs) {
                 log("reYAMF_debug") { "drop gate: task=$taskId stable=$stable waited=${elapsed}ms" }

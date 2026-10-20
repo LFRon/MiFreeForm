@@ -15,8 +15,8 @@ import android.graphics.Shader
 import android.graphics.drawable.Drawable
 import android.view.MotionEvent
 import android.view.View
-import com.buildsession.betterYAMF.window.core.SceneStyle
-import com.buildsession.betterYAMF.window.core.WindowSceneFrame
+import com.buildsession.betterYAMF.window.api.SceneStyle
+import com.buildsession.betterYAMF.window.api.WindowSceneFrame
 import kotlin.math.roundToInt
 
 /** Stable transparent surface. No animated WindowManager layout and no decoration snapshots. */
@@ -71,10 +71,9 @@ internal class WindowShellView(context: Context, private val style: SceneStyle) 
         val f = frame ?: return Region()
         if (f.alpha <= 0f) return Region()
         getLocationOnScreen(origin)
-        val o = (f.fullscreen?.inputBounds ?: f.outer).rounded()
+        val o = f.input.bounds?.rounded() ?: return Region()
         val result = Region(o.left, o.top, o.right, o.bottom)
-        if (f.acceptsContent) {
-            val c = f.content.rounded()
+        f.input.passThrough?.rounded()?.let { c ->
             result.op(c.left, c.top, c.right, c.bottom, Region.Op.DIFFERENCE)
         }
         result.translate(-origin[0], -origin[1])

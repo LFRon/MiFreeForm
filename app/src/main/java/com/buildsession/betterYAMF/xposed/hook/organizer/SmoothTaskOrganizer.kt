@@ -8,15 +8,15 @@ import android.util.DisplayMetrics
 import android.view.Display
 import android.view.SurfaceControl
 import android.window.ITaskOrganizer
-import com.buildsession.betterYAMF.window.core.WindowViewportPolicy
+import com.buildsession.betterYAMF.window.api.WindowRect
 import com.buildsession.betterYAMF.xposed.hook.freeform.FreeformBackend
 import com.buildsession.betterYAMF.xposed.utils.Instances
 import com.buildsession.betterYAMF.xposed.utils.log
 import com.buildsession.betterYAMF.xposed.utils.logWarning
 import com.buildsession.betterYAMF.xposed.utils.logError
 import com.github.kyuubiran.ezxhelper.utils.findMethod
-import com.github.kyuubiran.ezxhelper.utils.hookBefore
-import com.github.kyuubiran.ezxhelper.utils.hookAfter
+import com.buildsession.betterYAMF.xposed.hook.bridge.NativeHooks.hookBefore
+import com.buildsession.betterYAMF.xposed.hook.bridge.NativeHooks.hookAfter
 import com.github.kyuubiran.ezxhelper.utils.paramCount
 import de.robv.android.xposed.XposedHelpers
 import net.bytebuddy.ByteBuddy
@@ -29,7 +29,6 @@ import net.bytebuddy.matcher.ElementMatchers
 import java.io.File
 import java.lang.reflect.Method
 import java.util.concurrent.ConcurrentHashMap
-import kotlin.math.min
 import kotlin.math.roundToInt
 
 /**
@@ -114,7 +113,10 @@ object SmoothTaskOrganizer {
     private val shapedTasks = ConcurrentHashMap.newKeySet<Int>()
 
     private val originalParentTokens = ConcurrentHashMap<Int, Any>()
+    private val overrideLeases = ConcurrentHashMap<Int, TaskOverrideLease>()
     private val adoptedTasks = ConcurrentHashMap.newKeySet<Int>()
+    private val adoptionsInProgress = ConcurrentHashMap.newKeySet<Int>()
+    private val callbackHandler by lazy { android.os.Handler(android.os.Looper.getMainLooper()) }
 
     /** 待认领任务：认领前需要先把任务挂到 organizer 上（A17 的 WCT 只接受 organized 容器） */
     private val pendingAdoption = ConcurrentHashMap.newKeySet<Int>()
@@ -126,6 +128,9 @@ object SmoothTaskOrganizer {
     private val lastLeashWriteLogAt = ConcurrentHashMap<Int, Long>()
 
     fun isLeashManaged(taskId: Int): Boolean = adoptedTasks.contains(taskId)
+
+    fun currentLogicalViewport(taskId: Int): Rect? =
+        if (isLeashManaged(taskId)) logicalBounds[taskId]?.let(::Rect) else null
 
     fun isFloatingRootTask(taskId: Int): Boolean = taskId > 0 && taskId == floatingRootTaskId
 
@@ -634,7 +639,17 @@ object SmoothTaskOrganizer {
             "onTaskVanished" -> {
                 val info = args.getOrNull(0) as? ActivityManager.RunningTaskInfo ?: return
                 val taskId = info.taskId
+                if (adoptionsInProgress.contains(taskId)) {
+                    // The next adoption publishes its records before its WCT. An older queued
+                    // vanish must be rechecked after that call returns, not revoke those records.
+                    callbackHandler.post { handle("onTaskVanished", arrayOf(info)) }
+                    return
+                }
+                // An organizer callback may be queued across a new adoption. Re-read native
+                // ownership rather than revoking the new session from the old TaskInfo snapshot.
+                if (isCurrentlyOurTask(info)) return
                 val wasAdopted = adoptedTasks.remove(taskId)
+                val lostLayout = overrideLeases.remove(taskId)
                 leashes.remove(taskId)?.let(::releaseQuietly)
                 cancelInitialPresentation(taskId)
                 logicalBounds.remove(taskId)
@@ -647,7 +662,11 @@ object SmoothTaskOrganizer {
                     floatingRootTaskId = -1
                     rootAlwaysOnTop = false
                     logError(TAG, "floating root vanished; invalidate its remaining hosts")
-                    adoptedTasks.toList().forEach(SmoothWindowBackend::notifyTaskVanished)
+                    adoptedTasks.toList().forEach { child ->
+                        val layout = overrideLeases[child]
+                        forgetTask(child)
+                        SmoothWindowBackend.notifyTaskVanished(child, layout)
+                    }
                 }
                 if (wasAdopted) {
                     updateRootVisibility()
@@ -655,7 +674,7 @@ object SmoothTaskOrganizer {
                         log(TAG) { "onTaskVanished task=$taskId (releasing, skip notify)" }
                     } else {
                         log(TAG) { "onTaskVanished task=$taskId" }
-                        SmoothWindowBackend.notifyTaskVanished(taskId)
+                        SmoothWindowBackend.notifyTaskVanished(taskId, lostLayout)
                     }
                 }
             }
@@ -687,7 +706,13 @@ object SmoothTaskOrganizer {
     }
 
     /** 把已运行的任务认领进悬浮根（organized）。 */
-    fun adoptTask(taskId: Int, initialBounds: Rect? = null): Boolean {
+    fun adoptTask(taskId: Int, initialBounds: Rect? = null, selectedLogicalBounds: Rect? = null): Boolean {
+        check(adoptionsInProgress.add(taskId)) { "Task adoption is already in progress: $taskId" }
+        return try { performAdoption(taskId, initialBounds, selectedLogicalBounds) }
+        finally { adoptionsInProgress.remove(taskId) }
+    }
+
+    private fun performAdoption(taskId: Int, initialBounds: Rect?, selectedLogicalBounds: Rect?): Boolean {
         if (taskId <= 0 || isFloatingRootTask(taskId)) return false
         if (!registered) return false
         if (initialBounds != null && !canStageInitialPresentation) return false
@@ -719,7 +744,7 @@ object SmoothTaskOrganizer {
             val dm = displayMetrics()
             val bounds = if (initialBounds != null) {
                 check(initialBounds.width() > 0 && initialBounds.height() > 0)
-                logicalViewport(initialBounds, dm)
+                Rect(requireNotNull(selectedLogicalBounds) { "CORE must select the logical viewport before adoption" }).also { check(!it.isEmpty) }
             } else Rect(0, 0, dm.widthPixels, dm.heightPixels)
             val stage = initialBounds?.let { InitialPresentation(Rect(it)) }
             if (stage != null) initialPresentations[taskId] = stage
@@ -740,6 +765,8 @@ object SmoothTaskOrganizer {
                 // 由路由钩子经 pendingAdoption 把该任务临时路由给我们。
                 val task = resolveTaskByToken(token)
                 if (task != null) {
+                    overrideLeases[taskId] = TaskOverrideLease(task,
+                        WindowRect(bounds.left, bounds.top, bounds.right, bounds.bottom))
                     FreeformBackend.rememberTask(taskId, task)
                     if (!isTaskOrganized(task)) {
                         pendingAdoption.add(taskId)
@@ -753,6 +780,7 @@ object SmoothTaskOrganizer {
                             logError(TAG, "ERROR adoptTask task=$taskId cannot be organized (no fallback), abort")
                             adoptedTasks.remove(taskId)
                             logicalBounds.remove(taskId)
+                            overrideLeases.remove(taskId)
                             return false
                         }
                     }
@@ -919,6 +947,7 @@ object SmoothTaskOrganizer {
                 logicalBounds.remove(taskId)
                 shapedTasks.remove(taskId)
                 originalParentTokens.remove(taskId)
+                overrideLeases.remove(taskId)
                 lastLeashWriteLogAt.remove(taskId)
                 updateRootVisibility()
                 log(TAG) { "releaseTask task=$taskId" }
@@ -1032,7 +1061,7 @@ object SmoothTaskOrganizer {
                     return false
                 }
 
-                val virtual = logicalViewport(physical)
+                val virtual = Rect(checkNotNull(logicalBounds[taskId]) { "No selected task viewport" })
                 logicalBounds[taskId] = virtual
 
                 if (current == virtual) {
@@ -1097,10 +1126,6 @@ object SmoothTaskOrganizer {
         check(metrics.widthPixels > 0 && metrics.heightPixels > 0)
     }
 
-    private fun logicalViewport(physical: Rect, dm: DisplayMetrics = displayMetrics()): Rect {
-        val r = WindowViewportPolicy.logicalBounds(dm.widthPixels, physical.width(), physical.height())
-        return Rect(r.left, r.top, r.right, r.bottom)
-    }
 
     /** 取任务 RunningTaskInfo（token 的唯一可靠来源；与 release 路径同一取法）。 */
     private fun taskInfoById(taskId: Int): Any? = runCatching {
@@ -1328,6 +1353,7 @@ object SmoothTaskOrganizer {
         logicalBounds.remove(taskId)
         shapedTasks.remove(taskId)
         originalParentTokens.remove(taskId)
+        overrideLeases.remove(taskId)
         lastLeashWriteLogAt.remove(taskId)
     }
 
@@ -1342,6 +1368,44 @@ object SmoothTaskOrganizer {
                 else (XposedHelpers.callMethod(task, "getTaskInfo") as ActivityManager.RunningTaskInfo).isVisible
             }
         }.onFailure { log(TAG, "visibility read failed task=$taskId", it) }.getOrNull()
+    }
+
+    private fun isCurrentlyOurTask(info: ActivityManager.RunningTaskInfo): Boolean = runCatching {
+        val task = resolveTaskByToken(XposedHelpers.getObjectField(info, "token")) ?: return@runCatching false
+        val wm = XposedHelpers.getObjectField(task, "mWmService")
+        synchronized(XposedHelpers.getObjectField(wm, "mGlobalLock")) {
+            val lease = overrideLeases[info.taskId]
+            (lease != null && lease.task !== task) ||
+                XposedHelpers.callMethod(task, "isAttached") == true &&
+                XposedHelpers.getObjectField(task, "mTaskOrganizer") === organizer
+        }
+    }.onFailure { logWarning(TAG, "cannot read current vanished-task ownership task=${info.taskId}", it) }.getOrDefault(false)
+
+    /** The old leash was revoked by WM. Reconcile only a still-matching session viewport under
+     * the WM lock; do not reparent/reorder, force fullscreen, or reset the new owner's surface.
+     * TaskDisplayArea:825-860 can move the task out before changing its inherited window mode.
+     */
+    internal fun reconcileLostOwnership(taskId: Int, lease: TaskOverrideLease?) {
+        if (lease == null || isLeashManaged(taskId)) return
+        val task = lease.task
+        val wm = XposedHelpers.getObjectField(task, "mWmService")
+        synchronized(XposedHelpers.getObjectField(wm, "mGlobalLock")) {
+            if (isLeashManaged(taskId) || XposedHelpers.callMethod(task, "isAttached") != true || isInOurSubtree(task)) return
+            val info = taskInfoById(taskId) ?: return
+            val token = XposedHelpers.getObjectField(info, "token")
+            val currentTask = resolveTaskByToken(token) ?: return
+            val bounds = XposedHelpers.callMethod(currentTask, "getRequestedOverrideBounds") as Rect
+            val configuration = XposedHelpers.callMethod(currentTask, "getRequestedOverrideConfiguration")
+            val wc = XposedHelpers.getObjectField(configuration, "windowConfiguration")
+            val mode = XposedHelpers.callMethod(wc, "getWindowingMode") as Int
+            val restore = lease.restoration(currentTask,
+                WindowRect(bounds.left, bounds.top, bounds.right, bounds.bottom), mode) ?: return
+            val wct = newWct()
+            XposedHelpers.callMethod(wct, "setBounds", token, Rect())
+            if (restore.clearFreeformMode) XposedHelpers.callMethod(wct, "setWindowingMode", token, 0)
+            applyWct(wct)
+            log(TAG) { "retired viewport task=$taskId inheritedMode=${restore.clearFreeformMode}" }
+        }
     }
 
     private fun newWct(): Any {

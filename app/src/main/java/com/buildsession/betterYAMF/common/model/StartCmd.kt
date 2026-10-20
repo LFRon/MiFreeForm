@@ -16,6 +16,9 @@ data class StartCmd(
     val handoffId: Long = 0L,
     val entrySnapshot: EntrySnapshot? = null,
     /** Destination Home rotation, supplied by Launcher's RecentsOrientedState; -1 = unknown. */
-    val launcherRotation: Int = -1
+    val launcherRotation: Int = -1,
+    val sourceEpoch: Long = 0L,
+    /** Launcher transport address, not the application task's profile. */
+    val sourceUserId: Int = 0
 )
 

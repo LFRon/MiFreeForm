@@ -1,5 +1,7 @@
 package com.buildsession.betterYAMF.xposed.hook.freeform
 
+import com.buildsession.betterYAMF.xposed.hook.bridge.NativeHooks
+
 import android.content.res.Configuration
 import android.graphics.Rect
 import android.graphics.Region
@@ -16,8 +18,6 @@ import com.buildsession.betterYAMF.xposed.utils.log
 import com.buildsession.betterYAMF.xposed.utils.logWarning
 import com.buildsession.betterYAMF.window.session.WindowSessions
 import com.github.kyuubiran.ezxhelper.utils.*
-import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import java.util.concurrent.ConcurrentHashMap
 
@@ -438,8 +438,8 @@ object FreeformBackend {
         runCatching {
             activityRecordClass.declaredMethods.forEach { method ->
                 if (method.name == "shouldRelaunchLocked") {
-                    XposedBridge.hookMethod(method, object : XC_MethodHook() {
-                        override fun beforeHookedMethod(param: MethodHookParam) {
+                    NativeHooks.hookMethod(method, object : NativeHooks.Callback() {
+                        override fun beforeHookedMethod(param: NativeHooks.Call) {
                             if (shouldForcePreventRelaunch(param.thisObject)) {
                                 param.result = false
                             }
@@ -457,8 +457,8 @@ object FreeformBackend {
         runCatching {
             activityRecordClass.declaredMethods.forEach { method ->
                 if (method.name == "ensureActivityConfiguration") {
-                    XposedBridge.hookMethod(method, object : XC_MethodHook() {
-                        override fun afterHookedMethod(param: MethodHookParam) {
+                    NativeHooks.hookMethod(method, object : NativeHooks.Callback() {
+                        override fun afterHookedMethod(param: NativeHooks.Call) {
                             if (param.result == true && shouldForcePreventRelaunch(param.thisObject)) {
                                 param.result = false
                             }
@@ -472,8 +472,8 @@ object FreeformBackend {
         runCatching {
             activityRecordClass.declaredMethods.forEach { method ->
                 if (method.name == "relaunchActivityLocked") {
-                    XposedBridge.hookMethod(method, object : XC_MethodHook() {
-                        override fun beforeHookedMethod(param: MethodHookParam) {
+                    NativeHooks.hookMethod(method, object : NativeHooks.Callback() {
+                        override fun beforeHookedMethod(param: NativeHooks.Call) {
                             if (shouldForcePreventRelaunch(param.thisObject)) {
                                 log(TAG) { "Suppressing relaunchActivityLocked for ${param.thisObject}" }
                                 param.result = null // Skip original method
@@ -626,11 +626,11 @@ object FreeformBackend {
         val inputMonitorClass = classLoader.loadClass("com.android.server.wm.InputMonitor")
         
         // populateInputWindowHandle(InputWindowHandleWrapper inputWindowHandle, WindowState w)
-        XposedHelpers.findAndHookMethod(inputMonitorClass, "populateInputWindowHandle",
+        NativeHooks.findAndHookMethod(inputMonitorClass, "populateInputWindowHandle",
             "com.android.server.wm.InputWindowHandleWrapper",
             "com.android.server.wm.WindowState",
-            object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
+            object : NativeHooks.Callback() {
+                override fun afterHookedMethod(param: NativeHooks.Call) {
                     val windowState = param.args[1]
                     applyChromeTouchRegion(param.args[0], windowState)
                     if (defangSmoothInputSink(param.args[0], windowState)) return

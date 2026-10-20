@@ -1,5 +1,7 @@
 package com.buildsession.betterYAMF.xposed.hook.launcher
 
+import com.buildsession.betterYAMF.xposed.hook.bridge.NativeHooks
+
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -9,9 +11,8 @@ import com.buildsession.betterYAMF.xposed.utils.log
 import com.buildsession.betterYAMF.xposed.utils.logWarning
 import com.buildsession.betterYAMF.xposed.utils.TRUSTED_SENDER_PERMISSION
 import com.github.kyuubiran.ezxhelper.utils.findMethod
-import com.github.kyuubiran.ezxhelper.utils.hookAfter
-import com.github.kyuubiran.ezxhelper.utils.hookBefore
-import de.robv.android.xposed.XC_MethodHook
+import com.buildsession.betterYAMF.xposed.hook.bridge.NativeHooks.hookAfter
+import com.buildsession.betterYAMF.xposed.hook.bridge.NativeHooks.hookBefore
 import de.robv.android.xposed.XposedHelpers
 import java.util.concurrent.ConcurrentHashMap
 
@@ -62,7 +63,9 @@ object ManagedTaskFilter {
                 )
                 receiverRegistered = true
             }
-            context.sendBroadcast(Intent(Protocol.ACTION_QUERY_MANAGED_TASKS))
+            context.sendBroadcast(Intent(Protocol.ACTION_QUERY_MANAGED_TASKS).setPackage("android")
+                .putExtra(Protocol.EXTRA_SOURCE_PACKAGE, context.packageName)
+                .putExtra(Protocol.EXTRA_SOURCE_EPOCH, com.buildsession.betterYAMF.xposed.hook.system.EntryProtocolIdentity.epoch))
             log(TAG) { "managed tasks receiver registered" }
         }.onFailure { log(TAG, "managed tasks receiver setup failed", it) }
     }
@@ -99,7 +102,7 @@ object ManagedTaskFilter {
     }.getOrNull()
 
     /** shell 路径：visibleTasks 数组里"整组都是受管任务"的分组整组剔除。 */
-    private fun filterVisibleGroups(param: XC_MethodHook.MethodHookParam) {
+    private fun filterVisibleGroups(param: NativeHooks.Call) {
         if (managedTaskIds.isEmpty()) return
         val groups = param.args.getOrNull(0) as? Array<*> ?: return
         val kept = groups.filter { group ->
@@ -117,7 +120,7 @@ object ManagedTaskFilter {
     }
 
     /** legacy 路径：顶部任务命中受管任务时，用过滤后的列表重建 CachedTaskInfo。 */
-    private fun rebuildCachedTopTask(param: XC_MethodHook.MethodHookParam) {
+    private fun rebuildCachedTopTask(param: NativeHooks.Call) {
         if (managedTaskIds.isEmpty()) return
         val result = param.result ?: return
         // shell 模式实例没有 mAllCachedTasks（其数据已由 filterVisibleGroups 过滤）

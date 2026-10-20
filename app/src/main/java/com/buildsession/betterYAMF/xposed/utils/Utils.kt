@@ -29,11 +29,15 @@ fun getTopRootTask(displayId: Int, excludedTaskIds: Set<Int> = emptySet()): Acti
 internal const val TRUSTED_SENDER_PERMISSION = "android.permission.START_TASKS_FROM_RECENTS"
 
 fun Context.registerReceiver(action: String, onReceive: BroadcastReceiver.(Context, Intent) -> Unit) {
-    registerReceiver(object : BroadcastReceiver() {
+    val receiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             onReceive(this, context, intent)
         }
-    }, android.content.IntentFilter(action), TRUSTED_SENDER_PERMISSION, null, Context.RECEIVER_EXPORTED)
+    }
+    val filter = android.content.IntentFilter(action)
+    if (android.os.Process.myUid() == android.os.Process.SYSTEM_UID)
+        com.buildsession.betterYAMF.xposed.hook.system.UserScopedBroadcasts.registerSystemReceiver(this, receiver, filter)
+    else registerReceiver(receiver, filter, TRUSTED_SENDER_PERMISSION, null, Context.RECEIVER_EXPORTED)
 }
 
 fun IPackageManagerHidden.getActivityInfoCompat(className: ComponentName, flags: Int, userId: Int): ActivityInfo =
