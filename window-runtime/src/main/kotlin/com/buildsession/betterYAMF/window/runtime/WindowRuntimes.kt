@@ -10,6 +10,13 @@ object WindowRuntimes {
     private val registry = WindowShellRegistry()
     private val windows = mutableSetOf<WindowRuntime>()
 
+    /** Synchronous, stateless policy query, safe on a platform task-selection thread. It neither
+     * reads the owner-thread registry nor schedules/waits for it. The adapter supplies current
+     * ownership for EACH candidate under its native lock and retains the native traversal order,
+     * permission checks and direct-focus path. This does not change a scene or acquire focus.
+     */
+    fun acceptsTaskFocus(facts: TaskFocusFacts): Boolean = WindowSessionPolicy.acceptsTaskFocus(facts)
+
     fun createWindow(session: SessionKey, options: WindowOptions, metrics: SceneMetrics,
         scheduler: RuntimeScheduler, ports: WindowPorts): WindowRuntimeHandle {
         check(scheduler.isCurrentThread())

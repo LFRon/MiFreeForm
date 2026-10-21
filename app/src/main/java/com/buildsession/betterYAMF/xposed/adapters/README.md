@@ -34,6 +34,8 @@ adapters/
 
 Android 17 还需启用 `com.android.systemui` 的模块作用域。Shell 与系统使用独立的拥有者协商，确认相同构建和归属标记后才创建根；SystemUI 死亡使入口能力失效，正常重建后重新协商。它不占用 Launcher 的 v2 对端登记表，也不改变像素协议。隔离机制、源码点位与资源规则见 [Shell 接入说明](android17/shell/README.md)。
 
+Android 17 的 `AutomaticTaskFocusGuard` 还隔离自动选焦点：LOS 24.0 的 `RecentsController.setInputConsumerEnabled()` 调用 `ATMS.focusTopTask(displayId)`，原生会选到米窗置顶根内的可聚焦叶任务，产生额外 `TO_FRONT` 并使最近任务取消。适配器关联同线程的自动请求，只在原生 WM 锁内的 `setFocusedTask(int, ActivityRecord)` 选择阶段重读候选归属，经 `WindowRuntimes.acceptsTaskFocus(TaskFocusFacts)` 调用 CORE 策略跳过所有受管任务。保留原生权限检查、Binder 身份、锁及非米窗候选顺序；用户触摸、显式置前和全屏交还不受自动请求影响。调用结束或抛错即清除关联，没有轮询、手势计时或焦点定时恢复；选择异常报告 Error 并放弃该次自动焦点变更。
+
 Launcher 侧由组合入口选择 `QuickstepNativeAccess` 和具体退场 ABI，再通过 `QuickstepHookInstaller` 注册方法。固定成员在初始化阶段解析，候选任务、控制器和表面归属仍在每次手势中读取。输入回调通过 `LauncherGestureAdapter` 接入 `LauncherEntryHandle`，不直接访问 CORE。
 
 Android 17 的启动前解析覆盖输入、源事务、任务过滤缓存和控制器 normal / force 完成接口；结构解析与 Hook 注册分开，可以用原 APK 验证完整绑定而不启动 Launcher。Pixel 构建的 DEX 调用链、权限、R8 差异和验证方式见 [PixelOS 17 接入核对](android17/pixelLauncher/README.md)。

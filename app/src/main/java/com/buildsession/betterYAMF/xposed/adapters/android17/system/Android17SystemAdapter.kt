@@ -5,6 +5,7 @@ import com.buildsession.betterYAMF.xposed.adapters.AndroidSystemAdapter
 import com.buildsession.betterYAMF.xposed.adapters.SurfacePolicies
 import com.buildsession.betterYAMF.xposed.adapters.common.organizer.SmoothWindowBackend
 import com.buildsession.betterYAMF.xposed.adapters.common.system.SystemHookInstaller
+import com.buildsession.betterYAMF.xposed.hook.bridge.NativeHooks
 
 /** LoS 24.0 and PixelOS seventeen use this reviewed organizer/draw-sync mechanism.
  * Resolve signatures before installing global task hooks; structure alone is not device proof.
@@ -34,8 +35,13 @@ internal object Android17SystemAdapter : AndroidSystemAdapter {
         classLoader.loadClass("com.android.server.wm.TaskOrganizerController")
             .getDeclaredMethod("createTask", params)
         val shellGuard = ShellTaskTransactionGuard(classLoader)
-        val registrations = shellGuard.install()
-        try { SystemHookInstaller.install(classLoader, checkNotNull(SurfacePolicies.forSdk(sdk))) }
+        val focusGuard = AutomaticTaskFocusGuard(classLoader)
+        val registrations = mutableListOf<NativeHooks.Registration>()
+        try {
+            registrations += shellGuard.install()
+            registrations += focusGuard.install()
+            SystemHookInstaller.install(classLoader, checkNotNull(SurfacePolicies.forSdk(sdk)))
+        }
         catch (error: Throwable) { registrations.asReversed().forEach { it.unhook() }; throw error }
         installed = true
     }

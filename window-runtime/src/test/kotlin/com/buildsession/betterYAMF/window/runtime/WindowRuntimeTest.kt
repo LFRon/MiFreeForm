@@ -365,6 +365,57 @@ class WindowRuntimeTest {
         assertEquals(1, f.raises)
     }
 
+    @Test fun automaticFocusQueriesCannotRaiseOrMutateAnyOfSeveralLiveWindowSessions() {
+        val first = fixture(); val second = fixture(); val third = fixture()
+        val all = listOf(first, second, third)
+        all.forEach { it.ordinary(); it.settle() }
+        val before = all.map { it.handle.snapshot() }
+        // The native task-selection lock cannot wait for the serial scene owner. This query
+        // consumes only its supplied current fact and is safe without entering any scene pump.
+        val error = java.util.concurrent.atomic.AtomicReference<Throwable?>()
+        val caller = Thread {
+            try {
+                all.forEach {
+                    assertFalse(WindowRuntimes.acceptsTaskFocus(TaskFocusFacts(TaskFocusOrigin.AUTOMATIC, true)))
+                }
+                assertTrue(WindowRuntimes.acceptsTaskFocus(TaskFocusFacts(TaskFocusOrigin.AUTOMATIC, false)))
+                assertTrue(WindowRuntimes.acceptsTaskFocus(TaskFocusFacts(TaskFocusOrigin.DIRECT, true)))
+            } catch (failure: Throwable) { error.set(failure) }
+        }
+        caller.start(); caller.join(5000)
+        assertFalse(caller.isAlive)
+        error.get()?.let { throw it }
+        all.forEach { it.handle.post(WindowEvent.HomeForeground(HomeMaintenanceFacts(true, true, false, false))) }
+        assertEquals(before, all.map { it.handle.snapshot() })
+        assertTrue(all.all { it.raises == 0 && it.finished.isEmpty() && it.failures.isEmpty() })
+    }
+
+    @Test fun fullscreenAndLateCallbacksInOneWindowCannotCancelOrPrepareAnotherWindow() {
+        val first = fixture(); val second = fixture(autoPrepare = false)
+        first.ordinary(); first.settle()
+        second.ordinary()
+        val secondReady = requireNotNull(second.prepareResult)
+        val c = first.handle.snapshot().content
+        val x = c.left + 100f; val y = c.bottom + 10f
+        first.handle.post(WindowEvent.Input(WindowInputEvent.Press(first.key.windowId, first.clock.now, RegionId.BAR_BOTTOM, x, y)))
+        first.handle.post(WindowEvent.Input(WindowInputEvent.Move(first.key.windowId, first.clock.now + 10, RegionId.BAR_BOTTOM, x, y + 500)))
+        first.handle.post(WindowEvent.Input(WindowInputEvent.Up(first.key.windowId, first.clock.now + 20, RegionId.BAR_BOTTOM, x, y + 500)))
+        first.settle()
+        requireNotNull(first.releasedCallback).invoke()
+        requireNotNull(first.fullscreenResult).invoke(FullscreenHandoffResult(CommandStatus.DONE, true))
+        first.settle()
+        assertTrue(first.handle.destroyed)
+        assertFalse(second.handle.destroyed)
+        secondReady(CommandStatus.DONE); second.settle()
+        val secondFrame = second.handle.snapshot()
+        first.commits.last()(CommandStatus.FAILED)
+        first.handle.post(WindowEvent.TaskOwnershipLost)
+        assertEquals(secondFrame, second.handle.snapshot())
+        assertTrue(secondFrame.acceptsContent)
+        assertEquals(1, second.preparations.size)
+        assertTrue(second.finished.isEmpty() && second.failures.isEmpty())
+    }
+
     @Test fun ordinaryAndRetainedEntriesShareOnePreparedViewportAndCompleteSceneContract() {
         val f = fixture(); f.retained(); f.handle.post(WindowEvent.SourceReleased(73)); f.destinationReady!!(f.metrics)
         f.handle.post(WindowEvent.TaskAvailable); f.settle()

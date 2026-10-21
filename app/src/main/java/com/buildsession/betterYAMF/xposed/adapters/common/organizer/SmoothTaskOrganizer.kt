@@ -237,13 +237,15 @@ object SmoothTaskOrganizer {
     internal fun ownsNativeTask(task: Any?): Boolean {
         if (task == null) return false
         return isInOurSubtree(task) || pendingAdoption.contains(XposedHelpers.getIntField(task, "mTaskId")) ||
-            XposedHelpers.getObjectField(task, "mTaskOrganizer") === organizer
+            organizerDelegate.isInitialized() && XposedHelpers.getObjectField(task, "mTaskOrganizer") === organizer
     }
 
     private fun isTaskOrganized(task: Any): Boolean =
         (runCatching { XposedHelpers.callMethod(task, "isOrganized") }.getOrNull() as? Boolean) == true
 
-    val organizer: ITaskOrganizer by lazy {
+    // Ownership queries also run on early native focus paths. They must never initialize an
+    // organizer (or its generated Binder implementation) merely to inspect an unrelated task.
+    private val organizerDelegate = lazy {
         ByteBuddy()
             .subclass(ITaskOrganizer.Stub::class.java)
             .method(ElementMatchers.isDeclaredBy(ITaskOrganizer::class.java))
@@ -260,6 +262,7 @@ object SmoothTaskOrganizer {
             .getDeclaredConstructor()
             .newInstance()
     }
+    val organizer: ITaskOrganizer get() = organizerDelegate.value
 
     fun init() {
         if (android.os.Looper.myLooper() != callbackHandler.looper) {
