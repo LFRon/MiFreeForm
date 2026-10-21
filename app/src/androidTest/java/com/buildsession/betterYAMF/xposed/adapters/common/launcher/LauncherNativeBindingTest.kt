@@ -8,6 +8,7 @@ import com.buildsession.betterYAMF.xposed.adapters.AndroidEnvironment
 import com.buildsession.betterYAMF.xposed.adapters.LauncherSelection
 import com.buildsession.betterYAMF.xposed.adapters.android17.launcher3.Android17Launcher3Adapter
 import com.buildsession.betterYAMF.xposed.adapters.android17.pixelLauncher.Android17PixelLauncherAdapter
+import com.buildsession.betterYAMF.xposed.adapters.android17.pixelLauncher.PixelNativeFreeformAccess
 import android.os.Build
 import androidx.test.platform.app.InstrumentationRegistry
 import dalvik.system.PathClassLoader
@@ -24,6 +25,26 @@ import java.security.MessageDigest
  * Structural bindings and native cache filtering do not prove live handoff timing on PixelOS.
  */
 class LauncherNativeBindingTest {
+    @Test fun android17HomeAndRecentsFactsMatchTheCurrentUser() {
+        assumeTrue(Build.VERSION.SDK_INT == 37)
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val snapshot = LauncherEnvironmentQuery(context).read()
+        val resolved = context.packageManager.resolveActivity(
+            Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME), 0)
+        // A chooser / unset Home is a separate environment, not evidence of a broken lookup.
+        assumeTrue(resolved?.activityInfo != null && resolved.activityInfo.packageName != "android")
+        val activity = requireNotNull(resolved?.activityInfo)
+        assertEquals(android.content.ComponentName(activity.packageName, activity.name), snapshot.home)
+        assertNotNull("Android 17 must expose its configured Recents component", snapshot.recents)
+        assertEquals(snapshot.home?.packageName, snapshot.runtime.defaultHomePackage)
+        assertEquals(snapshot.recents?.packageName, snapshot.runtime.recentsPackage)
+        assertEquals(Build.VERSION.SDK_INT, snapshot.runtime.sdk)
+        assertEquals(context.packageName, snapshot.runtime.packageName)
+        assertEquals(android.app.Application.getProcessName(), snapshot.runtime.processName)
+        assertEquals(context.packageManager.getPackageInfo(context.packageName, 0).longVersionCode,
+            snapshot.runtime.launcherVersionCode)
+    }
+
     @Test fun installedAndroid17LauncherSatisfiesItsSelectedNativeBindings() {
         assumeTrue(Build.VERSION.SDK_INT == 37)
         val context = InstrumentationRegistry.getInstrumentation().targetContext
@@ -67,6 +88,7 @@ class LauncherNativeBindingTest {
         assertSame(Android17PixelLauncherAdapter, selected.adapter)
         val loader = PathClassLoader(apk.path, ClassLoader.getSystemClassLoader())
         assertBindingsAndCache(loader, Android17PixelLauncherAdapter.retirementSignature, context)
+        assertEquals("getEnabledShortcuts", PixelNativeFreeformAccess(loader).enabled.name)
     }
 
     private fun assertBindingsAndCache(loader: ClassLoader,

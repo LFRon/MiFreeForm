@@ -30,4 +30,25 @@ internal object AdapterCatalog {
         return LauncherSelection.Selected(adapter)
     }
 
+    /** Deferred until a Context and the user's preferred Home are available. Installing hooks
+     * for a loaded package does not activate it: its service must also satisfy these facts.
+     * The reviewed handoff uses integrated Home/Overview; a split Home/Quickstep combination
+     * needs its own audit rather than borrowing either installed Launcher's implementation.
+     */
+    fun selectRuntimeLauncher(runtime: LauncherRuntimeIdentity,
+        platform: PlatformIdentity = PlatformIdentity()): LauncherSelection {
+        val selection = selectLauncher(runtime.sdk, runtime.packageName, runtime.processName,
+            platform, runtime.launcherVersionCode)
+        if (selection !is LauncherSelection.Selected) return selection
+        if (runtime.defaultHomePackage == null)
+            return LauncherSelection.Unavailable("current user has no resolved default Home")
+        if (runtime.defaultHomePackage != runtime.packageName)
+            return LauncherSelection.Unavailable("default Home ${runtime.defaultHomePackage} differs from Quickstep host ${runtime.packageName}; split Home/Overview is not adapted")
+        if (runtime.recentsPackage == null)
+            return LauncherSelection.Unavailable("configured Recents component is unavailable")
+        if (runtime.recentsPackage != runtime.packageName)
+            return LauncherSelection.Unavailable("configured Recents host ${runtime.recentsPackage} differs from loaded Launcher ${runtime.packageName}")
+        return selection
+    }
+
 }

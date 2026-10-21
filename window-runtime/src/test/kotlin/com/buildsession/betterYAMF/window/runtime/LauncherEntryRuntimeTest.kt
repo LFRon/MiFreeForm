@@ -7,7 +7,7 @@ import org.junit.Test
 class LauncherEntryRuntimeTest {
     private class Fixture : RuntimeScheduler, LauncherEntryPort {
         var owner = true
-        var candidateValue: EntryCandidate? = EntryCandidate(7, false, false, true)
+        var candidateValue: EntryCandidate? = EntryCandidate(7, false, EntryTracking.TRACKING)
         var queries = 0
         var retainedAccepted = true
         var duringQuery: (() -> Unit)? = null
@@ -42,6 +42,52 @@ class LauncherEntryRuntimeTest {
         assertFalse(f.views.last().visible)
         assertEquals(listOf(900L, 450L), f.suppression)
     }
+    @Test fun verifiedNavigationCanStartOutsideAFixedPercentageOfTheScreen() {
+        val f = Fixture()
+        f.runtime.onInput(EntryInput(PointerPhase.DOWN, 800f, 2500f, 2500f, 1264, 2780,
+            navigationStart = true))
+        f.move()
+        assertTrue(f.views.last().visible)
+        assertEquals(EntryDisposition.TAKEOVER_ARMED, f.up())
+        assertEquals(listOf(900L, 450L), f.suppression)
+    }
+    @Test fun rejectedNavigationDoesNotReuseAnOldCandidateEvenAtTheScreenEdge() {
+        val f = Fixture()
+        f.runtime.onInput(EntryInput(PointerPhase.DOWN, 800f, 2770f, 2770f, 1264, 2780,
+            navigationStart = false))
+        f.move()
+        assertEquals(EntryDisposition.PASS_THROUGH, f.up())
+        assertEquals(0, f.queries)
+        assertTrue(f.suppression.isEmpty())
+        assertTrue(f.retained.isEmpty())
+        assertFalse(f.views.last().visible)
+    }
+
+    @Test fun adaptersWithoutANavigationFactKeepTheExistingBottomEdgeRequirement() {
+        val f = Fixture()
+        f.runtime.onInput(EntryInput(PointerPhase.DOWN, 800f, 2500f, 2500f, 1264, 2780))
+        f.move()
+        assertEquals(EntryDisposition.PASS_THROUGH, f.up())
+        assertEquals(0, f.queries)
+        assertTrue(f.suppression.isEmpty())
+        assertTrue(f.retained.isEmpty())
+    }
+    @Test fun navigationAdmissionStillWaitsForNativeTrackingAndBackendReadiness() {
+        val f = Fixture()
+        f.candidateValue = EntryCandidate(7, false, EntryTracking.WAITING)
+        f.capabilities = LauncherEntryCapabilities(false, false)
+        f.runtime.onInput(EntryInput(PointerPhase.DOWN, 800f, 2500f, 2500f, 1264, 2780,
+            navigationStart = true))
+        f.move()
+        assertFalse(f.views.last().visible)
+        f.capabilities = LauncherEntryCapabilities(true, true)
+        f.move()
+        assertFalse(f.views.last().visible)
+        f.candidateValue = EntryCandidate(7, false, EntryTracking.TRACKING)
+        f.move()
+        assertTrue(f.views.last().visible)
+        assertEquals(EntryDisposition.TAKEOVER_ARMED, f.up())
+    }
     @Test fun unsupportedRetainedCaptureUsesOnlyTheDeclaredLegacyCapability() {
         val f = Fixture(); f.capabilities = LauncherEntryCapabilities(false, true)
         f.down(); f.move()
@@ -54,11 +100,26 @@ class LauncherEntryRuntimeTest {
         assertEquals(EntryDisposition.PASS_THROUGH, f.up())
         assertTrue(f.legacy.isEmpty())
     }
-    @Test fun homeAndInvisibleSourcesAreNeverAcceptedAsWindowCandidates() {
-        for (value in listOf(null, EntryCandidate(7, true, true, true), EntryCandidate(7, false, false, false))) {
+    @Test fun homeAndRejectedNativeOwnersAreTerminalForThisGesture() {
+        for (value in listOf(EntryCandidate(7, true, EntryTracking.TRACKING),
+            EntryCandidate(7, false, EntryTracking.REJECTED))) {
             val f = Fixture(); f.candidateValue = value
-            f.down(); f.move(); f.move(); f.up()
+            f.down(); f.move()
+            f.candidateValue = EntryCandidate(7, false, EntryTracking.TRACKING)
+            f.move(); f.up()
             assertEquals(1, f.queries); assertTrue(f.retained.isEmpty()); assertTrue(f.legacy.isEmpty())
+        }
+    }
+    @Test fun temporaryMissingOrUnstartedCandidateCanBecomeReadyDuringTheSameGesture() {
+        for (value in listOf(null, EntryCandidate(-1, false, EntryTracking.WAITING),
+            EntryCandidate(7, false, EntryTracking.WAITING))) {
+            val f = Fixture(); f.candidateValue = value
+            f.down(); f.move()
+            assertFalse(f.views.last().visible)
+            f.candidateValue = EntryCandidate(7, false, EntryTracking.TRACKING)
+            f.move()
+            assertTrue(f.views.last().visible)
+            assertEquals(EntryDisposition.TAKEOVER_ARMED, f.up())
         }
     }
     @Test fun cancelAndReleaseOutsideTheCurrentTargetCannotOpenAWindow() {
@@ -69,12 +130,51 @@ class LauncherEntryRuntimeTest {
         f.runtime.onInput(EntryInput(PointerPhase.UP, 100f, 900f, 900f, 1264, 2780))
         assertTrue(f.retained.isEmpty())
     }
-    @Test fun crossingTheThresholdQueriesNativeFactsOnceWhileTheTargetRemainsVisible() {
+    @Test fun nativeTrackingAcceptsShortUpwardSwipesWithoutASecondHeightThreshold() {
         val f = Fixture(); f.down()
         f.runtime.onInput(EntryInput(PointerPhase.MOVE, 800f, 2500f, 2500f, 1264, 2780))
-        assertEquals(0, f.queries)
-        repeat(30) { f.move() }
         assertEquals(1, f.queries)
+        assertTrue(f.views.last().visible)
+    }
+    @Test fun releaseRechecksFactsAndCanBeTheFirstReadyInputInTheTarget() {
+        val f = Fixture(); f.candidateValue = null
+        f.down(); f.move()
+        f.candidateValue = EntryCandidate(7, false, EntryTracking.TRACKING)
+        assertEquals(EntryDisposition.TAKEOVER_ARMED, f.up())
+        val direct = Fixture(); direct.down()
+        assertEquals(EntryDisposition.TAKEOVER_ARMED, direct.up())
+    }
+    @Test fun lostOwnershipOrChangedTaskOnReleaseCannotUseAnEarlierCandidate() {
+        for (value in listOf(null, EntryCandidate(7, false, EntryTracking.REJECTED),
+            EntryCandidate(8, false, EntryTracking.TRACKING))) {
+            val f = Fixture(); f.down(); f.move(); f.candidateValue = value
+            assertEquals(EntryDisposition.PASS_THROUGH, f.up())
+            assertTrue(f.retained.isEmpty()); assertTrue(f.legacy.isEmpty())
+        }
+    }
+    @Test fun aWaitingOrBackendBlockedGestureCannotSwitchToAnotherApplication() {
+        for (blockedByBackend in listOf(false, true)) {
+            val f = Fixture()
+            if (blockedByBackend) f.capabilities = LauncherEntryCapabilities(false, false)
+            else f.candidateValue = EntryCandidate(7, false, EntryTracking.WAITING)
+            f.down(); f.move()
+            f.capabilities = LauncherEntryCapabilities(true, true)
+            f.candidateValue = EntryCandidate(8, false, EntryTracking.TRACKING)
+            f.move()
+            assertFalse(f.views.last().visible)
+            assertEquals(EntryDisposition.PASS_THROUGH, f.up())
+            assertTrue(f.retained.isEmpty()); assertTrue(f.legacy.isEmpty())
+        }
+    }
+    @Test fun unavailableBackendHidesTheTargetAndCanBecomeReadyWithoutANewDown() {
+        val f = Fixture(); f.capabilities = LauncherEntryCapabilities(false, false)
+        f.down(); f.move()
+        assertFalse(f.views.last().visible)
+        f.capabilities = LauncherEntryCapabilities(true, false)
+        f.move(); assertTrue(f.views.last().visible)
+        f.capabilities = LauncherEntryCapabilities(false, false)
+        assertEquals(EntryDisposition.PASS_THROUGH, f.up())
+        assertTrue(f.retained.isEmpty()); assertTrue(f.legacy.isEmpty())
     }
     @Test fun explicitCancellationAndInvalidCrossDisplayInputHideTheTarget() {
         val f = Fixture(); f.down(); f.move()

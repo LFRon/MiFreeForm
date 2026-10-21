@@ -14,6 +14,7 @@ import com.buildsession.betterYAMF.xposed.utils.logWarning
 internal class LauncherOverlayDisplay(service: Context) : AutoCloseable {
     private val display = checkNotNull(service.getSystemService(DisplayManager::class.java)
         .getDisplay(Display.DEFAULT_DISPLAY))
+    val displayId: Int get() = display.displayId
     val context: Context = service.createWindowContext(display, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY, null)
     val windowManager: WindowManager = context.getSystemService(WindowManager::class.java)
     private val release = runCatching { context.javaClass.getMethod("release") }.getOrNull()

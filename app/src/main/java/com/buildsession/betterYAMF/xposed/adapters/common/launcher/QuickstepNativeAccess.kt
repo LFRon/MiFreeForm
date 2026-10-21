@@ -1,6 +1,5 @@
 package com.buildsession.betterYAMF.xposed.adapters.common.launcher
 
-import android.app.Activity
 import android.graphics.PointF
 import android.os.Bundle
 import android.view.InputEvent
@@ -17,6 +16,7 @@ internal class QuickstepNativeAccess(private val loader: ClassLoader, signature:
     private val eventDisplay = InputEvent::class.java.getMethod("getDisplayId").accessible()
     private val handler = type("com.android.quickstep.TouchInteractionHandler")
     private val service = type("com.android.quickstep.TouchInteractionService")
+    private val serviceHandler = service.getDeclaredField("handler").accessible()
     val onCreate: Method = service.getDeclaredMethod("onCreate").accessible()
     val onDestroy: Method = service.getDeclaredMethod("onDestroy").accessible()
     val onInput: Method = handler.getDeclaredMethod("onInputEvent", InputEvent::class.java).accessible()
@@ -36,6 +36,7 @@ internal class QuickstepNativeAccess(private val loader: ClassLoader, signature:
     private val consumerCleanup = type("com.android.quickstep.InputConsumer").getMethod("onConsumerAboutToBeSwitched").accessible()
     private val otherConsumer = type("com.android.quickstep.inputconsumers.OtherActivityInputConsumer")
     private val interaction = otherConsumer.getDeclaredField("mInteractionHandler").accessible()
+    private val consumerGesture = otherConsumer.getDeclaredField("mGestureState").accessible()
 
     private val gestureType = type("com.android.quickstep.GestureState")
     private val topTask = gestureType.getMethod("getTopRunningTaskId").accessible()
@@ -45,7 +46,6 @@ internal class QuickstepNativeAccess(private val loader: ClassLoader, signature:
     private val createdContainer = containerInterface.returnType.getMethod("getCreatedContainer").accessible()
     private val containerType = type("com.android.quickstep.views.RecentsViewContainer")
     private val overview = containerType.getMethod("getOverviewPanel").accessible()
-    private val started = containerType.getMethod("isStarted").accessible()
     private val stateManager = type("com.android.launcher3.statemanager.StatefulContainer")
         .getMethod("getStateManager").accessible()
     private val retirement = LauncherSourceRetirement.resolve(stateManager.returnType, signature)
@@ -53,7 +53,11 @@ internal class QuickstepNativeAccess(private val loader: ClassLoader, signature:
     private val recentsController = recents.getMethod("getRecentsAnimationController").accessible()
     private val orientedState = recents.getMethod("getPagedViewOrientedState").accessible()
     private val rotation = orientedState.returnType.getMethod("getRecentsActivityRotation").accessible()
-    val gestureEnd: Method = type("com.android.quickstep.AbsSwipeUpHandler")
+    private val swipeHandler = type("com.android.quickstep.AbsSwipeUpHandler")
+    // Pixel 907 and LoS 24.0: onGestureStarted sets this after native slop/pilfer. This does
+    // not assert onRecentsAnimationStart or pixel readiness, which have separate barriers.
+    private val gestureStarted = swipeHandler.getDeclaredField("mGestureStarted").accessible()
+    val gestureEnd: Method = swipeHandler
         .getDeclaredMethod("onGestureEnded", Float::class.javaPrimitiveType,
             PointF::class.java, Boolean::class.javaPrimitiveType).accessible()
     val sources = QuickstepSourceAccess(loader)
@@ -62,7 +66,15 @@ internal class QuickstepNativeAccess(private val loader: ClassLoader, signature:
     init {
         check(onInput.returnType == Void.TYPE && gestureEnd.returnType == Void.TYPE)
         check(topTask.returnType == Int::class.javaPrimitiveType && home.returnType == Boolean::class.javaPrimitiveType)
+        check(serviceHandler.type == handler && consumerGesture.type == gestureType)
     }
+
+    /** TIS.onCreate obtains this handler from its current SysUIConnectionComponent in both
+     * reviewed builds. Late callbacks from a destroyed component must not drive a new service.
+     */
+    fun inputOwnerOf(service: Any): Any = checkNotNull(serviceHandler.get(service))
+    fun consumerGestureOf(consumer: Any?): Any? =
+        consumer?.takeIf(otherConsumer::isInstance)?.let(consumerGesture::get)
 
     fun displayIdOf(event: InputEvent): Int = eventDisplay.invoke(event) as Int
 
@@ -78,6 +90,8 @@ internal class QuickstepNativeAccess(private val loader: ClassLoader, signature:
     fun swipeOf(currentConsumer: Any): Any? =
         if (otherConsumer.isInstance(currentConsumer)) interaction.get(currentConsumer) else null
 
+    fun isTracking(swipe: Any): Boolean = gestureStarted.getBoolean(swipe)
+
     fun animationControllerOf(owner: Any, displayId: Int): Any? =
         managerGet.invoke(repository.get(owner), displayId)?.let { controller.get(it) }
 
@@ -87,29 +101,10 @@ internal class QuickstepNativeAccess(private val loader: ClassLoader, signature:
     fun containerOf(gesture: Any): Any? = containerInterface.invoke(gesture)?.let { createdContainer.invoke(it) }
     fun overviewOf(container: Any): Any? = overview.invoke(container)
     fun retirementOf(container: Any): LauncherSourceRetirement = retirement.bind(checkNotNull(stateManager.invoke(container)))
-    fun sourceVisible(gesture: Any): Boolean = containerOf(gesture)?.let { started.invoke(it) == true } == true
     fun taskId(gesture: Any): Int = topTask.invoke(gesture) as Int
     fun isHome(gesture: Any): Boolean = runningTask.invoke(gesture)?.let { home.invoke(it) == true } == true
     fun controllerOf(recentsView: Any): Any? = recentsController.invoke(recentsView)
     fun homeRotation(recentsView: Any): Int = (rotation.invoke(orientedState.invoke(recentsView)) as Int).also { check(it in 0..3) }
-}
-
-/** Android Activity facts, not a product policy; separate from Launcher private members. */
-internal object LauncherActivityFacts {
-    private val thread = Class.forName("android.app.ActivityThread")
-    private val current = thread.getMethod("currentActivityThread").accessible()
-    private val activities = thread.getDeclaredField("mActivities").accessible()
-    private val record = Class.forName("android.app.ActivityThread\$ActivityClientRecord")
-    private val activity = record.getDeclaredField("activity").accessible()
-    private val paused = record.getDeclaredField("paused").accessible()
-
-    fun anyResumed(): Boolean = runCatching {
-        val records = activities.get(current.invoke(null)) as Map<*, *>
-        records.values.any { value ->
-            val instance = activity.get(value) as? Activity
-            instance != null && !instance.isFinishing && !paused.getBoolean(value)
-        }
-    }.getOrDefault(false)
 }
 
 private fun Method.accessible(): Method = apply { isAccessible = true }

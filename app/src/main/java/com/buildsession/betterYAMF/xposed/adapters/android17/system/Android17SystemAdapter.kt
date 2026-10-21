@@ -17,8 +17,14 @@ internal object Android17SystemAdapter : AndroidSystemAdapter {
         if (installed) return
         val organizer = classLoader.loadClass("android.window.ITaskOrganizer")
         val tx = classLoader.loadClass("android.view.SurfaceControl\$Transaction")
-        classLoader.loadClass("com.android.server.wm.Task")
-            .getDeclaredMethod("setTaskOrganizer", organizer, Boolean::class.javaPrimitiveType)
+        val task = classLoader.loadClass("com.android.server.wm.Task")
+        task.getDeclaredMethod("setTaskOrganizer", organizer, Boolean::class.javaPrimitiveType)
+        task.getDeclaredMethod("fillTaskInfo", android.app.TaskInfo::class.java, Boolean::class.javaPrimitiveType,
+            classLoader.loadClass("com.android.server.wm.TaskDisplayArea"))
+        task.getDeclaredField("mLaunchCookie"); task.getDeclaredField("mTaskOrganizer")
+        android.app.TaskInfo::class.java.getField("launchCookies")
+        classLoader.loadClass("com.android.server.wm.WindowOrganizerController").getDeclaredMethod("getTaskOrganizerController")
+        classLoader.loadClass("android.window.TaskCreationParams\$Builder").getDeclaredMethod("setLaunchCookie", android.os.IBinder::class.java)
         classLoader.loadClass("com.android.server.wm.WindowContainer")
             .getDeclaredMethod("migrateToNewSurfaceControl", tx)
         val window = classLoader.loadClass("com.android.server.wm.WindowState")
@@ -27,7 +33,10 @@ internal object Android17SystemAdapter : AndroidSystemAdapter {
         val params = classLoader.loadClass("android.window.TaskCreationParams")
         classLoader.loadClass("com.android.server.wm.TaskOrganizerController")
             .getDeclaredMethod("createTask", params)
-        SystemHookInstaller.install(classLoader, checkNotNull(SurfacePolicies.forSdk(sdk)))
+        val shellGuard = ShellTaskTransactionGuard(classLoader)
+        val registrations = shellGuard.install()
+        try { SystemHookInstaller.install(classLoader, checkNotNull(SurfacePolicies.forSdk(sdk))) }
+        catch (error: Throwable) { registrations.asReversed().forEach { it.unhook() }; throw error }
         installed = true
     }
 

@@ -8,7 +8,9 @@ import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.IXposedHookZygoteInit
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 
-/** Framework entry only: select one exact Android + Launcher unit. */
+/** Framework entry only: bind one exact Android + loaded APK unit. Its service subsequently
+ * validates current preferred Home and Recents identities; package load alone cannot activate it.
+ */
 class HookLauncher : IXposedHookLoadPackage, IXposedHookZygoteInit {
     override fun initZygote(startupParam: IXposedHookZygoteInit.StartupParam) {
         EzXHelperInit.initZygote(startupParam)

@@ -285,6 +285,12 @@ object YAMFManager : IYAMFManager.Stub() {
         runCatching {
             WindowBackends.install(checkNotNull(SystemAdapters.current).windowBackend())
             WindowBackends.current().initialize(object : WindowBackendCallbacks {
+                override fun onEntryCapabilitiesChanged() {
+                    EntryProtocolIdentity.peers.recipients().forEach { peer ->
+                        sendEntryCapabilities(peer, 0L)
+                    }
+                    broadcastManagedTaskIds()
+                }
                 override fun onPresentationInvalidated(taskId: Int) {
                     // Backend callbacks already leave WM's stack and validate their session on
                     // main. Another unowned dispatch here could target a replacement host.
@@ -333,14 +339,13 @@ object YAMFManager : IYAMFManager.Stub() {
             val async = intent.getBooleanExtra(Protocol.EXTRA_ASYNC_SNAPSHOT, false)
             if (!EntryProtocolIdentity.peers.register(sourcePackage, sourceEpoch, sender.userId, sender.uid, async)) return@registerReceiver
             entryRequests.peerChanged(sourcePackage, sender.userId, sourceEpoch)
-            UserScopedBroadcasts.send(systemContext, Intent(Protocol.ACTION_ENTRY_CAPABILITIES).setPackage(sourcePackage)
-                .putExtra(Protocol.EXTRA_ENTRY_PROTOCOL, if (windowBackend.supportsRetainedEntry && async) Protocol.ENTRY_PROTOCOL else 0)
-                .putExtra(Protocol.EXTRA_ASYNC_SNAPSHOT, true)
-                .putExtra(Protocol.EXTRA_SOURCE_EPOCH, sourceEpoch)
-                .putExtra(Protocol.EXTRA_DESTINATION_EPOCH, EntryProtocolIdentity.epoch)
-                .putExtra(Protocol.EXTRA_CAPABILITY_QUERY_ID, intent.getLongExtra(Protocol.EXTRA_CAPABILITY_QUERY_ID, 0L)), sender.userId)
+            EntryProtocolIdentity.peers.peer(sourcePackage, sender.userId)?.let { peer ->
+                sendEntryCapabilities(peer, intent.getLongExtra(Protocol.EXTRA_CAPABILITY_QUERY_ID, 0L))
+            }
             broadcastManagedTaskIds()
-            log("reYAMF_EntryV2") { "capabilities retained=${windowBackend.supportsRetainedEntry} loadedBuild=${com.buildsession.betterYAMF.BuildConfig.BUILD_TIME}" }
+            if (!windowBackend.supportsRetainedEntry && !windowBackend.supportsLegacyEntry)
+                windowBackend.reportEntryUnavailable()
+            log("reYAMF_EntryV2") { "capabilities retained=${windowBackend.supportsRetainedEntry} legacy=${windowBackend.supportsLegacyEntry} loadedBuild=${com.buildsession.betterYAMF.BuildConfig.BUILD_TIME}" }
         }
         systemContext.registerReceiver(Protocol.ACTION_RECENTS_GESTURE) { _, intent ->
             val suppressMs = intent.getLongExtra(Protocol.EXTRA_SUPPRESS_MS, 0L)
@@ -708,6 +713,18 @@ object YAMFManager : IYAMFManager.Stub() {
     private fun launcherSender(receiver: BroadcastReceiver, intent: Intent): UserScopedBroadcasts.Sender? =
         runCatching { UserScopedBroadcasts.sender(systemContext, receiver, intent.getStringExtra(Protocol.EXTRA_SOURCE_PACKAGE)) }
             .onFailure { logWarning("reYAMF_EntryV2", "cannot verify launcher transport address", it) }.getOrNull()
+
+    private fun sendEntryCapabilities(peer: com.buildsession.betterYAMF.xposed.adapters.common.system.EntryPeerRegistry.Peer,
+        queryId: Long) {
+        UserScopedBroadcasts.send(systemContext, Intent(Protocol.ACTION_ENTRY_CAPABILITIES).setPackage(peer.packageName)
+            .putExtra(Protocol.EXTRA_ENTRY_PROTOCOL,
+                if (windowBackend.supportsRetainedEntry && peer.asyncSnapshot) Protocol.ENTRY_PROTOCOL else 0)
+            .putExtra(Protocol.EXTRA_ASYNC_SNAPSHOT, true)
+            .putExtra(Protocol.EXTRA_LEGACY_ENTRY, windowBackend.supportsLegacyEntry)
+            .putExtra(Protocol.EXTRA_SOURCE_EPOCH, peer.epoch)
+            .putExtra(Protocol.EXTRA_DESTINATION_EPOCH, EntryProtocolIdentity.epoch)
+            .putExtra(Protocol.EXTRA_CAPABILITY_QUERY_ID, queryId), peer.userId)
+    }
 
     private val OpenInYAMFBroadcastReceiver: BroadcastReceiver.(Context, Intent) -> Unit =
         entryReceiver@ { _: Context, intent: Intent ->

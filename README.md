@@ -13,7 +13,7 @@
 
 工程声明的最低版本是 Android 13（API 33），当前原生交接与绘制同步的验证基线是 **LineageOS 24.0 的 Quickstep / Launcher3 与系统窗口后端**。最低 API、作用域中的包名或可找到的类名，都不能单独证明设备兼容。当前 Android 17 / Pixel Launcher 17、907 仅为源码核对候选，尚未完成 PixelOS 真机验证；Android 15/16 的组合保留待适配入口。
 
-安装需要支持本工程 Xposed 接口的框架，例如 LSPosed。启用模块时，系统侧需要作用于 `android`，手势入口还需要作用于实际承担最近任务手势的 Launcher。侧边栏等应用侧浮层按界面提示授予悬浮窗权限。
+安装需要支持本工程 Xposed 接口的框架，例如 LSPosed。当前 Android 17 实现需要同时启用 **`android`、`com.android.systemui` 和实际承担最近任务手势的 Launcher**。SystemUI 承载 Shell，小窗后端会等待同一构建的 Shell 隔离确认；缺少其作用域或仍驻留旧代码时，后端不宣告入口可用。侧边栏等应用侧浮层按界面提示授予悬浮窗权限。
 
 安装或更新 APK 后，应检查应用中的激活状态与系统驻留模块的构建信息。APK 更新成功不等于 Launcher / `system_server` 已加载新代码；驻留版本的生效方式由所用框架决定。
 
@@ -65,9 +65,11 @@ HookLauncher → Android 大版本 / Launcher 安装入口
   → LauncherEntryPort → 原生投放提示或源交接预备
 ```
 
-[`NativeHooks`](app/src/main/java/com/buildsession/betterYAMF/xposed/hook/bridge/NativeHooks.kt) 封装方法注册、回调和原始方法调用；[`HookLauncher`](app/src/main/java/com/buildsession/betterYAMF/xposed/hook/HookLauncher.kt) 只选择组合入口，具体点位由所选适配实现安装；[`LauncherGestureAdapter`](app/src/main/java/com/buildsession/betterYAMF/xposed/adapters/common/launcher/LauncherGestureAdapter.kt) 读取任务、手势和显示方向，将原生对象转换为公共值类型。
+[`NativeHooks`](app/src/main/java/com/buildsession/betterYAMF/xposed/hook/bridge/NativeHooks.kt) 封装方法注册、回调和原始方法调用；[`HookLauncher`](app/src/main/java/com/buildsession/betterYAMF/xposed/hook/HookLauncher.kt) 按精确 SDK、实际包名 / 主进程及 APK 范围选择绑定，服务建立后再由 [`LauncherEnvironmentMonitor`](app/src/main/java/com/buildsession/betterYAMF/xposed/adapters/common/launcher/LauncherEnvironmentMonitor.kt) 核对当前用户的默认 Home 和最近任务宿主，启用相应入口。默认桌面切换通过系统广播更新，没有轮询，输入和动画回调只读缓存。[`LauncherGestureAdapter`](app/src/main/java/com/buildsession/betterYAMF/xposed/adapters/common/launcher/LauncherGestureAdapter.kt) 读取任务、手势和显示方向，将原生对象转换为公共值类型。
 
 入口由 `LauncherEntries.create(scheduler, port)` 建立。适配器提交 `EntryInput`，并通过 `LauncherEntryPort` 提供候选任务、能力、投放区呈现和本地交接预备。是否满足触发条件、投放区位置与大小由 CORE 决定。
+
+候选事实区分原生尚未开始、正在跟踪和已拒绝。暂不可用会在后续输入中重新评估；使用原生已越过触摸阈值的事实，不额外要求上滑超过屏高 20%，也不把 Launcher 的 resumed 生命周期当成输入资格。UP 重新核查最后坐标、当前任务及能力。
 
 窗口侧通过 `WindowRuntimeHandle.post(WindowEvent)` 接入触摸、尺寸变化、任务表面可用、源释放等事实。Hook 不直接调用核心控制器，也不在回调里计算 mini 或全屏轨迹。
 
@@ -88,6 +90,10 @@ Launcher 的原始 UP 必须完整执行，保留最后位移更新与输入跟�
 任务机制主要位于 [`SmoothWindowBackend`](app/src/main/java/com/buildsession/betterYAMF/xposed/adapters/common/organizer/SmoothWindowBackend.kt) / `SmoothTaskOrganizer`；同帧提交由 [`SurfaceFrameSynchronizer`](app/src/main/java/com/buildsession/betterYAMF/xposed/adapters/common/system/SurfaceFrameSynchronizer.kt) 落实；全屏交还由 [`FullscreenTaskHandoff`](app/src/main/java/com/buildsession/betterYAMF/xposed/adapters/common/organizer/FullscreenTaskHandoff.kt) 观察真实控制权与重绘。
 
 `WindowBackend` 是 Android 内部后端接口，可以使用任务 token、leash 和事务。面向运行时的公共端口不携带这些对象，也不暴露 CORE 内部命令。更换 Android 原生机制时，应在适配器中满足同一端口保证。
+
+Android 17 的 [`HookShell`](app/src/main/java/com/buildsession/betterYAMF/xposed/hook/HookShell.kt) 在 SystemUI 中选择原生转场与装饰隔离实现。system_server 先发布当前拥有者的 Binder 标记，收到同构建 Shell 的确认后才创建 freeform 根；任务快照在 WM 生成时携带当前归属，退出后自然移除。选定 Shell 观察器收到排除米窗任务的转场视图，保留其他变化、事务和完成回调。系统侧还在实际应用 Shell WCT 时再次核对归属，拦住认领前排队、认领后才执行的桌面恢复写入。Android 的基础 freeform 能力继续保留。
+
+初始化分别维护路由、任务快照标记、首帧隐藏机制、organizer 注册、根和 leash、Shell 协商等资源事实；部分失败只补缺失步骤。根丢失会终结旧宿主并恢复根，重试不会重复注册或创建无主根。相关机制全部位于 AD，公共弹簧、尺寸和交接轨迹继续使用 CORE 的统一实现。
 
 ### 画面与控制权交接
 
@@ -116,7 +122,7 @@ Launcher 的原始 UP 必须完整执行，保留最后位移更新与输入跟�
 
 ## 适配新的 Launcher 或 Android 版本
 
-具体实现以 **Android 大版本 + Launcher** 为独立目录和验收单位，共享机制集中在 `xposed/adapters/common`。每个组合提供普通 Kotlin Hook 安装入口，按精确 SDK / 包名 / 主进程选择；系统侧通过对应 Android 实现提供任务后端。未来 Android 版本和未登记 Launcher 不自动套用现有实现。
+具体实现以 **Android 大版本 + Launcher** 为独立目录和验收单位，共享机制集中在 `xposed/adapters/common`。每个组合提供普通 Kotlin Hook 安装入口，按精确 SDK / 包名 / 主进程选择；系统侧通过对应 Android 实现提供任务后端。ROM 名称不决定 Launcher 类型：LineageOS 24.0 加装已核对的 Pixel Launcher，且默认 Home / 最近任务宿主均为 Pixel 时，使用 Pixel 适配器。Home 与最近任务分属不同包的组合须单独适配，不能自动套用集成路径。未来 Android 版本和未登记 Launcher 也不自动套用现有实现。
 
 完整目录、当前支持表、源码证据及新增步骤见 **[平台适配接入说明](app/src/main/java/com/buildsession/betterYAMF/xposed/adapters/README.md)**。AVIUM、Project Infinity X 等自带魔改小窗的 ROM 不在适配范围；公开构建信息中识别到相应标识时跳过 Hook。构建信息和方法签名都不能代替目标 ROM 的行为验收。
 

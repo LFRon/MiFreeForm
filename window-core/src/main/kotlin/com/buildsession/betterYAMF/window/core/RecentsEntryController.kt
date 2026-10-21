@@ -9,14 +9,15 @@ sealed interface RecentsEntryEffect {
     data class Drop(val request: EntryDrop) : RecentsEntryEffect
 }
 
-/** Existing HookLauncher rules, now shared and independent of Quickstep's input implementation. */
+/** Shared entry policy. Native tracking supplies the slop/ownership fact; no second screen-height
+ * threshold competes with the platform's gesture recognition.
+ */
 class RecentsEntryController {
     private var potential = false
     private var armed = false
     private var showing = false
     private var taskId = -1
     private var startY = 0f
-    private var heightAtDown = 0
     private var displayAtDown = 0
     private var current: EntryInput? = null
 
@@ -34,37 +35,48 @@ class RecentsEntryController {
             PointerPhase.DOWN -> {
                 reset()
                 startY = value.gestureY
-                heightAtDown = value.height
                 displayAtDown = value.displayId
-                potential = value.gestureY > heightAtDown * 0.95
+                potential = value.navigationStart ?: (value.gestureY > value.height * 0.95)
                 armed = potential
                 if (armed) effects += RecentsEntryEffect.Suppress(900L)
             }
             PointerPhase.MOVE -> if (potential) {
-                if (startY - value.gestureY > heightAtDown * 0.2) {
-                    if (!showing) effects += RecentsEntryEffect.QueryCandidate
+                if (startY > value.gestureY) {
+                    effects += RecentsEntryEffect.QueryCandidate
                 } else showing = false
             }
             PointerPhase.UP -> {
                 if (armed) effects += RecentsEntryEffect.Suppress(450L)
-                if (showing && inZone(value) && taskId > 0)
-                    effects += RecentsEntryEffect.Drop(EntryDrop(taskId, value.x.toInt(), value.y.toInt()))
-                reset()
+                // UP may supply the first ready facts or the last displacement into the target.
+                if (potential && startY > value.gestureY) effects += RecentsEntryEffect.QueryCandidate
+                else reset()
             }
             PointerPhase.CANCEL -> {
                 if (armed) effects += RecentsEntryEffect.Suppress(450L)
                 reset()
             }
         }
-        effects += RecentsEntryEffect.Present(visual(value))
+        if (RecentsEntryEffect.QueryCandidate !in effects) effects += RecentsEntryEffect.Present(visual(value))
         return effects
     }
 
-    fun candidate(value: EntryCandidate?): EntryTargetFrame? {
-        if (value != null && value.taskId > 0 && !value.home && (value.launcherResumed || value.sourceVisible)) {
-            taskId = value.taskId; showing = true
-        } else { potential = false; showing = false; taskId = -1 }
-        return current?.let(::visual)
+    fun candidate(value: EntryCandidate?, capabilities: LauncherEntryCapabilities): List<RecentsEntryEffect> {
+        val input = current ?: return emptyList()
+        if (value?.home == true || value?.tracking == EntryTracking.REJECTED ||
+            taskId > 0 && value != null && value.taskId > 0 && value.taskId != taskId) {
+            potential = false
+        }
+        if (potential && taskId < 0 && value != null && value.taskId > 0) taskId = value.taskId
+        showing = potential && value != null && value.taskId > 0 && !value.home &&
+            value.tracking == EntryTracking.TRACKING && (capabilities.retainedSource || capabilities.legacyAfterNative)
+        val effects = mutableListOf<RecentsEntryEffect>()
+        if (input.phase == PointerPhase.UP) {
+            if (showing && inZone(input))
+                effects += RecentsEntryEffect.Drop(EntryDrop(taskId, input.x.toInt(), input.y.toInt()))
+            reset()
+        }
+        effects += RecentsEntryEffect.Present(visual(input))
+        return effects
     }
 
     fun fallback(capabilities: LauncherEntryCapabilities): EntryDisposition =

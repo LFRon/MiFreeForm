@@ -29,6 +29,14 @@ interface WindowBackend {
     fun existingLogicalViewport(taskId: Int): Rect? = null
     /** Can retain source pixels while preparing an initially hidden live task. */
     val supportsRetainedEntry: Boolean get() = false
+    /** Backend can actually adopt after native completion; independent of pixel transport. */
+    val supportsLegacyEntry: Boolean get() = false
+
+    /** Replay cached platform failure/current readiness on the system main thread. Diagnostic
+     * only: no native initialization, IPC, resource mutation or change to advertised capability.
+     * Implementations must rate-limit repeated unavailable queries themselves.
+     */
+    fun reportEntryUnavailable() {}
 
     /** 注册回灌回调并完成系统侧初始化（幂等）。 */
     fun initialize(callbacks: WindowBackendCallbacks)
@@ -215,6 +223,8 @@ interface WindowBackend {
  * 释放或替换会话使其排队中的旧事件失效；宿主不得再无归属地二次异步转发。
  */
 interface WindowBackendCallbacks {
+    /** Global backend resource capability changed, delivered on the host thread. */
+    fun onEntryCapabilitiesChanged() {}
     /** A platform reset requires the current authoritative scene to be presented again. */
     fun onPresentationInvalidated(taskId: Int)
     /** 任务已被接管且承载句柄就绪（宿主可摆位）。 */

@@ -34,6 +34,7 @@ object Protocol {
     const val EXTRA_DESTINATION_EPOCH = "entryDestinationEpoch"
     const val EXTRA_CAPABILITY_QUERY_ID = "entryCapabilityQueryId"
     const val EXTRA_ASYNC_SNAPSHOT = "entryAsyncSnapshot"
+    const val EXTRA_LEGACY_ENTRY = "entryLegacyAfterNative"
 
     // —— extras ——
     const val EXTRA_COMPONENT_NAME = "componentName"

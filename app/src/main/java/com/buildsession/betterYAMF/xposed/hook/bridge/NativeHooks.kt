@@ -13,6 +13,8 @@ internal object NativeHooks {
         val thisObject: Any get() = raw.thisObject
         @Suppress("UNCHECKED_CAST")
         val args: Array<Any> get() = raw.args as Array<Any>
+        /** Java signatures such as setTaskOrganizer(null, ...) carry nullable arguments. */
+        fun argument(index: Int): Any? = raw.args[index]
         val method: Member get() = raw.method
         val throwable: Throwable? get() = raw.throwable
         var result: Any?

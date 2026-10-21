@@ -10,6 +10,10 @@ class AdapterCatalogTest {
     private fun select(sdk: Int, pkg: String = launcher3, process: String = pkg,
         platform: PlatformIdentity = lineage, version: Long? = 907L) =
         AdapterCatalog.selectLauncher(sdk, pkg, process, platform, version)
+    private fun active(sdk: Int = 37, pkg: String = launcher3, process: String = pkg,
+        home: String? = pkg, recents: String? = pkg, version: Long? = 907L,
+        platform: PlatformIdentity = lineage) = AdapterCatalog.selectRuntimeLauncher(
+            LauncherRuntimeIdentity(sdk, pkg, process, version, home, recents), platform)
 
     @Test fun knownCurrentCombinationHasOneExplicitEntry() {
         val selected = select(37) as LauncherSelection.Selected
@@ -24,6 +28,56 @@ class AdapterCatalogTest {
         assertEquals("android17/pixelLauncher", selected.adapter.identity.id)
         assertEquals("PixelOS 17", selected.adapter.identity.referenceRom)
         assertEquals(AdapterEvidence.SOURCE_REVIEWED, selected.adapter.identity.evidence)
+    }
+
+    @Test fun lineageWithPixelHomeAndQuickstepSelectsPixelInsteadOfTheRomBaseline() {
+        val selected = active(pkg = pixel) as LauncherSelection.Selected
+        assertEquals("android17/pixelLauncher", selected.adapter.identity.id)
+        // The combination remains source-reviewed; a different ROM does not upgrade its evidence.
+        assertEquals(AdapterEvidence.SOURCE_REVIEWED, selected.adapter.identity.evidence)
+    }
+
+    @Test fun pixelRomWithLauncher3HomeAndQuickstepSelectsLauncher3() {
+        val selected = active(platform = PlatformIdentity(product = "PixelOS_sagit-userdebug"))
+            as LauncherSelection.Selected
+        assertEquals("android17/launcher3", selected.adapter.identity.id)
+    }
+
+    @Test fun installedButNonDefaultLauncherCannotEnableAnEntry() {
+        for ((host, home) in listOf(launcher3 to pixel, pixel to launcher3, launcher3 to "example.home")) {
+            val rejected = active(pkg = host, home = home) as LauncherSelection.Unavailable
+            assertTrue(rejected.reason.contains("default Home"))
+        }
+    }
+
+    @Test fun aHomeShortcutCannotSubstituteForTheActualQuickstepHost() {
+        for ((home, recents) in listOf(pixel to launcher3, launcher3 to pixel)) {
+            val rejected = active(pkg = home, recents = recents) as LauncherSelection.Unavailable
+            assertTrue(rejected.reason.contains("configured Recents host"))
+        }
+    }
+
+    @Test fun missingOrAmbiguousRolesDoNotGuessTheInstalledLauncher() {
+        assertTrue(active(home = null) is LauncherSelection.Unavailable)
+        assertTrue(active(recents = null) is LauncherSelection.Unavailable)
+        assertTrue(active(home = "android") is LauncherSelection.Unavailable)
+    }
+
+    @Test fun currentHomeStillRequiresTheExactSdkApkAndMainProcess() {
+        assertTrue(active(sdk = 36, pkg = pixel) is LauncherSelection.Unavailable)
+        assertTrue(active(sdk = 38, pkg = pixel) is LauncherSelection.Unavailable)
+        assertTrue(active(pkg = pixel, version = 908L) is LauncherSelection.Unavailable)
+        assertTrue(active(pkg = pixel, version = null) is LauncherSelection.Unavailable)
+        assertTrue(active(pkg = pixel, process = "$pixel:service") is LauncherSelection.Unavailable)
+        assertTrue(active(platform = PlatformIdentity(product = "avium_sagit-userdebug"))
+            is LauncherSelection.Unavailable)
+    }
+
+    @Test fun switchingHomeAwayAndBackNeverChangesTheInstalledUnit() {
+        assertTrue(active(pkg = pixel) is LauncherSelection.Selected)
+        assertTrue(active(pkg = pixel, home = launcher3) is LauncherSelection.Unavailable)
+        val restored = active(pkg = pixel) as LauncherSelection.Selected
+        assertEquals("android17/pixelLauncher", restored.adapter.identity.id)
     }
 
     @Test fun unauditedPixelApkDoesNotInstallEvenIfThePackageAndSdkMatch() {

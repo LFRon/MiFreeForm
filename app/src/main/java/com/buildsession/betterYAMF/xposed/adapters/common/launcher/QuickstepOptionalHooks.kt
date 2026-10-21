@@ -22,7 +22,8 @@ import de.robv.android.xposed.XposedHelpers
  * the LoS Launcher3 ABI; the Pixel unit deliberately does not select it.
  */
 internal class QuickstepOptionalHooks(private val loader: ClassLoader,
-    private val allowMenu: Boolean, private val allowTaskbar: Boolean) {
+    private val allowMenu: Boolean, private val allowTaskbar: Boolean,
+    private val isCurrentLauncher: () -> Boolean) {
     private var requested = false
     private var menuInstalled = false
     private var taskbarInstalled = false
@@ -62,6 +63,7 @@ internal class QuickstepOptionalHooks(private val loader: ClassLoader,
         val hooks = mutableListOf<NativeHooks.Registration>()
         try {
             methods.forEach { method -> hooks += method.hookAfter { call ->
+                if (!isCurrentLauncher()) return@hookAfter
                 runCatching {
                     val view = call.args[0] as View
                     val shortcuts = call.result as? List<*> ?: return@runCatching
@@ -108,6 +110,7 @@ internal class QuickstepOptionalHooks(private val loader: ClassLoader,
         val start = type.declaredMethods.single { it.name == "startItemInfoActivity" &&
             it.parameterCount == 2 && it.parameterTypes[0] == itemType }
         start.hookBefore { call ->
+            if (!isCurrentLauncher()) return@hookBefore
             runCatching {
                 val item = call.args.firstOrNull()?.takeIf(workspaceType::isInstance) ?: return@runCatching
                 val component = (XposedHelpers.callMethod(item, "getIntent") as? Intent)?.component ?: return@runCatching

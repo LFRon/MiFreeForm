@@ -3,6 +3,7 @@ package com.buildsession.betterYAMF.xposed.adapters.common.launcher
 import android.app.Service
 import android.content.Context
 import android.view.MotionEvent
+import com.buildsession.betterYAMF.window.api.PointerPhase
 import com.buildsession.betterYAMF.xposed.adapters.AdapterIdentity
 import com.buildsession.betterYAMF.xposed.hook.bridge.NativeHooks
 import com.buildsession.betterYAMF.xposed.hook.bridge.NativeHooks.hookAfter
@@ -16,17 +17,22 @@ internal object QuickstepHookInstaller {
     private var identity: AdapterIdentity? = null
     private var startService: ((Service) -> Unit)? = null
     private var activeService: WeakReference<Service>? = null
+    private var environment: LauncherEnvironmentMonitor? = null
+    val isCurrentLauncher: Boolean get() = activeService?.get() != null && environment?.isCurrentLauncher == true
     private val registrations = mutableListOf<NativeHooks.Registration>()
+    private class InputCall(val adapter: LauncherGestureAdapter, val input: LauncherGestureAdapter.PreparedInput,
+        var handoff: RecentsDropHandoff.Handoff? = null)
 
     fun install(id: AdapterIdentity, loader: ClassLoader,
-        signature: LauncherSourceRetirement.Signature, menu: Boolean, taskbar: Boolean) {
+        signature: LauncherSourceRetirement.Signature, menu: Boolean, taskbar: Boolean,
+        nativeDownAdmission: Boolean = false) {
         if (owner === loader && identity == id) return
         check(owner == null) { "An active Launcher binding cannot be replaced in-flight" }
         val native = QuickstepNativeAccess(loader, signature)
-        val optional = QuickstepOptionalHooks(loader, menu, taskbar)
+        val optional = QuickstepOptionalHooks(loader, menu, taskbar) { isCurrentLauncher }
         var gesture: LauncherGestureAdapter? = null
         fun adapter(): LauncherGestureAdapter =
-            gesture ?: LauncherGestureAdapter(native).also { gesture = it }
+            gesture ?: LauncherGestureAdapter(native, nativeDownAdmission).also { gesture = it }
 
         val pending = mutableListOf<NativeHooks.Registration>()
         try {
@@ -36,20 +42,32 @@ internal object QuickstepHookInstaller {
                 runCatching { start(call.thisObject as Service) }
                     .onFailure { logWarning(TAG, "${id.id}: Launcher service setup failed", it) }
             }
-            pending += native.onInput.hookBefore { call ->
-                val event = call.args.firstOrNull() as? MotionEvent ?: return@hookBefore
-                // Never skip original UP, even when its final end decision has been armed.
-                gesture?.takeIf { activeService?.get() != null }?.input(call.thisObject, event)?.let {
-                    call.setObjectExtra("miwindow.sourceHandoff", it)
+            pending += NativeHooks.hookMethod(native.onInput, object : NativeHooks.Callback() {
+                override fun beforeHookedMethod(call: NativeHooks.Call) {
+                    val event = call.args.firstOrNull() as? MotionEvent ?: return
+                    val current = gesture?.takeIf {
+                        activeService?.get() != null && it.acceptsInput(call.thisObject)
+                    } ?: return
+                    val input = runCatching { current.prepareInput(call.thisObject, event) }
+                        .onFailure { current.inputFailed(call.thisObject, it) }.getOrNull() ?: return
+                    val invocation = InputCall(current, input)
+                    call.setObjectExtra("miwindow.entryInput", invocation)
+                    // Never skip original UP. MOVE recognition is observed after the original.
+                    if (input.value.phase != PointerPhase.MOVE &&
+                        (input.value.phase != PointerPhase.DOWN || !nativeDownAdmission))
+                        invocation.handoff = current.input(input)
                 }
-            }
-            pending += native.onInput.hookAfter { call ->
-                (call.getObjectExtra("miwindow.sourceHandoff") as? RecentsDropHandoff.Handoff)
-                    ?.inputFinished(call.throwable)
-            }
+                override fun afterHookedMethod(call: NativeHooks.Call) {
+                    val invocation = call.getObjectExtra("miwindow.entryInput") as? InputCall ?: return
+                    runCatching { invocation.adapter.inputFinished(invocation.input, invocation.handoff, call.throwable) }
+                        .onFailure { invocation.adapter.inputFailed(invocation.input, it) }
+                }
+            })
             pending += native.onDestroy.hookBefore { call ->
                 if (activeService?.get() === call.thisObject) {
                     activeService = null
+                    environment?.close()
+                    environment = null
                     runCatching { gesture?.destroy() }.onFailure { error -> logWarning(TAG, "Launcher cleanup failed", error) }
                 }
             }
@@ -62,7 +80,21 @@ internal object QuickstepHookInstaller {
             owner = loader
             identity = id
             startService = { service ->
-                adapter().create(service)
+                environment?.close()
+                environment = null
+                gesture?.destroy()
+                try {
+                    val current = adapter()
+                    val monitor = LauncherEnvironmentMonitor(service, id, current::setEnvironmentCurrent)
+                    environment = monitor
+                    monitor.start()
+                    current.create(service, native.inputOwnerOf(service))
+                } catch (error: Throwable) {
+                    environment?.close()
+                    environment = null
+                    gesture?.destroy()
+                    throw error
+                }
                 runCatching { optional.configure(service.applicationContext) }
                     .onFailure { logWarning(TAG, "Optional Launcher entry configuration failed", it) }
             }

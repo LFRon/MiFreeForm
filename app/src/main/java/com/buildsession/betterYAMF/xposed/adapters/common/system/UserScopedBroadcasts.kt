@@ -5,6 +5,8 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.app.BroadcastOptions
+import android.os.Bundle
 import android.os.Handler
 import android.os.Process
 import android.os.UserHandle
@@ -17,15 +19,41 @@ internal object UserScopedBroadcasts {
     private val userOf by lazy { UserHandle::class.java.getMethod("of", Int::class.javaPrimitiveType) }
     private val sendingUser by lazy { BroadcastReceiver::class.java.getMethod("getSendingUserId") }
     private val sentFromUid by lazy { runCatching { BroadcastReceiver::class.java.getMethod("getSentFromUid") }.getOrNull() }
+    private val sentFromPackage by lazy { BroadcastReceiver::class.java.getMethod("getSentFromPackage") }
     private val packageUid by lazy { PackageManager::class.java.getMethod("getPackageUidAsUser",
         String::class.java, Int::class.javaPrimitiveType, Int::class.javaPrimitiveType) }
     private val send by lazy { Context::class.java.getMethod("sendBroadcastAsUser", Intent::class.java, UserHandle::class.java) }
+    private val identifiedSend by lazy { Context::class.java.getMethod("sendBroadcastAsUser", Intent::class.java,
+        UserHandle::class.java, String::class.java, Bundle::class.java) }
     private val register by lazy { Context::class.java.getMethod("registerReceiverAsUser",
         BroadcastReceiver::class.java, UserHandle::class.java, IntentFilter::class.java,
         String::class.java, Handler::class.java, Int::class.javaPrimitiveType) }
 
     fun deliveryUser(receiver: BroadcastReceiver): Int =
         (sendingUser.invoke(receiver) as Int).also { require(it >= 0) { "Missing broadcast delivery user" } }
+
+    fun senderUid(receiver: BroadcastReceiver): Int =
+        sentFromUid?.invoke(receiver) as? Int ?: Process.INVALID_UID
+
+    /** Only for messages sent by system_server, never for replies from SystemUI. */
+    fun isSystemSender(receiver: BroadcastReceiver): Boolean = senderUid(receiver) == Process.SYSTEM_UID
+
+    fun senderPackage(receiver: BroadcastReceiver): String? = sentFromPackage.invoke(receiver) as? String
+
+    /** New privileged handshakes require an actual sender UID; do not weaken Launcher v2's
+     * backwards-compatible receiver to add this capability. The reply always addresses user 0.
+     */
+    @android.annotation.SuppressLint("NewApi") // Only selected by the reviewed SDK-37 mechanism.
+    fun sendIdentifiedPrivileged(context: Context, intent: Intent) {
+        // SystemUI has its own PM-assigned UID. The receiver authenticates the actual package/UID;
+        // sharing identity does not grant the sender system_server's identity or permissions.
+        check(context.checkSelfPermission(TRUSTED_SENDER_PERMISSION) == PackageManager.PERMISSION_GRANTED) {
+            "Identified broadcast permission missing for uid=${Process.myUid()}"
+        }
+        intent.addFlags(Intent.FLAG_RECEIVER_REGISTERED_ONLY)
+        identifiedSend.invoke(context, intent, userOf.invoke(null, 0), TRUSTED_SENDER_PERMISSION,
+            BroadcastOptions.makeBasic().setShareIdentityEnabled(true).toBundle())
+    }
 
     /** The receiver's permission gate is retained on older platforms which do not share sender UID. */
     fun sender(context: Context, receiver: BroadcastReceiver, packageName: String?): Sender? {

@@ -1,6 +1,6 @@
 # Android / Launcher 适配入口
 
-具体 Hook 是普通 Kotlin 实现，由 `HookSystem` / `HookLauncher` 选择后执行。这里的选择信息只属于 AD，不传入 `window-api`、CORE 或运行时。
+具体 Hook 是普通 Kotlin 实现，由 `HookSystem` / `HookLauncher` / `HookShell` 选择后执行。这里的选择信息只属于 AD，不传入 `window-api`、CORE 或运行时。
 
 ## 目录与接入
 
@@ -15,15 +15,24 @@ adapters/
   android17/launcher3/       现有 LineageOS 24.0 机制的安装入口
   android17/pixelLauncher/   PixelOS 17 / Pixel Launcher 17、907 的源码核对候选
   android17/system/          经核对的任务组织器与绘制同步实现选择
+  android17/shell/           SystemUI / Shell 转场、装饰及任务归属隔离
   common/launcher/           Quickstep Hook 注册、输入归一、源画面与控制器交接
   common/organizer/          共享任务/表面机制
   common/system/             绘制、Android 事实、广播与像素传输
   common/freeform/           共享表面与输入变换
 ```
 
-`AdapterCatalog` 用精确 SDK、包名、主进程及已核对的 APK 版本范围选择唯一组合，再由安装器核对整组原生签名。`referenceRom` 记录源码 / 真机证据的 ROM 基线，不是运行时对任意 ROM 的兼容承诺。当前核对范围是 LineageOS 24.0 / PixelOS 17；其他 ROM 即使签名相同也需要独立验收。每个组合的 `install()` 真正调用原生 Hook 安装代码，不存在描述语言、脚本解释器或自动生成 Hook。
+`AdapterCatalog` 用精确 SDK、实际加载的包名、主进程及已核对的 APK 版本范围选择唯一组合，再由安装器核对整组原生签名。包加载仅安装绑定；服务建立后还要核对当前用户的默认 Home 和系统配置的最近任务宿主，才能启用入口。`referenceRom` 记录源码 / 真机证据的 ROM 基线，不参与 Launcher 类型选择，也不是对任意 ROM 的兼容承诺。当前核对范围是 LineageOS 24.0 / PixelOS 17；其他组合即使签名相同也需要独立验收。每个组合的 `install()` 真正调用原生 Hook 安装代码，不存在描述语言、脚本解释器或自动生成 Hook。
+
+`LauncherEnvironmentMonitor` 在 TouchInteractionService 建立时读取当前用户的首选 Home（`PackageManager.getHomeActivities`）、`android:string/config_recentsComponentName`、SDK、实际包名 / 进程及 APK 版本。前两项分别对应 Launcher 的 `OverviewComponentObserver` 和 SystemUI 的 `LauncherProxyService`，不能用 ROM 品牌、已安装的 Launcher 列表或 GApps 是否存在代替。Android 17 的 LineageOS 加装 Pixel Launcher，若 Home 和最近任务宿主都指向已核对的 Pixel APK，就选择 `android17/pixelLauncher`；不会因为 ROM 名字仍为 LineageOS 而使用 Launcher3 的 Hook。
+
+监听采用系统事件：初始化读取一次，此后仅在首选桌面变更、用户解锁、相关包或 framework overlay 变更时刷新。没有轮询、定时器或后台常驻任务；输入和动画回调只读缓存，不查询 PackageManager。监听随原生服务销毁注销。切走后撤销旧入口并清理手势；切回已绑定组合后，从新的 DOWN 开始，进行中的手势不切换原生实现。可选菜单、任务栏及 Pixel 原生菜单过滤使用相同的缓存资格。
+
+默认 Home 和承担 Quickstep 的包可能不同。当前只启用二者与已绑定 Launcher 一致的集成路径；无默认 Home、查询失败、未核对的 APK，或 Home / Recents 分属不同包时保留原生输入并输出 Warning，不猜测兼容实现。此限制不影响系统后端按 SDK 独立选择。新增分离 Home / Overview 支持时，须另外核对 fallback 容器、旋转和源退场保证；这组 Android 事实不进入公共 JVM 端口。
 
 系统侧通过 `SystemAdapters` 选择 Android 后端，`YAMFManager` 不再直接指定 `SmoothWindowBackend`。在 `systemReady` 前核对关键任务、表面迁移和绘制接口，再安装原生 Hook；窗口执行仍通过 `WindowBackend` 和现有公共执行端口连接。
+
+Android 17 还需启用 `com.android.systemui` 的模块作用域。Shell 与系统使用独立的拥有者协商，确认相同构建和归属标记后才创建根；SystemUI 死亡使入口能力失效，正常重建后重新协商。它不占用 Launcher 的 v2 对端登记表，也不改变像素协议。隔离机制、源码点位与资源规则见 [Shell 接入说明](android17/shell/README.md)。
 
 Launcher 侧由组合入口选择 `QuickstepNativeAccess` 和具体退场 ABI，再通过 `QuickstepHookInstaller` 注册方法。固定成员在初始化阶段解析，候选任务、控制器和表面归属仍在每次手势中读取。输入回调通过 `LauncherGestureAdapter` 接入 `LauncherEntryHandle`，不直接访问 CORE。
 
@@ -34,7 +43,7 @@ Android 17 的启动前解析覆盖输入、源事务、任务过滤缓存和控
 | 组合 | 状态 | 允许的行为 |
 |---|---|---|
 | Android 17 + Launcher3 | 迁移既有 LineageOS 24.0 真机基线 | 结构检查通过后安装手势、菜单和任务栏实现；本次重构仍需驻留代码生效后复验 |
-| Android 17 + Pixel Launcher | 源码/DEX 核对候选，未完成 PixelOS 真机验证 | 仅 APK 版本号 907，通过完整结构检查后启用手势；菜单与任务栏尚不安装 |
+| Android 17 + Pixel Launcher | 源码/DEX 核对候选，未完成 PixelOS 真机验证 | 仅 APK 版本号 907；手势接入公共端口，后端可用时过滤原生 desktop/freeform 菜单；米窗菜单与任务栏入口尚不安装 |
 | Android 16 + Launcher3 / Pixel Launcher | 待适配 | 不安装原生 Hook，不借用 Android 17 后端 |
 | Android 15 + Launcher3 | 待适配 | 不安装原生 Hook，不借用 Android 17 后端 |
 | 其他 SDK / Launcher 组合 | 未登记 | 不安装原生 Hook；无 `SDK >=` 或包名包含 launcher 的默认匹配 |
@@ -56,7 +65,7 @@ AVIUM、Project Infinity X 等已经集成魔改小窗的 ROM 不在适配范围
 
 ## 新增一个组合
 
-1. 核对对应 ROM 源码与实际 Launcher APK，记录分支、提交和 APK 构建范围。
+1. 核对对应 ROM 源码与实际 Launcher APK，记录分支、提交和 APK 构建范围，并确认当前用户的默认 Home、实际 Quickstep 宿主及二者是否一致。
 2. 在对应 Android / Launcher 目录编写具体安装代码，优先复用已证明等价的公共机制。
 3. 声明确切匹配范围和证据状态，在 `AdapterCatalog` 登记唯一入口；需要不同系统机制时显式新增系统实现。
 4. 补齐选择、原生签名及交接契约验证，再进行该组合的真机重复进入/退出、旋转、全屏、打断和清理验证。

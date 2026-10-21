@@ -14,6 +14,7 @@ import com.buildsession.betterYAMF.window.backend.WindowBackendCallbacks
 import com.buildsession.betterYAMF.xposed.adapters.common.freeform.FreeformBackend
 import com.buildsession.betterYAMF.xposed.adapters.common.system.SystemSignals
 import com.buildsession.betterYAMF.xposed.adapters.common.system.TaskSystemOps
+import com.buildsession.betterYAMF.xposed.adapters.common.system.ShellOwnershipServer
 import com.buildsession.betterYAMF.xposed.services.YAMFManager
 import com.buildsession.betterYAMF.xposed.utils.Instances
 import com.buildsession.betterYAMF.xposed.utils.log
@@ -67,8 +68,10 @@ object SmoothWindowBackend : WindowBackend {
         }
     }
     override val supportsRetainedEntry: Boolean
-        get() = SmoothTaskOrganizer.registered && SmoothTaskOrganizer.canStageInitialPresentation &&
-            SmoothTaskOrganizer.launchRootToken() != null
+        get() = SmoothTaskOrganizer.entryReady
+    override val supportsLegacyEntry: Boolean get() = SmoothTaskOrganizer.entryReady
+    override fun reportEntryUnavailable() = SmoothTaskOrganizer.reportEntryUnavailable()
+    fun notifyEntryCapabilitiesChanged() { mainHandler.post { callbacks?.onEntryCapabilitiesChanged() } }
     fun hasSynchronizedPresentation(taskId: Int): Boolean = frameSynchronizedTasks.contains(taskId)
 
     /** Coalesced signal, never an independent geometry write beside a View buffer. */
@@ -99,6 +102,7 @@ object SmoothWindowBackend : WindowBackend {
     override fun initialize(callbacks: WindowBackendCallbacks) {
         // 先绑回调再初始化：初始化过程中可能触发任务事件
         this.callbacks = callbacks
+        ShellOwnershipServer.initialize(Instances.systemContext, SmoothTaskOrganizer::shellReadinessChanged)
         SmoothTaskOrganizer.init()
         FullscreenTaskHandoff.initialize()
     }

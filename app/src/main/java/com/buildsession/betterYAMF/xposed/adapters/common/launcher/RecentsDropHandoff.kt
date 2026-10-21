@@ -32,10 +32,13 @@ internal object RecentsDropHandoff {
     private val handler = Handler(Looper.getMainLooper())
     private var installed = false
     private var bridgeSupported = false
+    private var legacySupported = false
     private var sourceSyncReady = false
     private var backendEpoch = 0L
     private var capabilityQueryId = 0L
     fun bridgeAvailable(): Boolean = bridgeSupported && sourceSyncReady
+    fun legacyAvailable(): Boolean = legacySupported
+    fun backendAvailable(): Boolean = bridgeAvailable() || legacyAvailable()
     private var application: Context? = null
     private val owners = HandoffOwners<Pending>()
     private val hookedEnds = mutableSetOf<Method>()
@@ -67,11 +70,16 @@ internal object RecentsDropHandoff {
                     val queryId = intent.getLongExtra(Protocol.EXTRA_CAPABILITY_QUERY_ID, 0L)
                     if (queryId != 0L && queryId != capabilityQueryId) return
                     val nextEpoch = intent.getLongExtra(Protocol.EXTRA_DESTINATION_EPOCH, 0L)
+                    val previousEpoch = backendEpoch
+                    val previousBridge = bridgeSupported
+                    val previousLegacy = legacySupported
                     if (backendEpoch != 0L && nextEpoch != 0L && nextEpoch != backendEpoch) dispose()
                     backendEpoch = nextEpoch
                     bridgeSupported = intent.getIntExtra(Protocol.EXTRA_ENTRY_PROTOCOL, 0) == Protocol.ENTRY_PROTOCOL &&
                         intent.getBooleanExtra(Protocol.EXTRA_ASYNC_SNAPSHOT, false)
-                    log(TAG) { "backend protocol ready=$bridgeSupported" }
+                    legacySupported = intent.getBooleanExtra(Protocol.EXTRA_LEGACY_ENTRY, false)
+                    if (previousEpoch != backendEpoch || previousBridge != bridgeSupported || previousLegacy != legacySupported)
+                        log(TAG) { "backend epoch=$backendEpoch protocol ready=$bridgeSupported legacy=$legacySupported" }
                     return
                 }
                 val taskId = intent.getIntExtra(Protocol.EXTRA_TASK_ID, -1)

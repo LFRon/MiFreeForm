@@ -3,13 +3,15 @@ package com.buildsession.betterYAMF.xposed.adapters.common.organizer
 import android.app.ActivityManager
 import android.graphics.Rect
 import android.hardware.display.DisplayManager
-import android.os.Binder
+import android.app.TaskInfo
 import android.util.DisplayMetrics
 import android.view.Display
 import android.view.SurfaceControl
 import android.window.ITaskOrganizer
 import com.buildsession.betterYAMF.window.api.WindowRect
 import com.buildsession.betterYAMF.xposed.adapters.common.freeform.FreeformBackend
+import com.buildsession.betterYAMF.xposed.adapters.common.system.ShellOwnershipServer
+import com.buildsession.betterYAMF.xposed.adapters.common.system.EntryProtocolIdentity
 import com.buildsession.betterYAMF.xposed.utils.Instances
 import com.buildsession.betterYAMF.xposed.utils.log
 import com.buildsession.betterYAMF.xposed.utils.logWarning
@@ -17,6 +19,7 @@ import com.buildsession.betterYAMF.xposed.utils.logError
 import com.github.kyuubiran.ezxhelper.utils.findMethod
 import com.buildsession.betterYAMF.xposed.hook.bridge.NativeHooks.hookBefore
 import com.buildsession.betterYAMF.xposed.hook.bridge.NativeHooks.hookAfter
+import com.buildsession.betterYAMF.xposed.hook.bridge.NativeHooks
 import com.github.kyuubiran.ezxhelper.utils.paramCount
 import de.robv.android.xposed.XposedHelpers
 import net.bytebuddy.ByteBuddy
@@ -43,7 +46,7 @@ import kotlin.math.roundToInt
  * - `Flags.unifyShellBinders` 时注册还会把过渡播放器转发给最后注册的 organizer（多播列表，附加式）。
  *
  * 因此本模块采用**透明插入**：
- * 1. 注册前捕获上一任 organizer；
+ * 1. 按原生登记表动态解析系统 organizer；
  * 2. 先钩 `Task.setTaskOrganizer(ITaskOrganizer, boolean)` 做**选择性路由**：
  *    只有我们悬浮根子树的任务归我们，其余任务强制保持上一任（系统壳行为不变）；
  * 3. 再用 `createTask(TaskCreationParams)` 建专属悬浮根，`WCT.reorder(onTop)`；
@@ -52,6 +55,7 @@ import kotlin.math.roundToInt
 object SmoothTaskOrganizer {
     private const val TAG = "reYAMF_Organizer"
     private const val WINDOWING_MODE_FREEFORM = 5
+    private const val UNAVAILABLE_REPORT_INTERVAL_MS = 5000L
 
     private val byteBuddyStrategy =
         AndroidClassLoadingStrategy.Wrapping(File("/data/system/reYAMF").also { it.mkdirs() })
@@ -59,10 +63,42 @@ object SmoothTaskOrganizer {
     @Volatile
     var registered = false
         private set
+    private var routingInstalled = false
+    private var markerInstalled = false
+    private var cornerGateInstalled = false
+    private var initializing = false
+    private var retry: Runnable? = null
+    private var failures = 0
+    @Volatile private var initialization = "not-started"
+    private var reportedInitialization = ""
+    private var lastInitializationFailure: Throwable? = null
+    private var rootInitializationStep = "not-started"
+    private var lastUnavailableReportAt: Long? = null
 
-    /** 注册前最后一任 organizer（通常是系统壳）；非本子树任务在路由时强制还给它的。 */
-    @Volatile
-    private var previousOrganizer: Any? = null
+    val entryReady: Boolean get() = registered && routingInstalled && markerInstalled && cornerGateInstalled &&
+        canStageInitialPresentation && rootAlwaysOnTop &&
+        ShellOwnershipServer.ready && floatingRootToken != null && floatingRootLeash?.isValid == true
+    fun readiness(): String = "$initialization epoch=${EntryProtocolIdentity.epoch} registered=$registered routing=$routingInstalled marker=$markerInstalled " +
+        "staging=$canStageInitialPresentation corner=$cornerGateInstalled shell=${ShellOwnershipServer.ready} root=$floatingRootTaskId " +
+        "rootStep=$rootInitializationStep token=${floatingRootToken != null} leash=${floatingRootLeash?.isValid == true} alwaysOnTop=$rootAlwaysOnTop"
+
+    /** Query-time replay: boot errors may already have fallen out of logd's main ring buffer.
+     * Read cached resource facts only; a Launcher DOWN must not retry WM initialization.
+     */
+    fun reportEntryUnavailable() {
+        if (entryReady) return
+        val now = android.os.SystemClock.uptimeMillis()
+        if (lastUnavailableReportAt?.let { now - it < UNAVAILABLE_REPORT_INTERVAL_MS } == true) return
+        lastUnavailableReportAt = now
+        logWarning(TAG, "entry capability unavailable: ${readiness()} shellState=${ShellOwnershipServer.readiness()} " +
+            "build=${com.buildsession.betterYAMF.BuildConfig.BUILD_TIME}",
+            ShellOwnershipServer.failureCause() ?: lastInitializationFailure)
+    }
+
+    private class RegistrationRead(val toUs: Boolean, val previous: RegistrationRead?) {
+        val leashes = RegistrationLeases<SurfaceControl>(::releaseQuietly)
+    }
+    private val registrationRead = ThreadLocal<RegistrationRead?>()
 
     @Volatile
     private var floatingRootTaskId = -1
@@ -142,7 +178,7 @@ object SmoothTaskOrganizer {
      * 让应用任务**出生即在根下**（容器兜底路径的任务归属语义；小窗不改应用 DPI）。
      * 根未就绪时返回 null，调用方退回默认启动路径（认领兜底）。
      */
-    fun launchRootToken(): Any? = floatingRootToken?.takeIf { floatingRootLeash?.isValid == true }
+    fun launchRootToken(): Any? = floatingRootToken?.takeIf { entryReady }
 
     /** 该任务是否已处于承载根子树（出生即入根或已认领）；供"重启进入会话"判定。 */
     fun isTaskInFloatingRoot(taskInfo: ActivityManager.RunningTaskInfo): Boolean = runCatching {
@@ -197,6 +233,13 @@ object SmoothTaskOrganizer {
         }.getOrNull()
     }
 
+    /** Current WM ownership, read under its global lock by marker/registration/write guards. */
+    internal fun ownsNativeTask(task: Any?): Boolean {
+        if (task == null) return false
+        return isInOurSubtree(task) || pendingAdoption.contains(XposedHelpers.getIntField(task, "mTaskId")) ||
+            XposedHelpers.getObjectField(task, "mTaskOrganizer") === organizer
+    }
+
     private fun isTaskOrganized(task: Any): Boolean =
         (runCatching { XposedHelpers.callMethod(task, "isOrganized") }.getOrNull() as? Boolean) == true
 
@@ -219,46 +262,112 @@ object SmoothTaskOrganizer {
     }
 
     fun init() {
-        if (registered) return
-        runCatching {
+        if (android.os.Looper.myLooper() != callbackHandler.looper) {
+            callbackHandler.post { init() }; return
+        }
+        if (initializing) return
+        retry?.let(callbackHandler::removeCallbacks); retry = null
+        initializing = true
+        var step = "controller"
+        try {
+            initialization = "initializing"
             val organizerController = XposedHelpers.callMethod(
                 Instances.activityTaskManager, "getWindowOrganizerController"
             )
-            val taskOrganizerController = XposedHelpers.getObjectField(
-                organizerController, "mTaskOrganizerController"
-            )
+            // Same AIDL accessor used by framework TaskOrganizer; no private controller field.
+            val taskOrganizerController = checkNotNull(XposedHelpers.callMethod(organizerController, "getTaskOrganizerController"))
             organizerControllerRef = taskOrganizerController
-
-            // 1) 捕获上一任 organizer（透明插入的关键参照）
-            runCatching {
-                val deque = XposedHelpers.getObjectField(taskOrganizerController, "mTaskOrganizers") as? java.util.ArrayDeque<*>
-                previousOrganizer = deque?.peekLast()
-                log(TAG) { "previous organizer=${previousOrganizer}" }
+            step = "routing"
+            if (!routingInstalled) { check(hookTaskOrganizerRouting()); routingInstalled = true }
+            step = "task-info-marker"
+            if (!markerInstalled) { hookTaskInfoMarker(); markerInstalled = true }
+            step = "initial-staging"
+            if (!canStageInitialPresentation) hookInitialSurfaceStaging()
+            check(canStageInitialPresentation) { "Initial surface staging unavailable" }
+            step = "corner-gate"
+            if (!cornerGateInstalled) hookRoundedCornerOptCleanup()
+            check(cornerGateInstalled) { "Rounded-corner cleanup gate unavailable" }
+            // Shell sees global transition snapshots even for tasks assigned to our organizer.
+            // Never create/adopt a freeform root before the exact running Shell acknowledges it.
+            if (!ShellOwnershipServer.ready) {
+                initialization = "waiting-shell-ack"
+                return
             }
-
-            // 2) 先装选择性路由钩子——注册引发的全量认领必须按我们的规则路由
-            check(hookTaskOrganizerRouting()) { "Selective task routing is required before organizer registration" }
-            hookInitialSurfaceStaging()
-
-            // 2.5) 圆角 opt 源头闸——禁止系统转场收尾恢复我方任务的客户端自绘
-            hookRoundedCornerOptCleanup()
-
-            // 3) 注册
-            val appeared = XposedHelpers.callMethod(
-                taskOrganizerController, "registerTaskOrganizer", organizer
-            )
-            registered = true
-            log(TAG) { "registered, already-organized=$appeared" }
-
-            // 4) 创建专属悬浮根（新 API：createTask(TaskCreationParams)）
+            step = "organizer-registration"
+            val lock = XposedHelpers.getObjectField(taskOrganizerController, "mGlobalLock")
+            fun nativeRegistered(): Boolean = synchronized(lock) {
+                val states = XposedHelpers.getObjectField(taskOrganizerController, "mTaskOrganizerStates") as Map<*, *>
+                states.containsKey(organizer.asBinder())
+            }
+            registered = nativeRegistered()
+            if (!registered) {
+                // The native call can register successfully, then fail while enumerating tasks.
+                // Read its actual registry on recovery, rather than repeating a global sweep.
+                XposedHelpers.callMethod(taskOrganizerController, "registerTaskOrganizer", organizer)
+                registered = nativeRegistered()
+                check(registered) { "Native organizer registration did not complete" }
+            }
+            step = "floating-root"
             createFloatingRoot(taskOrganizerController)
-            // Staging is a WM capability. system_server cannot execute an APK's JNI library:
-            // LoS private/system_server.te forbids execution from data_file_type and memfd.
-            // Do not make the already supported entry protocol depend on an app-only probe.
-            log("reYAMF_EntryV2") { "entry backend initialized staging=$canStageInitialPresentation rootReady=${launchRootToken() != null} drawSync=wm-resize loadedBuild=${com.buildsession.betterYAMF.BuildConfig.BUILD_TIME}" }
-        }.onFailure {
-            log(TAG, "init failed", it)
+            check(entryReady) { "Floating root is incomplete" }
+            initialization = "ready"
+            failures = 0
+            lastInitializationFailure = null
+        } catch (error: Throwable) {
+            initialization = "failed:$step"
+            lastInitializationFailure = error
+            logError(TAG, "backend initialization step=$step attempt=${failures + 1} ${readiness()}", error)
+            // Fault recovery only. No animation starts on this timer; completed steps are retained.
+            if (++failures <= 5 && ShellOwnershipServer.ready) {
+                val work = Runnable { retry = null; init() }
+                retry = work
+                callbackHandler.postDelayed(work, (1000L shl (failures - 1)).coerceAtMost(16000L))
+            }
+        } finally {
+            initializing = false
+            publishReadiness()
         }
+    }
+
+    fun shellReadinessChanged(ready: Boolean) {
+        callbackHandler.post {
+            failures = 0
+            if (ready) init() else {
+                retry?.let(callbackHandler::removeCallbacks); retry = null
+                initialization = "waiting-shell-ack"
+                publishReadiness()
+            }
+        }
+    }
+
+    private fun publishReadiness() {
+        val state = readiness()
+        if (state == reportedInitialization) return
+        reportedInitialization = state
+        if (!entryReady) logWarning(TAG, "entry unavailable: $state build=${com.buildsession.betterYAMF.BuildConfig.BUILD_TIME}")
+        else log(TAG) { "entry backend ready: $state build=${com.buildsession.betterYAMF.BuildConfig.BUILD_TIME}" }
+        SmoothWindowBackend.notifyEntryCapabilitiesChanged()
+    }
+
+    /** Task.fillTaskInfo clears/rebuilds cookies in its three-argument implementation. Stamp the
+     * CURRENT WM ownership while still in that call, before any snapshot can reach Shell. The
+     * marker disappears naturally after reparent out; no sticky id cache can misclassify reuse.
+     */
+    private fun hookTaskInfoMarker() {
+        val loader = Instances.systemContext.classLoader
+        val cookies = TaskInfo::class.java.getField("launchCookies")
+        loader.loadClass("com.android.server.wm.Task").getDeclaredMethod("fillTaskInfo", TaskInfo::class.java,
+            Boolean::class.javaPrimitiveType, loader.loadClass("com.android.server.wm.TaskDisplayArea"))
+            .hookAfter { call ->
+                if (call.throwable != null) return@hookAfter
+                runCatching {
+                    val task = call.thisObject
+                    if (ownsNativeTask(task)) {
+                        @Suppress("UNCHECKED_CAST") val list = cookies.get(call.args[0]) as MutableList<android.os.IBinder>
+                        if (!list.contains(ShellOwnershipServer.cookie)) list.add(ShellOwnershipServer.cookie)
+                    }
+                }.onFailure { ShellOwnershipServer.invalidate("TaskInfo ownership marker failed", it) }
+            }
     }
 
     /** LoS WindowContainer:728 revokes the old SC on organizer changes. Hide and position the
@@ -344,22 +453,45 @@ object SmoothTaskOrganizer {
      * 3. **其余调用**（系统正常设置其他 organizer / 置空 setTaskOrganizer(null)）一律不干预。
      */
     private fun hookTaskOrganizerRouting(): Boolean = runCatching {
-        val taskClass = Instances.systemContext.classLoader.loadClass("com.android.server.wm.Task")
-        findMethod(taskClass) {
-            name == "setTaskOrganizer" && paramCount == 2
-        }.hookBefore { param ->
+        val loader = Instances.systemContext.classLoader
+        val taskClass = loader.loadClass("com.android.server.wm.Task")
+        // Warm the generated local Stub before installing callbacks into WM's locked path.
+        val ours = organizer
+        val stateClass = loader.loadClass("com.android.server.wm.TaskOrganizerController\$TaskOrganizerState")
+        val callbacksClass = loader.loadClass("com.android.server.wm.TaskOrganizerController\$TaskOrganizerCallbacks")
+        val stateCallbacks = stateClass.getDeclaredField("mOrganizer").apply { isAccessible = true }
+        val callbackOwner = callbacksClass.getDeclaredField("mTaskOrganizer").apply { isAccessible = true }
+        val snapshot = stateClass.getDeclaredMethod("addTaskWithoutCallback", taskClass, String::class.java).apply { isAccessible = true }
+        val prepare = stateClass.getDeclaredMethod("prepareLeash", taskClass, String::class.java).apply { isAccessible = true }
+        val register = loader.loadClass("com.android.server.wm.TaskOrganizerController")
+            .getDeclaredMethod("registerTaskOrganizer", ITaskOrganizer::class.java).apply { isAccessible = true }
+        // The public getter can be inherited from package-private BaseParceledListSlice.
+        val getList = loader.loadClass("android.content.pm.ParceledListSlice").getMethod("getList")
+            .apply { isAccessible = true }
+        val appeared = loader.loadClass("android.window.TaskAppearedInfo")
+        val getInfo = appeared.getMethod("getTaskInfo")
+        val getLeash = appeared.getMethod("getLeash")
+        val cookies = TaskInfo::class.java.getField("launchCookies")
+        val routing = findMethod(taskClass) { name == "setTaskOrganizer" && paramCount == 2 }.hookBefore { param ->
             runCatching {
                 val task = param.thisObject
                 val taskId = runCatching { XposedHelpers.getIntField(task, "mTaskId") }.getOrDefault(-1)
                 val inOurs = isInOurSubtree(task) || pendingAdoption.contains(taskId)
-                val assigned = param.args[0]
+                val assigned = param.argument(0)
                 when {
+                    // Native detach/removal must be allowed to clear ownership, including an
+                    // organizer-created root. Forcing our owner back here defeats its cleanup.
+                    assigned == null -> Unit
                     inOurs -> {
-                        if (assigned !== organizer) {
-                            param.args[0] = organizer
+                        if (assigned !== ours) {
+                            param.args[0] = ours
                         }
+                        // A Shell registration uses skipTaskAppeared=true and consumes its
+                        // snapshot list. Our redirected tasks are NOT in that list, so deliver
+                        // their callbacks to our owner instead of suppressing them too.
+                        param.args[1] = false
                     }
-                    assigned === organizer -> {
+                    assigned === ours -> {
                         val other = resolveShellOrganizer()
                         if (other != null) {
                             param.args[0] = other
@@ -372,9 +504,67 @@ object SmoothTaskOrganizer {
                 }
             }.onFailure {
                 // Never let an adapter failure turn our registration into a claim on every root.
-                if (param.args[0] === organizer) param.result = false
+                if (param.args[0] === ours) param.result = false
                 logError(TAG, "selective organizer routing failed; preserve native ownership", it)
             }
+        }
+        val additional = mutableListOf<NativeHooks.Registration>()
+        try {
+            additional += NativeHooks.hookMethod(snapshot, object : NativeHooks.Callback() {
+                private fun isOurState(call: NativeHooks.Call) = callbackOwner.get(stateCallbacks.get(call.thisObject)) === ours
+                override fun beforeHookedMethod(call: NativeHooks.Call) {
+                    if (isOurState(call) != ownsNativeTask(call.args[0])) {
+                        // registerTaskOrganizer enumerates ALL organized tasks even after routing.
+                        // Copy its snapshot without changing the wrong state's mOrganizedTasks
+                        // or the task's mTaskAppearedSent. This also protects a new Shell state.
+                        call.result = prepare.invoke(call.thisObject, *call.args)
+                    }
+                }
+                override fun afterHookedMethod(call: NativeHooks.Call) {
+                    if (call.throwable == null)
+                        (call.result as? SurfaceControl)?.let { registrationRead.get()?.leashes?.record(it) }
+                }
+            })
+            additional += NativeHooks.hookMethod(register, object : NativeHooks.Callback() {
+                override fun beforeHookedMethod(call: NativeHooks.Call) {
+                    val scope = RegistrationRead((call.args[0] as ITaskOrganizer).asBinder() == ours.asBinder(), registrationRead.get())
+                    registrationRead.set(scope)
+                    call.setObjectExtra("miwindow.organizerRegistration", scope)
+                }
+                override fun afterHookedMethod(call: NativeHooks.Call) {
+                    val scope = call.getObjectExtra("miwindow.organizerRegistration") as? RegistrationRead ?: return
+                    try {
+                        if (call.throwable == null && call.result != null) {
+                            @Suppress("UNCHECKED_CAST") val list = getList.invoke(call.result) as MutableList<Any>
+                            val iterator = list.iterator()
+                            while (iterator.hasNext()) {
+                                val item = iterator.next()
+                                val info = getInfo.invoke(item)
+                                val owned = (cookies.get(info) as List<*>).contains(ShellOwnershipServer.cookie)
+                                if (scope.toUs != owned) {
+                                    iterator.remove()
+                                    val leash = getLeash.invoke(item) as SurfaceControl
+                                    scope.leashes.discard(leash)
+                                }
+                            }
+                            if (!scope.toUs) {
+                                // Kept snapshots transfer to the native caller/Binder marshaller.
+                                list.forEach { scope.leashes.transfer(getLeash.invoke(it) as SurfaceControl) }
+                            }
+                        }
+                    } catch (error: Throwable) {
+                        if (!scope.toUs && call.throwable == null && call.result != null)
+                            scope.leashes.preserveUncertainReturn()
+                        ShellOwnershipServer.invalidate("Organizer snapshot isolation failed", error)
+                    } finally {
+                        // Our local registration consumes no returned snapshot; failures also
+                        // retire copies not handed to the caller. Never release WM's own leash.
+                        try { scope.leashes.close() } finally { registrationRead.set(scope.previous) }
+                    }
+                }
+            })
+        } catch (error: Throwable) {
+            additional.asReversed().forEach { it.unhook() }; routing.unhook(); throw error
         }
         log(TAG) { "task organizer routing hook installed" }
         true
@@ -408,18 +598,19 @@ object SmoothTaskOrganizer {
                 }
             }
             log(TAG) { "rounded-corner opt gate hook installed" }
+            cornerGateInstalled = true
         }.onFailure {
             log(TAG, "rounded-corner opt gate hook install failed", it)
         }
     }
 
     private fun isInOurSubtree(task: Any): Boolean {
-        if (floatingRootTaskId < 0) return false
         var current: Any? = task
         var guard = 0
         while (current != null && guard++ < 16) {
             val id = runCatching { XposedHelpers.getIntField(current, "mTaskId") }.getOrDefault(-1)
-            if (id == floatingRootTaskId) return true
+            if (id > 0 && id == floatingRootTaskId ||
+                XposedHelpers.getObjectField(current, "mLaunchCookie") == ShellOwnershipServer.cookie) return true
             current = runCatching { XposedHelpers.callMethod(current, "getParent") }.getOrNull()?.let { parent ->
                 runCatching { XposedHelpers.callMethod(parent, "asTask") }.getOrNull()
             }
@@ -428,96 +619,120 @@ object SmoothTaskOrganizer {
     }
 
     private fun createFloatingRoot(taskOrganizerController: Any) {
-        runCatching {
+        rootInitializationStep = "check-shell"
+        check(ShellOwnershipServer.ready)
+        rootInitializationStep = "validate-existing-root"
+        if (floatingRootToken != null && resolveTaskByToken(floatingRootToken) == null) {
+            retireFloatingRoot()
+        }
+        if (floatingRootToken == null) {
+            rootInitializationStep = "scan-cookie-owned-roots"
+            // A prior createTask may have created the native root before a local copy/setup failed.
+            // Recover that cookie-owned root instead of leaving an orphan and creating another.
+            val roots = XposedHelpers.callMethod(taskOrganizerController, "getRootTasks", 0, null) as List<*>
+            val existing = roots.filterIsInstance<ActivityManager.RunningTaskInfo>().firstOrNull { info ->
+                resolveTaskByToken(XposedHelpers.getObjectField(info, "token"))?.let { task ->
+                    XposedHelpers.getObjectField(task, "mLaunchCookie") == ShellOwnershipServer.cookie
+                } == true
+            }
+            if (existing != null) {
+                floatingRootTaskId = existing.taskId
+                floatingRootToken = XposedHelpers.getObjectField(existing, "token")
+            }
+        }
+        if (floatingRootToken == null) {
+            rootInitializationStep = "build-task-params"
             val classLoader = Instances.systemContext.classLoader
             val builderClass = classLoader.loadClass("android.window.TaskCreationParams\$Builder")
             val builder = XposedHelpers.newInstance(builderClass)
             XposedHelpers.callMethod(builder, "setName", "reYAMF_floating_root")
             XposedHelpers.callMethod(builder, "setDisplayId", 0)
             XposedHelpers.callMethod(builder, "setWindowingMode", WINDOWING_MODE_FREEFORM)
-            runCatching { XposedHelpers.callMethod(builder, "setLaunchCookie", Binder()) }
+            XposedHelpers.callMethod(builder, "setLaunchCookie", ShellOwnershipServer.cookie)
             val params = XposedHelpers.callMethod(builder, "build")
 
-            val appearedInfo = XposedHelpers.callMethod(taskOrganizerController, "createTask", params)
-            if (appearedInfo == null) {
-                logError(TAG, "createTask returned null")
-                return
+            rootInitializationStep = "create-native-task"
+            val appearedInfo = checkNotNull(XposedHelpers.callMethod(taskOrganizerController, "createTask", params)) {
+                "createTask returned null (display/freeform/organizer prerequisites)"
             }
             val taskInfo = XposedHelpers.callMethod(appearedInfo, "getTaskInfo") as ActivityManager.RunningTaskInfo
             val rawLeash = XposedHelpers.callMethod(appearedInfo, "getLeash") as SurfaceControl
-            // 本地直调时 createTask 返回的 leash 不会被 WM 释放；仍统一收编为自持句柄并释放原句柄，
-            // 保证全链路只有"我们自己的句柄"一种来源。
-            val owned = ownLeash(rawLeash) ?: rawLeash
-            if (owned !== rawLeash) releaseQuietly(rawLeash)
+            // Record the native identity before any fallible local setup.
             floatingRootTaskId = taskInfo.taskId
             floatingRootToken = XposedHelpers.getObjectField(taskInfo, "token")
-            leashes[floatingRootTaskId] = owned
-            floatingRootLeash = owned
+            rootInitializationStep = "retain-and-hide-root-leash"
+            try {
+                val owned = checkNotNull(ownLeash(rawLeash))
+                // Hide the empty container before fallible organizer/AOT setup. A failed setup
+                // must not leave a top-level black container covering the current application.
+                try { SurfaceControl.Transaction().use { tx -> XposedHelpers.callMethod(tx, "hide", owned); tx.apply() } }
+                catch (error: Throwable) { releaseQuietly(owned); throw error }
+                bindRootLeash(owned)
+            }
+            finally { releaseQuietly(rawLeash) }
             log(TAG) { "floating root created task=$floatingRootTaskId" }
-
-            // 显式让悬浮根归属我们：注册发生在 SystemUI(shell) 之前，且 isInOurSubtree 依赖
-            // floatingRootTaskId（此时已写入），可稳定通过路由钩子；否则 root 会以"未 organized"
-            // 状态存在——WCT.reorder 会被 sanitizeTransaction 剥掉、表面语义依靠 WM 默认行为。
-            runCatching {
-                val rootTask = resolveTaskByToken(floatingRootToken)
-                if (rootTask != null) {
-                    XposedHelpers.callMethod(rootTask, "updateTaskOrganizerState")
-                    log(TAG) { "floating root organizer state ensured" }
-                } else {
-                    logWarning(TAG, "floating root task object unresolved")
-                }
-            }.onFailure {
-                log(TAG, "ensure floating root organizer state failed", it)
+        }
+        rootInitializationStep = "validate-root-organizer"
+        val rootTask = checkNotNull(resolveTaskByToken(floatingRootToken)) { "Floating root token is stale" }
+        val wm = XposedHelpers.getObjectField(rootTask, "mWmService")
+        synchronized(XposedHelpers.getObjectField(wm, "mGlobalLock")) {
+            if (XposedHelpers.callMethod(rootTask, "getParent") == null) {
+                retireFloatingRoot()
+                throw IllegalStateException("Floating root detached during initialization")
             }
-
-            // 置顶身份：把承载根声明为 always-on-top（TaskDisplayArea 优先级 1——低于 PiP/Dream、
-            // 高于一切普通任务）。系统层序规则（getPriority + findPositionForRootTask 夹取）
-            // 保证 home/recents/新应用前置时都只能插到我们之下：浮窗"全局置顶"从此是
-            // 一次声明的身份，而不是每次抢层（reorder/moveTaskToFront）——后者正是此前与
-            // recents 手势/过渡互相打断的根源。宿主侧 keepAboveHome 会据此让路。
-            runCatching {
-                val token = floatingRootToken
-                if (token != null) {
-                    val wct = newWct()
-                    val tokenClass = Instances.systemContext.classLoader
-                        .loadClass("android.window.WindowContainerToken")
-                    XposedHelpers.callMethod(
-                        wct, "setAlwaysOnTop",
-                        arrayOf(tokenClass, java.lang.Boolean.TYPE), token, true
-                    )
-                    // "重新启动即摘出会话根"（平台官方语义，TaskDisplayArea#getOrCreateRootTask:821-848
-                    // 消费该身份：reparentToTda 判定 → candidateTask.reparent(默认TDA)）：
-                    // - mReparentLeafTaskIfRelaunch：任意来源 relaunch 根内任务 → 自动摘回默认 TDA
-                    //   （= 退出小窗回全屏）；
-                    // - ...FromHome：桌面（最近任务点击/图标点击等）发起的 relaunch 同样生效。
-                    // 随后由 onTaskVanished → 宿主 onDestroy → releaseTask 收尾（回全屏迁移），
-                    // 实现"最近任务点一下 = 结束小窗、切回应用本体"。
-                    XposedHelpers.callMethod(
-                        wct, "setReparentLeafTaskIfRelaunch",
-                        arrayOf(tokenClass, java.lang.Boolean.TYPE), token, true
-                    )
-                    XposedHelpers.callMethod(
-                        wct, "setReparentLeafTaskIfRelaunchFromHome",
-                        arrayOf(tokenClass, java.lang.Boolean.TYPE), token, true
-                    )
-                    applyWct(wct)
-                    rootAlwaysOnTop = true
-                    log(TAG) { "floating root always-on-top + reparentIfRelaunch applied task=$floatingRootTaskId" }
-                }
-            }.onFailure {
-                log(TAG, "floating root always-on-top failed", it)
+            XposedHelpers.callMethod(rootTask, "updateTaskOrganizerState")
+            if (XposedHelpers.getObjectField(rootTask, "mTaskOrganizer") !== organizer)
+                XposedHelpers.callMethod(rootTask, "setTaskOrganizer", organizer, false)
+            check(XposedHelpers.getObjectField(rootTask, "mTaskOrganizer") === organizer) { "Floating root organizer mismatch" }
+            if (floatingRootLeash?.isValid != true) {
+                val current = XposedHelpers.callMethod(rootTask, "getSurfaceControl") as? SurfaceControl
+                bindRootLeash(checkNotNull(ownLeash(current)))
             }
+        }
 
-            // 空根先隐藏（空 container 若在最上层会整屏渲染成黑色遮住一切），
-            // 认领第一个窗口时才 reorder(onTop)+show。
-            runCatching {
-                SurfaceControl.Transaction().use { tx ->
-                    XposedHelpers.callMethod(tx, "hide", owned)
-                    tx.apply()
-                }
-            }
-        }.onFailure {
-            log(TAG, "createFloatingRoot failed", it)
+        // TaskDisplayArea priority 1 keeps the root above ordinary tasks and below PiP/Dream.
+        // Establish this once; per-frame reorder/moveTaskToFront would fight native recents.
+        if (!rootAlwaysOnTop) {
+            rootInitializationStep = "configure-root-hierarchy"
+            val token = checkNotNull(floatingRootToken)
+            val wct = newWct()
+            val tokenClass = Instances.systemContext.classLoader.loadClass("android.window.WindowContainerToken")
+            XposedHelpers.callMethod(wct, "setAlwaysOnTop", arrayOf(tokenClass, java.lang.Boolean.TYPE), token, true)
+            // TaskDisplayArea#getOrCreateRootTask honors these on relaunch: recent/icon launches
+            // leave our root, and the normal ownership-lost path retires the old window host.
+            XposedHelpers.callMethod(wct, "setReparentLeafTaskIfRelaunch",
+                arrayOf(tokenClass, java.lang.Boolean.TYPE), token, true)
+            XposedHelpers.callMethod(wct, "setReparentLeafTaskIfRelaunchFromHome",
+                arrayOf(tokenClass, java.lang.Boolean.TYPE), token, true)
+            applyWct(wct)
+            check(floatingRootToken === token) { "Floating root changed during setup" }
+            rootAlwaysOnTop = true
+            log(TAG) { "floating root always-on-top + reparentIfRelaunch applied task=$floatingRootTaskId" }
+        }
+        rootInitializationStep = "update-root-visibility"
+        updateRootVisibility()
+        rootInitializationStep = "ready"
+    }
+
+    private fun bindRootLeash(owned: SurfaceControl) {
+        val previous = floatingRootLeash
+        val old = leashes.put(floatingRootTaskId, owned)
+        floatingRootLeash = owned
+        if (old !== owned) releaseQuietly(old)
+        if (previous !== owned && previous !== old) releaseQuietly(previous)
+    }
+
+    private fun retireFloatingRoot() {
+        rootInitializationStep = "retired"
+        val previous = floatingRootLeash
+        val old = leashes.remove(floatingRootTaskId)
+        floatingRootLeash = null; floatingRootToken = null; floatingRootTaskId = -1; rootAlwaysOnTop = false
+        releaseQuietly(old)
+        if (previous !== old) releaseQuietly(previous)
+        adoptedTasks.toList().forEach { child ->
+            val layout = overrideLeases[child]
+            forgetTask(child)
+            SmoothWindowBackend.notifyTaskVanished(child, layout)
         }
     }
 
@@ -586,7 +801,7 @@ object SmoothTaskOrganizer {
 
     /** 把"最后注册者语义"的全局回调原样转交系统壳（见 [resolveShellOrganizer]）。 */
     private fun forwardToShell(name: String, args: Array<Any?>) {
-        val shell = resolveShellOrganizer() ?: previousOrganizer
+        val shell = resolveShellOrganizer()
         if (shell == null) {
             logWarning(TAG, "forward $name skipped: no shell organizer")
             return
@@ -605,10 +820,14 @@ object SmoothTaskOrganizer {
                 val info = args.getOrNull(0) as? ActivityManager.RunningTaskInfo ?: return
                 val leash = args.getOrNull(1) as? SurfaceControl ?: return
                 val taskId = info.taskId
+                if (taskId == floatingRootTaskId && !matchesRootToken(info)) return
                 // 必须在回调同步期内复制句柄：WM 在回调返回后立即 release 传入对象（见 ownLeash 注释）
                 val owned = ownLeash(leash) ?: run {
                     leashes.remove(taskId)?.let(::releaseQuietly)
-                    if (taskId == floatingRootTaskId) floatingRootLeash = null
+                    if (taskId == floatingRootTaskId) {
+                        floatingRootLeash = null
+                        callbackHandler.post { init() }
+                    }
                     return
                 }
                 when {
@@ -619,6 +838,7 @@ object SmoothTaskOrganizer {
                         floatingRootLeash = owned
                         if (prev !== owned && prev !== old) releaseQuietly(prev)
                         log(TAG) { "floating root leash appeared" }
+                        callbackHandler.post { init() }
                     }
                     adoptedTasks.contains(taskId) -> {
                         leashes.put(taskId, owned)?.let { old -> if (old !== owned) releaseQuietly(old) }
@@ -639,6 +859,7 @@ object SmoothTaskOrganizer {
             "onTaskVanished" -> {
                 val info = args.getOrNull(0) as? ActivityManager.RunningTaskInfo ?: return
                 val taskId = info.taskId
+                if (taskId == floatingRootTaskId && !matchesRootToken(info)) return
                 if (adoptionsInProgress.contains(taskId)) {
                     // The next adoption publishes its records before its WCT. An older queued
                     // vanish must be rechecked after that call returns, not revoke those records.
@@ -648,6 +869,12 @@ object SmoothTaskOrganizer {
                 // An organizer callback may be queued across a new adoption. Re-read native
                 // ownership rather than revoking the new session from the old TaskInfo snapshot.
                 if (isCurrentlyOurTask(info)) return
+                if (taskId == floatingRootTaskId) {
+                    logError(TAG, "floating root vanished; invalidate its remaining hosts")
+                    retireFloatingRoot()
+                    callbackHandler.post { failures = 0; init() }
+                    return
+                }
                 val wasAdopted = adoptedTasks.remove(taskId)
                 val lostLayout = overrideLeases.remove(taskId)
                 leashes.remove(taskId)?.let(::releaseQuietly)
@@ -656,18 +883,6 @@ object SmoothTaskOrganizer {
                 shapedTasks.remove(taskId)
                 originalParentTokens.remove(taskId)
                 lastLeashWriteLogAt.remove(taskId)
-                if (taskId == floatingRootTaskId) {
-                    floatingRootLeash = null
-                    floatingRootToken = null
-                    floatingRootTaskId = -1
-                    rootAlwaysOnTop = false
-                    logError(TAG, "floating root vanished; invalidate its remaining hosts")
-                    adoptedTasks.toList().forEach { child ->
-                        val layout = overrideLeases[child]
-                        forgetTask(child)
-                        SmoothWindowBackend.notifyTaskVanished(child, layout)
-                    }
-                }
                 if (wasAdopted) {
                     updateRootVisibility()
                     if (releasingTasks.contains(taskId)) {
@@ -709,12 +924,12 @@ object SmoothTaskOrganizer {
     fun adoptTask(taskId: Int, initialBounds: Rect? = null, selectedLogicalBounds: Rect? = null): Boolean {
         check(adoptionsInProgress.add(taskId)) { "Task adoption is already in progress: $taskId" }
         return try { performAdoption(taskId, initialBounds, selectedLogicalBounds) }
-        finally { adoptionsInProgress.remove(taskId) }
+        finally { pendingAdoption.remove(taskId); adoptionsInProgress.remove(taskId) }
     }
 
     private fun performAdoption(taskId: Int, initialBounds: Rect?, selectedLogicalBounds: Rect?): Boolean {
         if (taskId <= 0 || isFloatingRootTask(taskId)) return false
-        if (!registered) return false
+        if (!entryReady) return false
         if (initialBounds != null && !canStageInitialPresentation) return false
         if (adoptedTasks.contains(taskId) && leashes[taskId]?.isValid == true) {
             // Replacing a shell must not reshape an already-owned application's viewport.
@@ -756,6 +971,9 @@ object SmoothTaskOrganizer {
             // A supplied initial viewport is laid out once in this same adoption WCT.
             logicalBounds[taskId] = bounds
             shapedTasks.remove(taskId)
+            // Publish ownership only after callback geometry/staging is ready. WCT applies
+            // configuration before hierarchy, so keep this marker for its whole native call.
+            pendingAdoption.add(taskId)
 
             try {
                 // A17 的 sanitizeTransaction 会静默剥掉一切指向"未 organized"容器的 WCT 操作
@@ -769,13 +987,8 @@ object SmoothTaskOrganizer {
                         WindowRect(bounds.left, bounds.top, bounds.right, bounds.bottom))
                     FreeformBackend.rememberTask(taskId, task)
                     if (!isTaskOrganized(task)) {
-                        pendingAdoption.add(taskId)
-                        try {
-                            runCatching { XposedHelpers.callMethod(task, "updateTaskOrganizerState") }
-                                .onFailure { log(TAG, "updateTaskOrganizerState failed task=$taskId", it) }
-                        } finally {
-                            pendingAdoption.remove(taskId)
-                        }
+                        runCatching { XposedHelpers.callMethod(task, "updateTaskOrganizerState") }
+                            .onFailure { log(TAG, "updateTaskOrganizerState failed task=$taskId", it) }
                         if (!isTaskOrganized(task)) {
                             logError(TAG, "ERROR adoptTask task=$taskId cannot be organized (no fallback), abort")
                             adoptedTasks.remove(taskId)
@@ -1380,6 +1593,12 @@ object SmoothTaskOrganizer {
                 XposedHelpers.getObjectField(task, "mTaskOrganizer") === organizer
         }
     }.onFailure { logWarning(TAG, "cannot read current vanished-task ownership task=${info.taskId}", it) }.getOrDefault(false)
+
+    private fun matchesRootToken(info: ActivityManager.RunningTaskInfo): Boolean {
+        val current = floatingRootToken ?: return true
+        val reported = XposedHelpers.getObjectField(info, "token") ?: return false
+        return XposedHelpers.callMethod(reported, "asBinder") == XposedHelpers.callMethod(current, "asBinder")
+    }
 
     /** The old leash was revoked by WM. Reconcile only a still-matching session viewport under
      * the WM lock; do not reparent/reorder, force fullscreen, or reset the new owner's surface.

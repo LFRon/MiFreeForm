@@ -1,2 +1,3 @@
 com.buildsession.betterYAMF.xposed.hook.HookSystem
 com.buildsession.betterYAMF.xposed.hook.HookLauncher
+com.buildsession.betterYAMF.xposed.hook.HookShell

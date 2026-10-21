@@ -12,6 +12,18 @@ internal data class AdapterIdentity(
     val launcherVersionCode: Long? = null
 )
 
+/** Current user's Home and the configured Quickstep host are separate platform facts.
+ * A ROM label or an installed (but unused) Launcher cannot substitute for either fact.
+ */
+internal data class LauncherRuntimeIdentity(
+    val sdk: Int,
+    val packageName: String,
+    val processName: String,
+    val launcherVersionCode: Long?,
+    val defaultHomePackage: String?,
+    val recentsPackage: String?
+)
+
 /** A concrete Android-major + Launcher implementation. install executes ordinary Hook code. */
 internal interface LauncherAdapter {
     val identity: AdapterIdentity

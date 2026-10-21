@@ -22,14 +22,18 @@ private class LauncherEntryRuntime(private val scheduler: RuntimeScheduler,
         val epoch = cancellationEpoch
         var disposition = EntryDisposition.PASS_THROUGH
         try {
-            // The candidate result supersedes the pre-query visual from this same input turn.
             var visual: EntryTargetFrame? = null
-            for (effect in core.input(input)) {
+            val effects = ArrayDeque(core.input(input))
+            while (effects.isNotEmpty()) {
+                val effect = effects.removeFirst()
                 if (epoch != cancellationEpoch) return disposition
                 when (effect) {
                     RecentsEntryEffect.QueryCandidate -> {
                         val candidate = port.candidate()
-                        if (epoch == cancellationEpoch) visual = core.candidate(candidate)
+                        if (epoch != cancellationEpoch) return disposition
+                        val caps = port.capabilities
+                        if (epoch == cancellationEpoch)
+                            core.candidate(candidate, caps).asReversed().forEach(effects::addFirst)
                     }
                     is RecentsEntryEffect.Present -> if (visual == null) visual = effect.frame
                     is RecentsEntryEffect.Suppress -> port.suppressNativeGesture(effect.durationMs)
