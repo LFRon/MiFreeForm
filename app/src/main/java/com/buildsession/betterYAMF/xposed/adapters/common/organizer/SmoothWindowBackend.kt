@@ -49,7 +49,8 @@ object SmoothWindowBackend : WindowBackend {
     /** Reconstructible presentation cache. Transition reassertions must preserve opacity/corners. */
     data class Appearance(
         val cornerRadiusPx: Float = 0f, val alpha: Float = 1f,
-        val contentAlignment: ContentAlignment = ContentAlignment.CENTER
+        val contentAlignment: ContentAlignment = ContentAlignment.CENTER,
+        val visible: Boolean = true, val focusable: Boolean = true
     )
     private val appearanceByTask = ConcurrentHashMap<Int, Appearance>()
     fun appearanceOf(taskId: Int): Appearance = appearanceByTask[taskId] ?: Appearance()
@@ -312,12 +313,18 @@ object SmoothWindowBackend : WindowBackend {
         physicalBounds: Rect,
         cornerRadiusPx: Float,
         alpha: Float,
-        contentAlignment: ContentAlignment
+        contentAlignment: ContentAlignment,
+        visible: Boolean,
+        focusable: Boolean
     ): Boolean {
         if (!SmoothTaskOrganizer.isLeashManaged(taskId)) return false
+        // A native reset invalidates execution facts as well as geometry. Recheck suppression
+        // once for that event; the desired cache alone cannot prove the native field survived.
+        if ((appearanceOf(taskId).focusable != focusable || !focusable && invalidatedPresentations.contains(taskId)) &&
+            !SmoothTaskOrganizer.setPresentationFocusable(taskId, focusable)) return false
         invalidatedPresentations.remove(taskId)
         geometryByTask[taskId] = Rect(physicalBounds)
-        appearanceByTask[taskId] = Appearance(cornerRadiusPx, alpha.coerceIn(0f, 1f), contentAlignment)
+        appearanceByTask[taskId] = Appearance(cornerRadiusPx, alpha.coerceIn(0f, 1f), contentAlignment, visible, focusable)
         return SmoothTaskOrganizer.writeLeashTransformInto(tx, taskId, physicalBounds)
     }
 

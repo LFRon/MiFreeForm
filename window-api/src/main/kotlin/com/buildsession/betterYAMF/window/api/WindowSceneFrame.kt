@@ -30,6 +30,14 @@ enum class ContentAlignment { CENTER, TOP }
  */
 data class EntryImageVisual(val bounds: SceneRect, val clip: SceneRect, val featherPx: Float)
 
+/** Application icon during side collapse/restoration. Display pixels; bounds may extend beyond
+ * the display. Alpha and geometry are complete CORE outputs, not an animation for AD to start.
+ * The icon belongs to the same task/session; presenting it must not launch another Activity.
+ */
+data class SideStashVisual(
+    val side: WindowSide, val bounds: SceneRect, val cornerRadius: Float, val alpha: Float
+)
+
 /** Visual bridge, in display pixels. Its opacity and geometry are solved by CORE. */
 enum class FullscreenStage { DRAGGING, RETURNING, COVERING, HIDING, EXPANDING, WAITING, REVEALING, FINISHED }
 
@@ -102,6 +110,18 @@ data class WindowSceneFrame(
     val entryImage: EntryImageVisual? = null,
     /** Source and task cover the same content viewport with the same alignment. */
     val contentAlignment: ContentAlignment = ContentAlignment.CENTER,
+    /** Decoration opacity, including collapse into a side icon; excludes the icon itself. */
+    val shellAlpha: Float = alpha,
+    val sideStash: SideStashVisual? = null,
+    /** False hides the owned content subtree, including its native touch targets. Ownership,
+     * logical viewport and WM task visibility are retained; this is not task release/backgrounding.
+     * Must be applied in the same presentation transaction as the matching shell buffer.
+     */
+    val taskVisible: Boolean = true,
+    /** Permission to focus, not a request to steal focus. Restore only this session's suppression;
+     * native policy may still prevent focus. Input reopening follows a committed restoration frame.
+     */
+    val taskFocusable: Boolean = true,
     val input: SceneInput = SceneInput.EMPTY,
     val coordinateSpace: SceneMetrics
 )

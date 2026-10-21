@@ -6,10 +6,13 @@ enum class RegionId {
     BAR_BOTTOM,
     BAR_SIDE,
     RESIZE_HANDLE,
-    CONTENT
+    CONTENT,
+    /** Side icon activation. Press/Up within tap slop restores; never drags or flings a task. */
+    STASH_HANDLE
 }
 
 enum class DropKind { CORNER_TL, CORNER_TR, CORNER_BL, CORNER_BR, SIDE_LEFT, SIDE_RIGHT }
+enum class WindowSide { LEFT, RIGHT }
 
 /** Display pixels and monotonic uptime milliseconds; fling velocity uses pixels/second. */
 sealed interface WindowInputEvent {

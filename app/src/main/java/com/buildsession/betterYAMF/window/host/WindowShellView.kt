@@ -151,7 +151,7 @@ internal class WindowShellView(context: Context, private val style: SceneStyle) 
         ring.addRoundRect(content, f.contentRadius, f.contentRadius, Path.Direction.CW)
         fun channel(start: Int) = (start + (224f - start) * f.miniFraction).roundToInt()
         paint.color = Color.rgb(channel(Color.red(f.controllerColor)), channel(Color.green(f.controllerColor)), channel(Color.blue(f.controllerColor)))
-        paint.alpha = (f.alpha * 255f).roundToInt().coerceIn(0, 255)
+        paint.alpha = (f.shellAlpha * 255f).roundToInt().coerceIn(0, 255)
         paint.style = Paint.Style.FILL
         canvas.drawPath(ring, paint)
 
@@ -176,7 +176,41 @@ internal class WindowShellView(context: Context, private val style: SceneStyle) 
             canvas.drawRoundRect(cx - halfWidth, cy - halfHeight, cx + halfWidth, cy + halfHeight, halfWidth, halfWidth, paint)
         }
         drawFullscreenBridge(canvas, f)
+        drawSideStash(canvas, f)
         paint.alpha = 255
+        canvas.restoreToCount(save)
+    }
+
+    private fun drawSideStash(canvas: Canvas, frame: WindowSceneFrame) {
+        val stash = frame.sideStash ?: return
+        if (stash.alpha <= 0f) return
+        val b = stash.bounds.rounded()
+        bridgeBounds.set(b.left.toFloat(), b.top.toFloat(), b.right.toFloat(), b.bottom.toFloat())
+        val save = canvas.save()
+        imageClip.rewind()
+        imageClip.addRoundRect(bridgeBounds, stash.cornerRadius, stash.cornerRadius, Path.Direction.CW)
+        canvas.clipPath(imageClip)
+        // Group opacity keeps drawable + background from building up during the crossfade.
+        val layer = if (stash.alpha < 1f)
+            canvas.saveLayerAlpha(bridgeBounds, (stash.alpha * 255f).roundToInt().coerceIn(0, 255))
+            else canvas.save()
+        paint.style = Paint.Style.FILL
+        paint.color = 0xFFF7F7F7.toInt()
+        paint.alpha = 255
+        canvas.drawRoundRect(bridgeBounds, stash.cornerRadius, stash.cornerRadius, paint)
+        val icon = applicationIcon
+        if (icon != null) {
+            icon.setBounds(b.left, b.top, b.right, b.bottom)
+            icon.alpha = 255
+            icon.draw(canvas)
+        } else {
+            // A package/icon lookup failure still leaves a visible, usable restore control.
+            paint.color = 0xFF538AD8.toInt()
+            val inset = bridgeBounds.width() * 0.22f
+            canvas.drawRoundRect(bridgeBounds.left + inset, bridgeBounds.top + inset,
+                bridgeBounds.right - inset, bridgeBounds.bottom - inset, inset / 3f, inset / 3f, paint)
+        }
+        canvas.restoreToCount(layer)
         canvas.restoreToCount(save)
     }
 

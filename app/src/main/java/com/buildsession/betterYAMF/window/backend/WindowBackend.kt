@@ -88,6 +88,10 @@ interface WindowBackend {
      * Guarantees: uniform content scale, crop filling the visible rectangle, visual-pixel corner
      * radius, crop alignment and common opacity. Subsequent frames never resize the app's logical
      * viewport. TOP keeps its top edge fixed while the visual viewport changes aspect.
+     * [visible] also controls the entire content subtree's native touch visibility. It does not
+     * change WM task visibility or release ownership. [focusable] permits focus; false temporarily
+     * suppresses it, true restores only this adoption's suppression using the native lifecycle path.
+     * Visibility shares this transaction. Focus is reconciled only when the requested value changes.
      * Returns false if these guarantees cannot be supplied; no independent fallback transaction.
      */
     fun writePresentationInto(
@@ -96,7 +100,9 @@ interface WindowBackend {
         physicalBounds: Rect,
         cornerRadiusPx: Float,
         alpha: Float,
-        contentAlignment: ContentAlignment = ContentAlignment.CENTER
+        contentAlignment: ContentAlignment = ContentAlignment.CENTER,
+        visible: Boolean = true,
+        focusable: Boolean = true
     ): Boolean
 
     /**

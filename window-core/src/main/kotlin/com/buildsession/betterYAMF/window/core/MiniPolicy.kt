@@ -3,7 +3,8 @@ package com.buildsession.betterYAMF.window.core
 import com.buildsession.betterYAMF.window.api.*
 
 /**
- * mini/贴边几何策略（纯逻辑，零平台依赖；宿主只负责传值与执行）。
+ * mini 槽位几何策略（纯逻辑，零平台依赖；宿主只负责传值与执行）。
+ * 左右投放的图标收起由 SideStashPolicy 处理，不走此处的缩略图槽位。
  *
  * 模型（参考澎湃OS 帧_02/帧_05）：**mini 与展开态是同一 UI 的纯缩放——宽高比完全一致**。
  * mini 尺寸 = 当前窗口内容区等比缩放到磁吸槽位（屏宽 28.5% × 屏高 20%，按"填满槽位"的

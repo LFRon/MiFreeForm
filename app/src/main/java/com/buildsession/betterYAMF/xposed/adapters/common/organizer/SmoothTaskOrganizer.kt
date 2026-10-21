@@ -1234,9 +1234,40 @@ object SmoothTaskOrganizer {
         // transition cleanup guard / release). These are SF-only corners, never app-owned pixels.
         XposedHelpers.callMethod(tx, "setCornerRadius", leash, transform.cornerRadius)
         tx.setAlpha(leash, appearance.alpha)
-        XposedHelpers.callMethod(tx, "show", leash)
+        XposedHelpers.callMethod(tx, if (appearance.visible) "show" else "hide", leash)
         return true
     }
+
+    /** LOS 24.0 WCT#setFocusable -> WOC#applyChanges (CHANGE_FOCUSABLE) -> lifecycle /
+     * traversal. WindowContainer#setFocusable alone changes only a field, leaving InputMonitor
+     * and focused activity stale. Only mode boundaries call this; no reflection/IPC per frame.
+     * Surface hiding stays in the caller's synchronized frame transaction, never WCT#setHidden.
+     */
+    internal fun setPresentationFocusable(taskId: Int, focusable: Boolean): Boolean = runCatching {
+        val lease = overrideLeases[taskId] ?: return false
+        val task = lease.task
+        val wm = XposedHelpers.getObjectField(task, "mWmService")
+        synchronized(XposedHelpers.getObjectField(wm, "mGlobalLock")) {
+            if (overrideLeases[taskId] !== lease || !isLeashManaged(taskId) || !isInOurSubtree(task)) return false
+            val current = XposedHelpers.getBooleanField(task, "mIsFocusable")
+            if (focusable && !lease.focusSuppressed) return true
+            if (current == focusable) {
+                if (focusable) lease.focusSuppressed = false
+                return true
+            }
+            val info = taskInfoById(taskId) ?: return false
+            val token = XposedHelpers.getObjectField(info, "token")
+            if (resolveTaskByToken(token) !== task) return false
+            val wct = newWct()
+            XposedHelpers.callMethod(wct, "setFocusable", token, focusable)
+            // Remember before apply: cleanup must cover an exception after partial native work.
+            if (!focusable) lease.focusSuppressed = true
+            applyWct(wct)
+            if (focusable) lease.focusSuppressed = false
+            log(TAG) { "presentation focus allowed=$focusable task=$taskId" }
+            true
+        }
+    }.onFailure { logError(TAG, "presentation focus failed task=$taskId allowed=$focusable", it) }.getOrDefault(false)
 
     /**
      * 静止结算（ColorOS 16 缩放逻辑 / 澎湃OS3 小窗观感）：
@@ -1418,7 +1449,6 @@ object SmoothTaskOrganizer {
         runCatching {
             SurfaceControl.Transaction().use { tx ->
                 if (!writeLeashTransform(tx, taskId, leash, logical, physical)) return@runCatching
-                XposedHelpers.callMethod(tx, "show", leash)
                 tx.apply()
             }
             if (com.buildsession.betterYAMF.BuildConfig.DEBUG) {
@@ -1550,6 +1580,7 @@ object SmoothTaskOrganizer {
     }
 
     fun showLeash(taskId: Int) {
+        if (!SmoothWindowBackend.appearanceOf(taskId).visible) return
         val leash = leashes[taskId] ?: return
         runCatching {
             SurfaceControl.Transaction().use { tx ->
@@ -1618,12 +1649,18 @@ object SmoothTaskOrganizer {
             val wc = XposedHelpers.getObjectField(configuration, "windowConfiguration")
             val mode = XposedHelpers.callMethod(wc, "getWindowingMode") as Int
             val restore = lease.restoration(currentTask,
-                WindowRect(bounds.left, bounds.top, bounds.right, bounds.bottom), mode) ?: return
+                WindowRect(bounds.left, bounds.top, bounds.right, bounds.bottom), mode)
+            val restoreFocus = lease.canRestoreFocus(currentTask, XposedHelpers.getBooleanField(currentTask, "mIsFocusable"))
+            if (restore == null && !restoreFocus) return
             val wct = newWct()
-            XposedHelpers.callMethod(wct, "setBounds", token, Rect())
-            if (restore.clearFreeformMode) XposedHelpers.callMethod(wct, "setWindowingMode", token, 0)
+            if (restore != null) {
+                XposedHelpers.callMethod(wct, "setBounds", token, Rect())
+                if (restore.clearFreeformMode) XposedHelpers.callMethod(wct, "setWindowingMode", token, 0)
+            }
+            if (restoreFocus) XposedHelpers.callMethod(wct, "setFocusable", token, true)
             applyWct(wct)
-            log(TAG) { "retired viewport task=$taskId inheritedMode=${restore.clearFreeformMode}" }
+            if (restoreFocus) lease.focusSuppressed = false
+            log(TAG) { "retired viewport task=$taskId inheritedMode=${restore?.clearFreeformMode} focus=$restoreFocus" }
         }
     }
 

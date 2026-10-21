@@ -67,6 +67,7 @@ class AppWindow(val context: Context, private val onWindowInit: (WindowHost, Int
     private var launcherRotation = -1
     private var frameResults = 0
     private var loggedFullscreenStage: FullscreenStage? = null
+    private var loggedSideStash: String? = null
     private var entryVisualLogged: String? = null
     private var stagedEntry = false
     private val style = SceneStyle(context.resources.displayMetrics.density,
@@ -122,11 +123,19 @@ class AppWindow(val context: Context, private val onWindowInit: (WindowHost, Int
                     loggedFullscreenStage = frame.fullscreen?.stage
                     log(TAG) { "fullscreen stage=$loggedFullscreenStage window=$windowId frame=${submission.frameId}" }
                 }
+                if (BuildConfig.DEBUG) {
+                    val state = frame.sideStash?.let { "${it.side}:${if (frame.taskVisible) "transition" else "hidden"}" }
+                    if (state != loggedSideStash) {
+                        loggedSideStash = state
+                        log(TAG) { "side stash=$state session=${runtime.session} task=$currentTaskId frame=${submission.frameId}" }
+                    }
+                }
                 view.render(frame)
                 synchronizer.present({ tx ->
                     if (!frame.presentsLiveContent || !adoptionRequested && frame.showEntryImage) true
                     else YAMFManager.windowBackend.writePresentationInto(tx, currentTaskId,
-                        frame.content.rounded().toAndroidRect(), frame.contentRadius, frame.taskAlpha, frame.contentAlignment)
+                        frame.content.rounded().toAndroidRect(), frame.contentRadius, frame.taskAlpha,
+                        frame.contentAlignment, frame.taskVisible, frame.taskFocusable)
                 }) { status ->
                     if (status == CommandStatus.FAILED) logError(TAG, "frame commit failed window=$windowId frame=${submission.frameId}")
                     else if (BuildConfig.DEBUG && ++frameResults <= 2) log("reYAMF_EntryV2") { "frame status=$status task=$currentTaskId handoff=$sourceHandoffId frame=${submission.frameId}" }

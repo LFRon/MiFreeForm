@@ -143,6 +143,43 @@ class WindowRuntimeTest {
         assertTrue(f.handle.snapshot().acceptsContent)
     }
 
+    @Test fun sideIconsUseTheSameSessionAndRestorationFenceWithSyncOrAsyncPresenters() {
+        for (auto in listOf(true, false)) {
+            val f = fixture(autoCommit = auto)
+            f.ordinary(); f.settle()
+            if (!auto) f.commits.last()(CommandStatus.DONE)
+            val id = f.key.windowId
+            fun input(event: WindowInputEvent) = f.handle.post(WindowEvent.Input(event))
+            input(WindowInputEvent.Press(id, f.clock.now, RegionId.HANDLE, 600f, 1300f))
+            f.clock.now += 1000
+            input(WindowInputEvent.Move(id, f.clock.now, RegionId.HANDLE, 1260f, 1300f))
+            f.clock.now += 1000
+            input(WindowInputEvent.Up(id, f.clock.now, RegionId.HANDLE, 1260f, 1300f))
+            f.settle()
+            if (!auto) f.commits.last()(CommandStatus.DONE)
+            val hidden = f.handle.snapshot()
+            assertFalse(hidden.taskVisible || hidden.taskFocusable || hidden.acceptsContent)
+            val rect = requireNotNull(hidden.input.bounds)
+            val x = rect.left + rect.width / 2f; val y = rect.top + rect.height / 2f
+            val old = f.commits.last()
+            input(WindowInputEvent.Press(id, f.clock.now, RegionId.STASH_HANDLE, x, y))
+            input(WindowInputEvent.Up(id, f.clock.now + 10, RegionId.STASH_HANDLE, x, y))
+            f.settle()
+            if (!auto) {
+                old(CommandStatus.DONE)
+                assertFalse(f.handle.snapshot().taskFocusable)
+                assertFalse(f.handle.snapshot().acceptsContent)
+                f.commits.last()(CommandStatus.DONE)
+            }
+            assertNull(f.handle.snapshot().sideStash)
+            assertTrue(f.handle.snapshot().taskVisible && f.handle.snapshot().taskFocusable && f.handle.snapshot().acceptsContent)
+            assertEquals(1, f.adopted.size)
+            assertEquals(1, f.preparations.size)
+            assertTrue(f.finished.isEmpty() && f.failures.isEmpty())
+            assertTrue(f.frames.all { it.session == f.key })
+        }
+    }
+
     @Test fun nativeSourceCannotRetireBeforeTheProducedBridgeFrameCommits() {
         val f = fixture(autoCommit = false); f.retained()
         assertTrue(f.acknowledgements.isEmpty())

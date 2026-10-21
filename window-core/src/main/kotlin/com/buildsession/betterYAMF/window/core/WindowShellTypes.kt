@@ -2,7 +2,7 @@ package com.buildsession.betterYAMF.window.core
 
 import com.buildsession.betterYAMF.window.api.*
 
-enum class ShellMode { NORMAL, MINI }
+enum class ShellMode { NORMAL, MINI, STASHED }
 enum class CloseOrigin { DOUBLE_TAP_BAR, DRAG_UP_BAR }
 enum class FullscreenOrigin { DRAG_DOWN_BAR }
 
@@ -49,6 +49,8 @@ sealed interface WindowCommand {
     ) : WindowCommand
 
     data class ExitMini(override val windowId: Int, val cmdId: Long = 0L) : WindowCommand
+    data class StashSide(override val windowId: Int, val side: WindowSide, val cmdId: Long) : WindowCommand
+    data class RestoreSide(override val windowId: Int, val cmdId: Long) : WindowCommand
     data class RequestClose(override val windowId: Int, val origin: CloseOrigin) : WindowCommand
     data class RequestFullscreen(override val windowId: Int, val origin: FullscreenOrigin) : WindowCommand
     data class RaiseWindow(override val windowId: Int) : WindowCommand

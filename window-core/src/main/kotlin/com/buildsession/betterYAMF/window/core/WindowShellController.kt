@@ -22,10 +22,13 @@ class WindowShellController(
     private var lastBarTapMs: Long? = null
     private var fullscreenArmed = false
     private var barTravel = 0f
-    /** 闭环（不变量 2）：模式迁移命令的指令计数与未决登记。 */
+    private var bodyMoved = false
+    private var lastX = 0f
+    private var lastY = 0f
+    /** Mode changes share one ticket; a late mini/stash result cannot settle a newer restore. */
     private var nextCommandId = 1L
-    private var pendingMiniCommandId = 0L
-    private var pendingMiniFromMode = ShellMode.NORMAL
+    private var pendingModeCommandId = 0L
+    private var pendingFromMode = ShellMode.NORMAL
 
     fun onScreenMetricsChanged(width: Int, height: Int) {
         screenWidth = width
@@ -48,36 +51,37 @@ class WindowShellController(
             is WindowInputEvent.Cancel -> onCancel(event)
             is WindowInputEvent.TapConfirmed -> onTapConfirmed()
             is WindowInputEvent.RequestMini -> onRequestMini()
-            is WindowInputEvent.Fling -> listOf(WindowCommand.FlingBy(windowId, event.velocityX, event.velocityY))
+            is WindowInputEvent.Fling -> if (mode == ShellMode.STASHED || pressedRegion == RegionId.STASH_HANDLE)
+                emptyList() else listOf(WindowCommand.FlingBy(windowId, event.velocityX, event.velocityY))
         }
     }
 
     /** 外部请求进入 mini（如"打开即 mini"）：仅 NORMAL→MINI 迁移，幂等。 */
     private fun onRequestMini(): List<WindowCommand> {
-        if (mode == ShellMode.MINI) return emptyList()
+        if (mode != ShellMode.NORMAL) return emptyList()
         return listOf(
-            miniCommand(ShellMode.MINI) { id -> WindowCommand.EnterMini(windowId, DropKind.CORNER_TR, id) }
+            modeCommand(ShellMode.MINI) { id -> WindowCommand.EnterMini(windowId, DropKind.CORNER_TR, id) }
         )
     }
 
     /**
-     * 模式迁移命令（进/出 mini）：分配命令 id 并登记未决回灌——
+     * 模式迁移命令：分配命令 id 并登记未决回灌——
      * 宿主执行失败回 Failed（回退模式）；被后续命令取代则闭包作废（陈旧结果忽略）。
      */
-    private fun miniCommand(target: ShellMode, build: (Long) -> WindowCommand): WindowCommand {
+    private fun modeCommand(target: ShellMode, build: (Long) -> WindowCommand): WindowCommand {
         val id = nextCommandId++
-        pendingMiniCommandId = id
-        pendingMiniFromMode = mode
+        pendingModeCommandId = id
+        pendingFromMode = mode
         mode = target
         return build(id)
     }
 
     /** 命令结果回灌：仅收敛当前未决的模式命令；陈旧结果（已被取代/已收敛）一律忽略。 */
     fun onCommandResult(commandId: Long, status: CommandStatus): List<WindowCommand> {
-        if (commandId != pendingMiniCommandId) return emptyList()
-        pendingMiniCommandId = 0L
+        if (commandId != pendingModeCommandId) return emptyList()
+        pendingModeCommandId = 0L
         if (status == CommandStatus.FAILED) {
-            mode = pendingMiniFromMode
+            mode = pendingFromMode
         }
         return emptyList()
     }
@@ -89,6 +93,9 @@ class WindowShellController(
         dropActive = null
         fullscreenArmed = false
         barTravel = 0f
+        bodyMoved = false
+        lastX = event.screenX
+        lastY = event.screenY
         return when (event.region) {
             RegionId.RESIZE_HANDLE -> listOf(WindowCommand.ResizePreviewStart(windowId))
             else -> emptyList()
@@ -103,11 +110,15 @@ class WindowShellController(
             RegionId.RESIZE_HANDLE -> listOf(
                 WindowCommand.ResizePreviewUpdate(windowId, event.screenX - pressX, event.screenY - pressY)
             )
+            RegionId.STASH_HANDLE -> { updateBarTravel(event); emptyList() }
             else -> emptyList()
         }
     }
 
     private fun onBodyMove(event: WindowInputEvent.Move): List<WindowCommand> {
+        bodyMoved = true
+        lastX = event.screenX
+        lastY = event.screenY
         val out = mutableListOf<WindowCommand>()
         out += WindowCommand.MoveBy(windowId, event.screenX - pressX, event.screenY - pressY)
         out += WindowCommand.DropZoneShow(windowId)
@@ -156,7 +167,17 @@ class WindowShellController(
         val out = mutableListOf<WindowCommand>()
         raiseIfNeeded(out)
         when (event.region) {
-            RegionId.BODY_MASK, RegionId.HANDLE -> decideDrop(out)
+            RegionId.BODY_MASK, RegionId.HANDLE -> {
+                // UP owns the last position too; a slow edge drop must not depend on another MOVE.
+                if (bodyMoved && (lastX != event.screenX || lastY != event.screenY))
+                    out += onBodyMove(WindowInputEvent.Move(windowId, event.timeMs, event.region, event.screenX, event.screenY))
+                decideDrop(out)
+            }
+            RegionId.STASH_HANDLE -> {
+                updateBarTravel(event)
+                if (barTravel <= config.barTapSlopDp * registration.density) out += restoreSide()
+                pressedRegion = null
+            }
             RegionId.BAR_BOTTOM, RegionId.BAR_SIDE -> decideBarRelease(out, event)
             RegionId.RESIZE_HANDLE -> {
                 out += WindowCommand.ResizePreviewCommit(windowId)
@@ -188,10 +209,11 @@ class WindowShellController(
 
     private fun decideDrop(out: MutableList<WindowCommand>) {
         when (val kind = dropActive) {
-            // 角落与侧边一致：缩小并贴边显示应用画面（不再收起为图标球）
-            DropKind.CORNER_TL, DropKind.CORNER_TR, DropKind.CORNER_BL, DropKind.CORNER_BR,
+            DropKind.CORNER_TL, DropKind.CORNER_TR, DropKind.CORNER_BL, DropKind.CORNER_BR ->
+                out += modeCommand(ShellMode.MINI) { id -> WindowCommand.EnterMini(windowId, kind, id) }
             DropKind.SIDE_LEFT, DropKind.SIDE_RIGHT ->
-                out += miniCommand(ShellMode.MINI) { id -> WindowCommand.EnterMini(windowId, kind, id) }
+                out += modeCommand(ShellMode.STASHED) { id -> WindowCommand.StashSide(windowId,
+                    if (kind == DropKind.SIDE_LEFT) WindowSide.LEFT else WindowSide.RIGHT, id) }
             null -> out += WindowCommand.ClampToScreen(windowId, animated = true)
         }
         out += WindowCommand.DropZoneHide(windowId)
@@ -245,9 +267,13 @@ class WindowShellController(
 
     private fun onTapConfirmed(): List<WindowCommand> = when (mode) {
         ShellMode.MINI ->
-            listOf(miniCommand(ShellMode.NORMAL) { id -> WindowCommand.ExitMini(windowId, id) })
+            listOf(modeCommand(ShellMode.NORMAL) { id -> WindowCommand.ExitMini(windowId, id) })
         else -> emptyList()
     }
+
+    fun restoreSide(): List<WindowCommand> = if (mode == ShellMode.STASHED)
+        listOf(modeCommand(ShellMode.NORMAL) { id -> WindowCommand.RestoreSide(windowId, id) })
+        else emptyList()
 
     private fun raiseIfNeeded(out: MutableList<WindowCommand>) {
         if (!topPort.isTop(windowId)) {

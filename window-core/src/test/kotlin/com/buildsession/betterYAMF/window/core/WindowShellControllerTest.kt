@@ -98,17 +98,18 @@ class WindowShellControllerTest {
     }
 
     @Test
-    fun sideDropEntersSideMiniAndTapConfirmedExpands() {
+    fun sideDropStashesWithoutFlingAndAnIconTapRestores() {
         val c = controller()
         c.feed(press(RegionId.BODY_MASK, 10f, 1000f))
         c.feed(move(RegionId.BODY_MASK, 10f, 1000f))
         val released = c.feed(up(RegionId.BODY_MASK, 10f, 1000f))
-        val enter = released.filterIsInstance<WindowCommand.EnterMini>().single()
-        assertEquals(DropKind.SIDE_LEFT, enter.corner)
+        val enter = released.filterIsInstance<WindowCommand.StashSide>().single()
+        assertEquals(WindowSide.LEFT, enter.side)
         assertTrue(enter.cmdId > 0L)
         assertEquals(WindowCommand.DropZoneHide(1), released.last())
-        assertEquals(ShellMode.MINI, c.snapshot().mode)
-        val exit = c.feed(tapConfirmed()).single() as WindowCommand.ExitMini
+        assertEquals(ShellMode.STASHED, c.snapshot().mode)
+        c.feed(press(RegionId.STASH_HANDLE, 10f, 1000f))
+        val exit = c.feed(up(RegionId.STASH_HANDLE, 10f, 1000f)).single() as WindowCommand.RestoreSide
         assertTrue(exit.cmdId > 0L)
         assertEquals(ShellMode.NORMAL, c.snapshot().mode)
     }
@@ -149,8 +150,28 @@ class WindowShellControllerTest {
         c.feed(press(RegionId.BODY_MASK, 10f, 1000f))
         c.feed(move(RegionId.BODY_MASK, 10f, 1000f))
         val released = c.feed(up(RegionId.BODY_MASK, 10f, 1000f))
-        assertEquals(DropKind.SIDE_LEFT, released.filterIsInstance<WindowCommand.EnterMini>().single().corner)
-        assertEquals(ShellMode.MINI, c.snapshot().mode)
+        assertEquals(WindowSide.LEFT, released.filterIsInstance<WindowCommand.StashSide>().single().side)
+        assertEquals(ShellMode.STASHED, c.snapshot().mode)
+    }
+
+    @Test fun anIconDragOrCancelCannotRestoreOrFlingTheHiddenTask() {
+        val c = controller()
+        c.feed(press(RegionId.HANDLE, 500f, 1000f), move(RegionId.HANDLE, 990f, 1000f), up(RegionId.HANDLE, 990f, 1000f))
+        c.feed(press(RegionId.STASH_HANDLE, 990f, 1000f), move(RegionId.STASH_HANDLE, 800f, 1000f))
+        assertTrue(c.feed(fling(2000f, 0f)).isEmpty())
+        assertTrue(c.feed(up(RegionId.STASH_HANDLE, 990f, 1000f)).isEmpty())
+        c.feed(press(RegionId.STASH_HANDLE, 990f, 1000f))
+        assertTrue(c.feed(cancel(RegionId.STASH_HANDLE, 990f, 1000f)).isEmpty())
+        assertEquals(ShellMode.STASHED, c.snapshot().mode)
+    }
+
+    @Test fun theReleasePositionCanEnterOrLeaveTheSideTarget() {
+        for ((moveX, upX, stashed) in listOf(Triple(900f, 990f, true), Triple(990f, 700f, false))) {
+            val c = controller()
+            c.feed(press(RegionId.HANDLE, 500f, 1000f), move(RegionId.HANDLE, moveX, 1000f))
+            val out = c.feed(up(RegionId.HANDLE, upX, 1000f))
+            assertEquals(stashed, out.any { it is WindowCommand.StashSide })
+        }
     }
 
     @Test

@@ -57,19 +57,22 @@ class WindowSceneController(
     private var dropX = -1
     private var dropY = -1
     private var lastCorner = DropKind.CORNER_TR
+    private data class SideStash(val side: WindowSide, val anchor: Float)
+    private var sideStash: SideStash? = null
     private var effects = mutableListOf<WindowSceneEffect>()
 
     private data class Pose(
         val content: SceneRect, val mini: Float, val alpha: Float,
         val normalChrome: Float = 1f - mini, val entryRadius: Float = 0f,
-        val cover: Float = 0f, val outline: Float = 0f
+        val cover: Float = 0f, val outline: Float = 0f, val stash: Float = 0f
     )
-    private enum class Property { X, Y, W, H, MINI, NORMAL_CHROME, ALPHA, ENTRY_RADIUS, COVER, OUTLINE }
+    private enum class Property { X, Y, W, H, MINI, NORMAL_CHROME, ALPHA, ENTRY_RADIUS, COVER, OUTLINE, STASH }
     private enum class FullscreenStep { EXPAND, RELEASE, FINISH, RESTORE }
     private data class Completion(
-        val miniCommandId: Long,
+        val modeCommandId: Long,
         val close: Boolean,
-        val fullscreenStep: FullscreenStep? = null
+        val fullscreenStep: FullscreenStep? = null,
+        val restoreSide: Boolean = false
     )
     private data class Motion(
         val generation: Long,
@@ -204,8 +207,12 @@ class WindowSceneController(
                     if (ready && fullscreenStage != null) {
                         fullscreenMetricsChanged()
                     } else if (ready) {
-                        if (shell.snapshot().mode == ShellMode.MINI) enterMini(lastCorner, 0L)
-                        else startMotion(Pose(normalContent, 0f, pose.alpha), MiniAnimKind.OPEN)
+                        when (shell.snapshot().mode) {
+                            ShellMode.STASHED -> stashSide(requireNotNull(sideStash), 0L)
+                            ShellMode.MINI -> enterMini(lastCorner, 0L)
+                            ShellMode.NORMAL -> if (sideStash != null) restoreSide(0L)
+                                else startMotion(Pose(normalContent, 0f, pose.alpha), MiniAnimKind.OPEN)
+                        }
                     }
                 }
             }
@@ -225,9 +232,16 @@ class WindowSceneController(
                     effects += WindowSceneEffect.SystemCommand(WindowCommand.RaiseWindow(windowId))
             }
             WindowSceneEvent.ResetPosition -> if (ready && fullscreenStage == null) {
-                val c = pose.content
-                val centered = c.copy(left = (metrics.width - c.width) / 2f, top = (metrics.height - c.height) / 2f)
-                startMotion(Pose(clamp(centered, pose.mini), pose.mini, 1f), MiniAnimKind.OPEN)
+                if (sideStash != null) {
+                    normalContent = clamp(normalContent.copy(left = (metrics.width - normalContent.width) / 2f,
+                        top = (metrics.height - normalContent.height) / 2f), 0f)
+                    if (shell.snapshot().mode == ShellMode.STASHED) shell.restoreSide().forEach(::command)
+                    else restoreSide(0L)
+                } else {
+                    val c = pose.content
+                    val centered = c.copy(left = (metrics.width - c.width) / 2f, top = (metrics.height - c.height) / 2f)
+                    startMotion(Pose(clamp(centered, pose.mini), pose.mini, 1f), MiniAnimKind.OPEN)
+                }
             }
             WindowSceneEvent.Destroy -> {
                 endSourceHandoff(CommandStatus.SUPERSEDED)
@@ -241,13 +255,16 @@ class WindowSceneController(
                 fullscreenStage = null
                 previewBase = null
                 fullscreenHint = false
+                sideStash = null
                 pose = pose.copy(alpha = 0f, cover = 0f, outline = 0f)
             }
         }
         return effects.toList()
     }
 
-    private fun permitsInput(event: WindowInputEvent): Boolean = when (fullscreenStage) {
+    private fun permitsInput(event: WindowInputEvent): Boolean = if (sideStash != null)
+        event is WindowInputEvent.Pointer && event.region == RegionId.STASH_HANDLE
+        else when (fullscreenStage) {
         null -> true
         FullscreenStage.DRAGGING -> event !is WindowInputEvent.Press ||
             event.region == RegionId.BAR_BOTTOM || event.region == RegionId.BAR_SIDE
@@ -258,7 +275,7 @@ class WindowSceneController(
 
     private fun input(event: WindowInputEvent) {
         if (event.windowId != windowId) return
-        if (event is WindowInputEvent.Press) {
+        if (event is WindowInputEvent.Press && event.region != RegionId.STASH_HANDLE) {
             interrupt()
             if (fullscreenStage == FullscreenStage.RETURNING) fullscreenStage = FullscreenStage.DRAGGING
             dragBase = pose
@@ -270,6 +287,9 @@ class WindowSceneController(
     private fun command(command: WindowCommand) {
         when (command) {
             is WindowCommand.EnterMini -> enterMini(command.corner, command.cmdId)
+            is WindowCommand.StashSide -> stashSide(SideStash(command.side,
+                SideStashPolicy.anchor(pose.content, metrics, style)), command.cmdId)
+            is WindowCommand.RestoreSide -> restoreSide(command.cmdId)
             is WindowCommand.ExitMini -> {
                 previewBase = null
                 fullscreenStage = null
@@ -464,14 +484,29 @@ class WindowSceneController(
         startMotion(Pose(target, 1f, 1f), MiniAnimKind.MINIMIZE, commandId)
     }
 
+    private fun stashSide(stash: SideStash, commandId: Long) {
+        sideStash = stash
+        previewBase = null
+        fullscreenStage = null
+        fullscreenHint = false
+        startMotion(Pose(SideStashPolicy.target(stash.side, stash.anchor, metrics, style),
+            0f, 1f, normalChrome = 0f, stash = 1f), MiniAnimKind.MINIMIZE, commandId)
+    }
+
+    private fun restoreSide(commandId: Long) {
+        startMotion(Pose(clamp(normalContent, 0f), 0f, 1f), MiniAnimKind.OPEN,
+            commandId, restoreSide = true)
+    }
+
     private fun startMotion(
         target: Pose, kind: MiniAnimKind, commandId: Long = 0L, close: Boolean = false,
-        fullscreenKind: FullscreenMotionKind? = null, fullscreenStep: FullscreenStep? = null
+        fullscreenKind: FullscreenMotionKind? = null, fullscreenStep: FullscreenStep? = null,
+        restoreSide: Boolean = false
     ) {
         val seed = motion?.tracks?.mapValues { it.value.velocity } ?: velocitySeed
         interrupt()
         velocitySeed = null
-        val completion = Completion(commandId, close, fullscreenStep)
+        val completion = Completion(commandId, close, fullscreenStep, restoreSide)
         if (style.timeScale <= 0f || pose == target) {
             pose = target
             if (fullscreenStep == FullscreenStep.EXPAND) velocitySeed = seed
@@ -484,12 +519,12 @@ class WindowSceneController(
             val prop = when (property) {
                 Property.X -> MiniAnimProp.TX
                 Property.Y -> MiniAnimProp.TY
-                Property.W, Property.MINI, Property.NORMAL_CHROME, Property.ENTRY_RADIUS -> MiniAnimProp.W
+                Property.W, Property.MINI, Property.NORMAL_CHROME, Property.ENTRY_RADIUS, Property.STASH -> MiniAnimProp.W
                 Property.H -> MiniAnimProp.H
                 Property.ALPHA, Property.COVER, Property.OUTLINE -> MiniAnimProp.ALPHA
             }
             val unitless = property == Property.MINI || property == Property.NORMAL_CHROME ||
-                property == Property.ALPHA || property == Property.COVER || property == Property.OUTLINE
+                property == Property.ALPHA || property == Property.COVER || property == Property.OUTLINE || property == Property.STASH
             SpringTrack(
                 fromValues.getValue(property), targetValues.getValue(property),
                 if (fullscreenKind != null) FullscreenAnimPolicy.spec(fullscreenKind, unitless, style.timeScale)
@@ -498,7 +533,8 @@ class WindowSceneController(
             ).also { track -> seed?.get(property)?.let { track.seed(track.value, it) } }
         }
         val id = ++generation
-        val keepInside = clamp(pose.content, pose.mini) == pose.content && clamp(target.content, target.mini) == target.content
+        val keepInside = sideStash == null && clamp(pose.content, pose.mini) == pose.content &&
+            clamp(target.content, target.mini) == target.content
         motion = Motion(id, tracks, target, completion, keepInside, fullscreenKind)
         present()
         if (!awaitingSourceRelease) effects += WindowSceneEffect.RequestFrame(id)
@@ -522,7 +558,8 @@ class WindowSceneController(
             SceneRect(value(Property.X), value(Property.Y), value(Property.W).coerceAtLeast(1f), value(Property.H).coerceAtLeast(1f)),
             value(Property.MINI).coerceIn(0f, 1f), value(Property.ALPHA).coerceIn(0f, 1f),
             value(Property.NORMAL_CHROME).coerceIn(0f, 1f), value(Property.ENTRY_RADIUS).coerceAtLeast(0f),
-            value(Property.COVER).coerceIn(0f, 1f), value(Property.OUTLINE).coerceIn(0f, 1f)
+            value(Property.COVER).coerceIn(0f, 1f), value(Property.OUTLINE).coerceIn(0f, 1f),
+            value(Property.STASH).coerceIn(0f, 1f)
         )
         if (active.keepInside) {
             val bounded = clamp(pose.content, pose.mini)
@@ -568,10 +605,12 @@ class WindowSceneController(
     }
 
     private fun report(completion: Completion, status: CommandStatus) {
-        if (completion.miniCommandId > 0L) {
-            shell.onCommandResult(completion.miniCommandId, status)
+        if (completion.modeCommandId > 0L) {
+            shell.onCommandResult(completion.modeCommandId, status)
         }
         if (status == CommandStatus.DONE) {
+            // Keep the icon/input shield and focus suppression until the restored scene commits.
+            if (completion.restoreSide) sideStash = null
             rememberNormal()
             if (completion.close) effects += WindowSceneEffect.FinishClose
             when (completion.fullscreenStep) {
@@ -656,9 +695,10 @@ class WindowSceneController(
         val waiting = pendingCompletion
         if (waiting?.first == event.frameId) {
             if (!visible && event.status == CommandStatus.DONE &&
-                (waiting.second.fullscreenStep == FullscreenStep.EXPAND || waiting.second.fullscreenStep == FullscreenStep.RELEASE)) {
+                (waiting.second.restoreSide || waiting.second.fullscreenStep == FullscreenStep.EXPAND ||
+                    waiting.second.fullscreenStep == FullscreenStep.RELEASE)) {
                 // A hidden shell has not covered the display. Visibility(true) republishes this
-                // fence; only its subsequent visible image may advance the task handoff.
+                // fence; only its subsequent visible image may advance the handoff or reopen input.
                 return
             }
             pendingCompletion = null
@@ -693,7 +733,7 @@ class WindowSceneController(
     }
 
     private fun rememberNormal(resized: Boolean = false) {
-        if (fullscreenStage == null && previewBase == null && pose.mini <= 0.001f &&
+        if (fullscreenStage == null && sideStash == null && previewBase == null && pose.mini <= 0.001f &&
             shell.snapshot().mode == ShellMode.NORMAL && pose.alpha >= 0.999f) {
             normalContent = pose.content
             // A temporary display constraint must not become the user's remembered size.
@@ -709,7 +749,7 @@ class WindowSceneController(
         Property.X to p.content.left, Property.Y to p.content.top, Property.W to p.content.width,
         Property.H to p.content.height, Property.MINI to p.mini, Property.NORMAL_CHROME to p.normalChrome,
         Property.ALPHA to p.alpha, Property.ENTRY_RADIUS to p.entryRadius,
-        Property.COVER to p.cover, Property.OUTLINE to p.outline
+        Property.COVER to p.cover, Property.OUTLINE to p.outline, Property.STASH to p.stash
     )
 
     private fun frame(): WindowSceneFrame {
@@ -728,6 +768,12 @@ class WindowSceneController(
         val c = if (!live) pose.content else
             SceneRect(raster.left.toFloat(), raster.top.toFloat(), raster.width.toFloat(), raster.height.toFloat())
         val outer = SceneRect(c.left - left, c.top - top, c.width + left + right, c.height + top + bottom)
+        val stash = sideStash?.let {
+            val icon = SideStashPolicy.icon(c, metrics, style)
+            SideStashVisual(it.side, icon, icon.width * 0.25f,
+                (if (visible) pose.alpha else 0f) * SideStashPolicy.iconAlpha(pose.stash))
+        }
+        val iconMix = if (stash == null) 0f else SideStashPolicy.iconAlpha(pose.stash)
         val bridge = fullscreenStage?.let { stage ->
             val end = displayRect()
             val p = pose.outline.coerceIn(0f, 1f)
@@ -739,9 +785,10 @@ class WindowSceneController(
                 stage == FullscreenStage.DRAGGING || stage == FullscreenStage.RETURNING,
                 if (stage == FullscreenStage.DRAGGING || stage == FullscreenStage.RETURNING) outer else end)
         }
-        val baseRadius = pose.entryRadius + style.barCorner * normal + style.miniCorner * m
-        val baseBottomRadius = pose.entryRadius + (if (portrait) style.barCorner * normal else 0f) + style.miniCorner * m
-        val baseContentRadius = pose.entryRadius + (style.miniCorner - style.bezel).coerceAtLeast(0f) * m
+        fun stashRadius(radius: Float) = radius + ((stash?.cornerRadius ?: radius) - radius) * pose.stash
+        val baseRadius = stashRadius(pose.entryRadius + style.barCorner * normal + style.miniCorner * m)
+        val baseBottomRadius = stashRadius(pose.entryRadius + (if (portrait) style.barCorner * normal else 0f) + style.miniCorner * m)
+        val baseContentRadius = stashRadius(pose.entryRadius + (style.miniCorner - style.bezel).coerceAtLeast(0f) * m)
         val contentRadius = if (bridge != null && live)
             baseContentRadius + (maxOf(baseContentRadius, bridge.cornerRadius) - baseContentRadius) * bridge.maskAlpha
             else baseContentRadius
@@ -752,23 +799,27 @@ class WindowSceneController(
             m, if (visible) pose.alpha else 0f,
             bridgeRadius(baseRadius),
             contentRadius,
-            normal * pose.alpha * (1f - pose.cover),
+            normal * pose.alpha * (1f - pose.cover) * (1f - iconMix),
             ready && taskReady && visible && shell.snapshot().mode == ShellMode.NORMAL && motion == null &&
                 pendingCompletion == null && entryVisual == EntryVisual.LIVE &&
-                fullscreenStage == null && m <= 0.001f && normal >= 0.999f,
+                fullscreenStage == null && sideStash == null && m <= 0.001f && normal >= 0.999f,
             portrait, fullscreenHint,
             outerBottomRadius = bridgeRadius(baseBottomRadius),
             controllerColor = controllerColor,
             controlsColor = if (controllerBrightness() < 128) 0xFFFFFFFF.toInt() else 0xFF777777.toInt(),
             fullscreen = bridge,
             taskAlpha = if (!visible || entryVisual == EntryVisual.SOURCE ||
-                fullscreenStage == FullscreenStage.HIDING || !live) 0f else pose.alpha,
+                fullscreenStage == FullscreenStage.HIDING || !live) 0f else pose.alpha * (1f - iconMix),
             presentsLiveContent = live,
             showEntryImage = entryVisual == EntryVisual.SOURCE || entryVisual == EntryVisual.REPLACING,
             entryImage = if (entryVisual == EntryVisual.SOURCE || entryVisual == EntryVisual.REPLACING)
                 EntryTransitionPolicy.sourceVisual(c, sourceImageAspect,
                     entryReplacement?.value ?: 1f) else null,
             contentAlignment = if (entryFlight) ContentAlignment.TOP else ContentAlignment.CENTER,
+            shellAlpha = (if (visible) pose.alpha else 0f) * (1f - iconMix),
+            sideStash = stash,
+            taskVisible = sideStash == null || pose.stash < 1f,
+            taskFocusable = sideStash == null,
             coordinateSpace = metrics
         )
         return result.copy(input = WindowHitPolicy.resolve(result, style))

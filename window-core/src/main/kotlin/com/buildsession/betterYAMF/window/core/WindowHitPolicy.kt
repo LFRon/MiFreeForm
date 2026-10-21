@@ -6,6 +6,13 @@ import com.buildsession.betterYAMF.window.api.*
 internal object WindowHitPolicy {
     fun resolve(f: WindowSceneFrame, style: SceneStyle): SceneInput {
         if (f.alpha <= 0f) return SceneInput.EMPTY
+        f.sideStash?.let { stash ->
+            // Clip before dispatch: only the visible icon/card is a target, never its old rect.
+            // During restoration retain this shield until the final scene's commit fence.
+            val rect = if (f.shellAlpha > 0f) f.outer else stash.bounds
+            val visible = SideStashPolicy.visiblePart(rect, f.coordinateSpace) ?: return SceneInput.EMPTY
+            return SceneInput(visible, null, listOf(HitRegion(visible, RegionId.STASH_HANDLE)))
+        }
         val regions = mutableListOf<HitRegion>()
         fun add(rect: SceneRect, region: RegionId?) { regions += HitRegion(rect, region) }
         if (!f.acceptsContent) {

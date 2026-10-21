@@ -5,6 +5,18 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class TaskOverrideLeaseTest {
+    @Test fun focusCleanupBelongsToTheSameTaskAndOnlyTheSuppressedValue() {
+        val task = Any()
+        val lease = TaskOverrideLease(task, WindowRect(0, 0, 100, 200))
+        assertFalse(lease.canRestoreFocus(task, false))
+        lease.focusSuppressed = true
+        assertTrue(lease.canRestoreFocus(task, false))
+        assertFalse(lease.canRestoreFocus(Any(), false))
+        assertFalse(lease.canRestoreFocus(task, true))
+        // Focus and layout leases are independent: another layout does not authorize clearing it.
+        assertNull(lease.restoration(task, WindowRect(0, 0, 300, 400), 5))
+        assertTrue(lease.canRestoreFocus(task, false))
+    }
     @Test fun externalMigrationRetiresOnlyTheViewportAndModeStillOwnedByThisAdoption() {
         val task = Any()
         val viewport = WindowRect(0, 0, 1264, 1605)

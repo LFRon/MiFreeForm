@@ -3,6 +3,7 @@ package com.buildsession.betterYAMF.window.host
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.drawable.ColorDrawable
 import android.graphics.HardwareBufferRenderer
 import android.graphics.RenderNode
 import android.hardware.HardwareBuffer
@@ -14,6 +15,11 @@ import com.buildsession.betterYAMF.window.api.EntryImageVisual
 import com.buildsession.betterYAMF.window.api.SceneRect
 import com.buildsession.betterYAMF.window.api.SceneMetrics
 import com.buildsession.betterYAMF.window.api.SceneStyle
+import com.buildsession.betterYAMF.window.api.SceneInput
+import com.buildsession.betterYAMF.window.api.HitRegion
+import com.buildsession.betterYAMF.window.api.RegionId
+import com.buildsession.betterYAMF.window.api.SideStashVisual
+import com.buildsession.betterYAMF.window.api.WindowSide
 import com.buildsession.betterYAMF.window.api.WindowSceneFrame
 import org.junit.Assert.*
 import org.junit.Test
@@ -30,6 +36,35 @@ import java.util.concurrent.atomic.AtomicReference
 @SdkSuppress(minSdkVersion = 34)
 class WindowShellViewRenderingTest {
     private val viewport = SceneRect(8f, 10f, 80f, 80f)
+
+    @Test fun aSideIconPaintsAndReceivesTouchesOnlyInItsVisiblePart() {
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        instrumentation.runOnMainSync {
+            for (side in WindowSide.entries) {
+                val bounds = SceneRect(if (side == WindowSide.LEFT) -22f else 82f, 38f, 52f, 52f)
+                val input = SceneRect(if (side == WindowSide.LEFT) 0f else 82f, 38f, 30f, 52f)
+                val view = WindowShellView(instrumentation.targetContext, SceneStyle(1f, 8f, 8f))
+                view.layout(0, 0, 112, 112)
+                view.setApplicationIcon(ColorDrawable(Color.RED))
+                view.render(WindowSceneFrame(bounds, bounds, 0f, 1f, 13f, 13f, 0f, false, true,
+                    shellAlpha = 0f, taskAlpha = 0f, taskVisible = false, taskFocusable = false,
+                    sideStash = SideStashVisual(side, bounds, 13f, 1f),
+                    input = SceneInput(input, null, listOf(HitRegion(input, RegionId.STASH_HANDLE))),
+                    coordinateSpace = SceneMetrics(112, 112, 0, 0)))
+                val pixels = Bitmap.createBitmap(112, 112, Bitmap.Config.ARGB_8888)
+                try {
+                    val canvas = Canvas(pixels)
+                    canvas.drawColor(Color.GREEN)
+                    view.draw(canvas)
+                    val x = if (side == WindowSide.LEFT) 8 else 104
+                    assertEquals(Color.RED, pixels.getPixel(x, 60))
+                    assertEquals(Color.GREEN, pixels.getPixel(56, 60))
+                    assertTrue(view.touchRegion().contains(x, 60))
+                    assertFalse(view.touchRegion().contains(56, 60))
+                } finally { pixels.recycle() }
+            }
+        }
+    }
 
     private fun render(source: Bitmap, remaining: Float, hardware: Boolean): Bitmap {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
