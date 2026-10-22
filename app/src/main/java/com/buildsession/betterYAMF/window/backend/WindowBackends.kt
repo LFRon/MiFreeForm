@@ -36,7 +36,7 @@ private object NoopWindowBackend : WindowBackend {
         return WindowOperation {}
     }
     override fun applyGeometry(taskId: Int, physicalBounds: Rect) {}
-    override fun preparePresentation(taskId: Int, normalBounds: Rect, onComplete: (com.buildsession.betterYAMF.window.api.CommandStatus) -> Unit): WindowOperation {
+    override fun preparePresentation(taskId: Int, layout: com.buildsession.betterYAMF.window.api.TaskLayout, onComplete: (com.buildsession.betterYAMF.window.api.CommandStatus) -> Unit): WindowOperation {
         onComplete(com.buildsession.betterYAMF.window.api.CommandStatus.FAILED)
         return WindowOperation {}
     }

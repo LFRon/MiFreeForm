@@ -22,6 +22,27 @@ import de.robv.android.xposed.XposedHelpers
  * 每次动态读取保证与当前显示配置一致。
  */
 object SystemBarMetrics {
+    /** Persistent safe bands from WM's current InsetsState, under its native lock. IME is
+     * deliberately excluded: showing a keyboard must not move/reallocate the edge icon slots.
+     */
+    fun sceneMetrics(): com.buildsession.betterYAMF.window.api.SceneMetrics {
+        val display = checkNotNull(Instances.systemContext.getSystemService(android.hardware.display.DisplayManager::class.java)
+            .getDisplay(Display.DEFAULT_DISPLAY))
+        val dm = android.util.DisplayMetrics().also(display::getRealMetrics)
+        val safe = runCatching {
+            val wms = XposedHelpers.getObjectField(Instances.activityTaskManager, "mWindowManager")
+            synchronized(XposedHelpers.getObjectField(wms, "mGlobalLock")) {
+                val dc = XposedHelpers.callMethod(XposedHelpers.getObjectField(wms, "mRoot"), "getDisplayContent", 0)
+                val controller = XposedHelpers.callMethod(dc, "getInsetsStateController")
+                val state = XposedHelpers.callMethod(controller, "getRawInsetsState")
+                XposedHelpers.callMethod(state, "calculateInsets", Rect(0, 0, dm.widthPixels, dm.heightPixels),
+                    android.view.WindowInsets.Type.systemBars() or android.view.WindowInsets.Type.displayCutout(), true) as android.graphics.Insets
+            }
+        }.getOrNull()
+        return com.buildsession.betterYAMF.window.api.SceneMetrics(dm.widthPixels, dm.heightPixels,
+            safe?.top ?: statusBarHeightPx(), safe?.bottom ?: navigationBarHeightPx(),
+            Display.DEFAULT_DISPLAY, display.rotation, safe?.left ?: 0, safe?.right ?: 0)
+    }
 
     /** 真实状态栏高度（px）；全部路径解析失败返回 0（调用方自行决定降级策略）。 */
     fun statusBarHeightPx(): Int =

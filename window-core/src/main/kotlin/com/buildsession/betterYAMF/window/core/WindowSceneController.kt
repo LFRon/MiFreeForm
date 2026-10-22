@@ -14,7 +14,8 @@ class WindowSceneController(
     val style: SceneStyle,
     initialMetrics: SceneMetrics,
     initialContent: SceneRect,
-    private val shell: WindowShellController = WindowShellController(WindowRegistration(windowId, style.density))
+    private val shell: WindowShellController = WindowShellController(WindowRegistration(windowId, style.density)),
+    private val stashSlots: SideStashRegistry = SideStashRegistry()
 ) {
     private var metrics = initialMetrics
     private var normalContent = initialContent
@@ -40,6 +41,12 @@ class WindowSceneController(
     private var fullscreenCommandId = 0L
     private var controllerColor = 0xFFFFFFFF.toInt()
     private var openAsMini = false
+    private var entryOrigin = EntryOrigin.RECENTS
+    private var activationId = 0L
+    private val activationFrames = mutableSetOf<Long>()
+    private var keyboardInset = 0
+    private var repreparing = false
+    private var prepareFrame = 0L
     private var awaitingSourceRelease = false
     private var sourceFrameAcknowledged = false
     private enum class EntryVisual { SOURCE, REPLACING, AWAITING_COMMIT, LIVE }
@@ -86,14 +93,15 @@ class WindowSceneController(
     )
 
     init {
-        shell.onScreenMetricsChanged(metrics.width, metrics.height)
+        shell.onScreenMetricsChanged(metrics)
     }
 
     fun snapshot(): WindowSceneFrame = frame()
     fun shellSnapshot(): ShellSnapshot = shell.snapshot()
     fun normalViewport(): SceneRect = normalContent
+    fun restoreToFrontOnFailure(): Boolean = WindowSessionPolicy.restoreToFrontOnFailure(entryOrigin)
     fun normalLayout(existingViewport: WindowRect? = null): TaskLayout =
-        WindowLayoutPolicy.layout(normalContent, metrics, existingViewport)
+        WindowLayoutPolicy.layout(normalContent, metrics, existingViewport, style.density)
     fun dropTargetVisual(kind: DropKind?, active: Boolean): DropTargetVisual =
         WindowLayoutPolicy.dropVisual(kind, active, metrics)
     fun isAnimating(): Boolean = !destroyed && (motion != null || pendingCompletion != null ||
@@ -119,7 +127,10 @@ class WindowSceneController(
             is WindowSceneEvent.Input -> if (ready && taskReady && !awaitingSourceRelease &&
                 entryVisual == EntryVisual.LIVE && !entryFlight && permitsInput(event.event)) input(event.event)
             is WindowSceneEvent.OpenAsMini -> {
-                openAsMini = true
+                entryOrigin = event.origin
+                openAsMini = event.origin == EntryOrigin.RECENTS
+                if (event.origin == EntryOrigin.NOTIFICATION) normalContent = initialContent(metrics, style,
+                    normalContent.width.roundToInt(), normalContent.height.roundToInt(), 0)
                 entrySource = event.source?.takeIf { it.width > 0f && it.height > 0f }
                 sourceImageAspect = event.sourceImageAspect?.takeIf { it.isFinite() && it > 0f }
                     ?: entrySource?.let { it.width / it.height } ?: 1f
@@ -145,13 +156,19 @@ class WindowSceneController(
             is WindowSceneEvent.EntryLayout -> if (awaitingSourceRelease && !entryLayoutChosen && !taskReady && prepareId == 0L) {
                 entryLayoutChosen = true
                 metrics = event.metrics
-                shell.onScreenMetricsChanged(metrics.width, metrics.height)
+                shell.onScreenMetricsChanged(metrics)
                 normalContent = initialContent(metrics, style, event.width, event.height, event.preferredTop)
                 preferredNormalWidth = normalContent.width
                 preferredNormalHeight = normalContent.height
                 // Retarget the frozen source bridge from its exact current pose. Do this before
                 // Prepare: the live application must receive this final aspect exactly once.
-                if (ready) enterMini(lastCorner, 0L)
+                if (ready) {
+                    if (metrics.width > metrics.height) {
+                        val commands = shell.restoreMini()
+                        if (commands.isEmpty()) startNormalEntry() else commands.forEach(::command)
+                    } else if (shell.snapshot().mode == ShellMode.MINI) enterMini(lastCorner, 0L)
+                    else shell.onInput(WindowInputEvent.RequestMini(windowId, 0L)).forEach(::command)
+                }
                 effects += WindowSceneEffect.ActivateEntry
             }
             WindowSceneEvent.PresentationInvalidated -> if (ready) {
@@ -170,7 +187,7 @@ class WindowSceneController(
                 entryVisual = EntryVisual.SOURCE
                 entryFlight = true
                 ready = true
-                shell.onInput(WindowInputEvent.RequestMini(windowId, 0L)).forEach(::command)
+                startEntry()
             }
             WindowSceneEvent.TaskAvailable -> if (!taskReady && prepareId == 0L) {
                 prepareId = nextId++
@@ -180,16 +197,34 @@ class WindowSceneController(
                 prepareId = 0L
                 if (event.status == CommandStatus.DONE) {
                     taskReady = true
-                    if (ready) {
+                    if (repreparing) {
+                        repreparing = false
+                        prepareFrame = 0L
+                        val restore = when (shell.snapshot().mode) {
+                            ShellMode.STASHED -> if (activationId > 0L) shell.restoreSide() else emptyList()
+                            ShellMode.MINI -> if (activationId > 0L) shell.restoreMini() else emptyList()
+                            ShellMode.NORMAL -> emptyList()
+                        }
+                        if (restore.isNotEmpty()) restore.forEach(::command)
+                        else if (sideStash != null) {
+                            // The icon/input shield survives until the restore frame commits.
+                            // Preparation may interrupt that restore after NORMAL was selected;
+                            // continue its intent instead of re-stashing the still-retained icon.
+                            if (shell.snapshot().mode == ShellMode.STASHED) reflowStash()
+                            else restoreSide(0L)
+                        }
+                        else { pose = pose.copy(alpha = 0f); startNormalEntry() }
+                    } else if (ready) {
                         republish()
                     } else if (openAsMini) {
                         ready = true
-                        shell.onInput(WindowInputEvent.RequestMini(windowId, 0L)).forEach(::command)
+                        startEntry()
                     } else {
                         ready = true
-                        startMotion(Pose(normalContent, 0f, 1f), MiniAnimKind.OPEN)
+                        startNormalEntry()
                     }
                 } else {
+                    finishActivation(CommandStatus.FAILED)
                     endSourceHandoff(event.status)
                     effects += WindowSceneEffect.Failed(WindowFailure.PREPARATION)
                 }
@@ -201,21 +236,59 @@ class WindowSceneController(
                 // A refresh-rate vote also produces onDisplayChanged. It is not a geometry event.
                 if (metrics != event.metrics) {
                     metrics = event.metrics
-                    shell.onScreenMetricsChanged(metrics.width, metrics.height)
+                    shell.onScreenMetricsChanged(metrics)
+                    if (stashSlots.configure(metrics, style)) effects += WindowSceneEffect.StashSlotsChanged
+                    val vertical = metrics.width > metrics.height && preferredNormalWidth >= preferredNormalHeight
                     normalContent = clamp(fitNormalContent(normalContent.copy(
-                        width = preferredNormalWidth, height = preferredNormalHeight)), 0f)
+                        width = if (vertical) preferredNormalHeight else preferredNormalWidth,
+                        height = if (vertical) preferredNormalWidth + if (preferredNormalWidth == preferredNormalHeight) 1f else 0f
+                            else preferredNormalHeight)), 0f)
+                    val needsLayout = event.existingViewport?.let { normalLayout(it).logicalViewport != it } == true
+                    if (needsLayout && taskReady && fullscreenStage == null) {
+                        taskReady = false
+                        repreparing = true
+                    }
                     if (ready && fullscreenStage != null) {
                         fullscreenMetricsChanged()
                     } else if (ready) {
                         when (shell.snapshot().mode) {
-                            ShellMode.STASHED -> stashSide(requireNotNull(sideStash), 0L)
-                            ShellMode.MINI -> enterMini(lastCorner, 0L)
+                            ShellMode.STASHED -> reflowStash()
+                            ShellMode.MINI -> if (metrics.width > metrics.height) {
+                                if (awaitingSourceRelease) shell.restoreMini().forEach(::command)
+                                else migrateMini()
+                            } else enterMini(lastCorner, 0L)
                             ShellMode.NORMAL -> if (sideStash != null) restoreSide(0L)
                                 else startMotion(Pose(normalContent, 0f, pose.alpha), MiniAnimKind.OPEN)
                         }
                     }
                 }
             }
+            WindowSceneEvent.StashSlotsChanged -> if (ready && shell.snapshot().mode == ShellMode.STASHED) reflowStash()
+            is WindowSceneEvent.KeyboardOcclusion -> if (keyboardInset != event.bottomInset.coerceAtLeast(0)) {
+                keyboardInset = event.bottomInset.coerceAtLeast(0)
+                if (ready && shell.snapshot().mode == ShellMode.NORMAL && sideStash == null && fullscreenStage == null)
+                    startMotion(Pose(clamp(fitNormalContent(normalContent, true), 0f), 0f, 1f), MiniAnimKind.OPEN)
+            }
+            is WindowSceneEvent.Activate -> if (event.requestId > 0L && event.requestId != activationId) {
+                finishActivation(CommandStatus.SUPERSEDED)
+                activationId = event.requestId
+                activationFrames.clear()
+                if (fullscreenStage != null) {
+                    // An explicit fullscreen operation owns its task handoff. A concurrent
+                    // activation cannot wait indefinitely or acquire that native task again.
+                    finishActivation(CommandStatus.SUPERSEDED)
+                } else {
+                    entryOrigin = event.origin
+                    if (ready && taskReady) {
+                        taskReady = false
+                        repreparing = true
+                        interrupt()
+                        republish()
+                    }
+                }
+            }
+            is WindowSceneEvent.CancelActivation -> if (event.requestId == activationId)
+                finishActivation(CommandStatus.SUPERSEDED)
             is WindowSceneEvent.Visibility -> {
                 visible = event.visible
                 entryReplacementFrames.clear()
@@ -244,6 +317,8 @@ class WindowSceneController(
                 }
             }
             WindowSceneEvent.Destroy -> {
+                finishActivation(CommandStatus.SUPERSEDED)
+                stashSlots.release(windowId)
                 endSourceHandoff(CommandStatus.SUPERSEDED)
                 interrupt()
                 destroyed = true
@@ -287,13 +362,23 @@ class WindowSceneController(
     private fun command(command: WindowCommand) {
         when (command) {
             is WindowCommand.EnterMini -> enterMini(command.corner, command.cmdId)
-            is WindowCommand.StashSide -> stashSide(SideStash(command.side,
-                SideStashPolicy.anchor(pose.content, metrics, style)), command.cmdId)
+            is WindowCommand.StashSide -> {
+                val slot = stashSlots.reserve(windowId, command.side,
+                    SideStashPolicy.anchor(pose.content, metrics, style), metrics, style)
+                if (slot != null) stashSide(SideStash(slot.side, slot.anchor), command.cmdId)
+                else {
+                    shell.onCommandResult(command.cmdId, CommandStatus.FAILED)
+                    // Failure restored the prior mode; its geometry and input must agree too.
+                    // In particular a portrait MINI must not become an unclickable normal card.
+                    if (shell.snapshot().mode == ShellMode.MINI) enterMini(lastCorner, 0L)
+                    else startMotion(Pose(clamp(fitNormalContent(normalContent, true), 0f), 0f, 1f), MiniAnimKind.OPEN)
+                }
+            }
             is WindowCommand.RestoreSide -> restoreSide(command.cmdId)
             is WindowCommand.ExitMini -> {
                 previewBase = null
                 fullscreenStage = null
-                startMotion(Pose(clamp(normalContent, 0f), 0f, 1f), MiniAnimKind.OPEN, command.cmdId)
+                startMotion(Pose(clamp(fitNormalContent(normalContent, true), 0f), 0f, 1f), MiniAnimKind.OPEN, command.cmdId)
             }
             is WindowCommand.MoveBy -> {
                 velocitySeed = null
@@ -321,8 +406,11 @@ class WindowSceneController(
             is WindowCommand.ResizePreviewStart -> resizeBase = pose.content
             is WindowCommand.ResizePreviewUpdate -> {
                 val factor = ResizePolicy.dragScaleFactor(resizeBase.width.roundToInt(), resizeBase.height.roundToInt(), command.dx, command.dy)
-                val maxWidth = metrics.width - style.margin * 2f
-                val maxHeight = metrics.height - metrics.topInset - metrics.bottomInset - style.topBar - style.bottomBar - style.margin * 2f
+                val portrait = metrics.height >= metrics.width
+                val maxWidth = metrics.width - metrics.rightInset - style.margin - resizeBase.left -
+                    if (portrait) 0f else style.sideBar
+                val maxHeight = metrics.height - maxOf(metrics.bottomInset, keyboardInset) - style.margin - resizeBase.top -
+                    if (portrait) style.bottomBar else 0f
                 val maxFactor = minOf(maxWidth / resizeBase.width, maxHeight / resizeBase.height).coerceAtLeast(ResizePolicy.MIN_FACTOR)
                 val f = factor.coerceAtMost(maxFactor)
                 pose = pose.copy(content = resizeBase.copy(width = resizeBase.width * f, height = resizeBase.height * f))
@@ -484,6 +572,39 @@ class WindowSceneController(
         startMotion(Pose(target, 1f, 1f), MiniAnimKind.MINIMIZE, commandId)
     }
 
+    private fun startEntry() {
+        if (metrics.width > metrics.height) startNormalEntry()
+        else shell.onInput(WindowInputEvent.RequestMini(windowId, 0L)).forEach(::command)
+    }
+
+    private fun startNormalEntry() {
+        if (openAsMini) {
+            entrySource?.let { source ->
+                pose = Pose(source, 0f, 1f, normalChrome = 0f, entryRadius = entryCornerRadius)
+                velocitySeed = mapOf(Property.X to entryVelocityX, Property.Y to entryVelocityY)
+            }
+            openAsMini = false
+            entrySource = null
+        }
+        startMotion(Pose(clamp(fitNormalContent(normalContent, true), 0f), 0f, 1f), MiniAnimKind.OPEN)
+    }
+
+    private fun migrateMini() {
+        val side = if (pose.content.left + pose.content.width / 2f < metrics.width / 2f)
+            WindowSide.LEFT else WindowSide.RIGHT
+        val anchor = SideStashPolicy.anchor(pose.content, metrics, style)
+        val slot = stashSlots.reserve(windowId, side, anchor, metrics, style)
+            ?: stashSlots.reserve(windowId, if (side == WindowSide.LEFT) WindowSide.RIGHT else WindowSide.LEFT,
+                anchor, metrics, style)
+        shell.migrateMini(slot?.side).forEach(::command)
+    }
+
+    private fun reflowStash() {
+        val slot = stashSlots.get(windowId)
+        if (slot == null) shell.restoreSide().forEach(::command)
+        else stashSide(SideStash(slot.side, slot.anchor), 0L)
+    }
+
     private fun stashSide(stash: SideStash, commandId: Long) {
         sideStash = stash
         previewBase = null
@@ -494,7 +615,7 @@ class WindowSceneController(
     }
 
     private fun restoreSide(commandId: Long) {
-        startMotion(Pose(clamp(normalContent, 0f), 0f, 1f), MiniAnimKind.OPEN,
+        startMotion(Pose(clamp(fitNormalContent(normalContent, true), 0f), 0f, 1f), MiniAnimKind.OPEN,
             commandId, restoreSide = true)
     }
 
@@ -610,7 +731,7 @@ class WindowSceneController(
         }
         if (status == CommandStatus.DONE) {
             // Keep the icon/input shield and focus suppression until the restored scene commits.
-            if (completion.restoreSide) sideStash = null
+            if (completion.restoreSide) { sideStash = null; stashSlots.release(windowId) }
             rememberNormal()
             if (completion.close) effects += WindowSceneEffect.FinishClose
             when (completion.fullscreenStep) {
@@ -651,7 +772,11 @@ class WindowSceneController(
         lastFrameId = id
         if (entryVisual == EntryVisual.AWAITING_COMMIT && visible && pose.alpha > 0f) entryReplacementFrames += id
         if (completion != null) pendingCompletion = id to completion
-        effects += WindowSceneEffect.Present(id, frame())
+        val current = frame()
+        if (repreparing && prepareId == 0L) prepareFrame = id
+        if (activationId > 0L && current.acceptsContent && current.alpha > 0f && visible)
+            activationFrames += id
+        effects += WindowSceneEffect.Present(id, current)
     }
 
     private fun advanceEntryReplacement(timeMs: Long) {
@@ -672,6 +797,21 @@ class WindowSceneController(
     }
 
     private fun frameCommitted(event: WindowSceneEvent.FrameCommitted) {
+        if (repreparing && prepareId == 0L && event.frameId == prepareFrame) {
+            when (event.status) {
+                CommandStatus.DONE -> {
+                    prepareId = nextId++
+                    effects += WindowSceneEffect.Prepare(prepareId, normalContent)
+                }
+                CommandStatus.SUPERSEDED -> republish()
+                CommandStatus.FAILED -> Unit
+            }
+        }
+        if (activationFrames.remove(event.frameId)) {
+            if (event.status == CommandStatus.DONE && visible && frame().acceptsContent)
+                finishActivation(CommandStatus.DONE)
+            else if (event.status == CommandStatus.SUPERSEDED && activationFrames.isEmpty()) republish()
+        }
         if (entryVisual == EntryVisual.AWAITING_COMMIT && entryReplacementFrames.remove(event.frameId)) {
             when (event.status) {
                 CommandStatus.DONE -> {
@@ -712,6 +852,7 @@ class WindowSceneController(
             }
         }
         if (event.status == CommandStatus.FAILED && event.frameId == lastFrameId) {
+            finishActivation(CommandStatus.FAILED)
             endSourceHandoff(CommandStatus.FAILED)
             motion?.let { report(it.completion, CommandStatus.FAILED) }
             motion = null
@@ -724,6 +865,15 @@ class WindowSceneController(
         }
     }
 
+    private fun finishActivation(status: CommandStatus) {
+        if (activationId == 0L) return
+        if (status == CommandStatus.DONE)
+            effects += WindowSceneEffect.SystemCommand(WindowCommand.RaiseWindow(windowId))
+        effects += WindowSceneEffect.ActivationResult(activationId, status)
+        activationId = 0L
+        activationFrames.clear()
+    }
+
     private fun endSourceHandoff(status: CommandStatus) {
         if (awaitingSourceRelease) {
             awaitingSourceRelease = false
@@ -733,7 +883,7 @@ class WindowSceneController(
     }
 
     private fun rememberNormal(resized: Boolean = false) {
-        if (fullscreenStage == null && sideStash == null && previewBase == null && pose.mini <= 0.001f &&
+        if (keyboardInset <= metrics.bottomInset && fullscreenStage == null && sideStash == null && previewBase == null && pose.mini <= 0.001f &&
             shell.snapshot().mode == ShellMode.NORMAL && pose.alpha >= 0.999f) {
             normalContent = pose.content
             // A temporary display constraint must not become the user's remembered size.
@@ -796,10 +946,10 @@ class WindowSceneController(
             else radius + (bridge.cornerRadius - radius) * bridge.maskAlpha
         val result = WindowSceneFrame(
             c, outer,
-            m, if (visible) pose.alpha else 0f,
+            m, if (visible && !repreparing) pose.alpha else 0f,
             bridgeRadius(baseRadius),
             contentRadius,
-            normal * pose.alpha * (1f - pose.cover) * (1f - iconMix),
+            if (repreparing) 0f else normal * pose.alpha * (1f - pose.cover) * (1f - iconMix),
             ready && taskReady && visible && shell.snapshot().mode == ShellMode.NORMAL && motion == null &&
                 pendingCompletion == null && entryVisual == EntryVisual.LIVE &&
                 fullscreenStage == null && sideStash == null && m <= 0.001f && normal >= 0.999f,
@@ -808,7 +958,7 @@ class WindowSceneController(
             controllerColor = controllerColor,
             controlsColor = if (controllerBrightness() < 128) 0xFFFFFFFF.toInt() else 0xFF777777.toInt(),
             fullscreen = bridge,
-            taskAlpha = if (!visible || entryVisual == EntryVisual.SOURCE ||
+            taskAlpha = if (!visible || repreparing || entryVisual == EntryVisual.SOURCE ||
                 fullscreenStage == FullscreenStage.HIDING || !live) 0f else pose.alpha * (1f - iconMix),
             presentsLiveContent = live,
             showEntryImage = entryVisual == EntryVisual.SOURCE || entryVisual == EntryVisual.REPLACING,
@@ -818,8 +968,8 @@ class WindowSceneController(
             contentAlignment = if (entryFlight) ContentAlignment.TOP else ContentAlignment.CENTER,
             shellAlpha = (if (visible) pose.alpha else 0f) * (1f - iconMix),
             sideStash = stash,
-            taskVisible = sideStash == null || pose.stash < 1f,
-            taskFocusable = sideStash == null,
+            taskVisible = !repreparing && (sideStash == null || pose.stash < 1f),
+            taskFocusable = sideStash == null && !repreparing,
             coordinateSpace = metrics
         )
         return result.copy(input = WindowHitPolicy.resolve(result, style))
@@ -834,17 +984,18 @@ class WindowSceneController(
         val bottom = (if (metrics.height >= metrics.width) style.bottomBar else 0f) * (1f - mini) + style.bezel * mini
         val side = style.bezel * mini
         val right = (if (metrics.height >= metrics.width) 0f else style.sideBar) * (1f - mini) + side
-        val minX = style.margin + side
+        val minX = metrics.leftInset + style.margin + side
         val minY = metrics.topInset + style.margin + top
-        val maxX = (metrics.width - style.margin - right - content.width).coerceAtLeast(minX)
-        val maxY = (metrics.height - metrics.bottomInset - style.margin - bottom - content.height).coerceAtLeast(minY)
+        val maxX = (metrics.width - metrics.rightInset - style.margin - right - content.width).coerceAtLeast(minX)
+        val maxY = (metrics.height - maxOf(metrics.bottomInset, keyboardInset) - style.margin - bottom - content.height).coerceAtLeast(minY)
         return content.copy(left = content.left.coerceIn(minX, maxX), top = content.top.coerceIn(minY, maxY))
     }
 
-    private fun fitNormalContent(content: SceneRect): SceneRect {
+    private fun fitNormalContent(content: SceneRect, includeKeyboard: Boolean = false): SceneRect {
         val portrait = metrics.height >= metrics.width
-        val availableWidth = (metrics.width - style.margin * 2f - if (portrait) 0f else style.sideBar).coerceAtLeast(1f)
-        val availableHeight = (metrics.height - metrics.topInset - metrics.bottomInset - style.margin * 2f -
+        val availableWidth = (metrics.width - metrics.leftInset - metrics.rightInset - style.margin * 2f - if (portrait) 0f else style.sideBar).coerceAtLeast(1f)
+        val bottomInset = if (includeKeyboard) maxOf(metrics.bottomInset, keyboardInset) else metrics.bottomInset
+        val availableHeight = (metrics.height - metrics.topInset - bottomInset - style.margin * 2f -
             style.topBar - if (portrait) style.bottomBar else 0f).coerceAtLeast(1f)
         val factor = minOf(1f, availableWidth / content.width, availableHeight / content.height)
         return content.copy(width = content.width * factor, height = content.height * factor)
@@ -855,23 +1006,26 @@ class WindowSceneController(
             val portrait = metrics.height >= metrics.width
             val barHeight = style.topBar + if (portrait) style.bottomBar else 0f
             val rightBar = if (portrait) 0f else style.sideBar
-            val availableWidth = (metrics.width - style.margin * 2f - rightBar).coerceAtLeast(1f)
+            val availableWidth = (metrics.width - metrics.leftInset - metrics.rightInset - style.margin * 2f - rightBar).coerceAtLeast(1f)
             val availableHeight = (metrics.height - metrics.topInset - metrics.bottomInset -
                 style.margin * 2f - barHeight).coerceAtLeast(1f)
-            val safeWidth = width.coerceAtLeast(1).toFloat()
-            val safeHeight = height.coerceAtLeast(1).toFloat()
+            val vertical = !portrait && width >= height
+            val safeWidth = (if (vertical) height else width).coerceAtLeast(1).toFloat()
+            val safeHeight = (if (vertical) width + if (width == height) 1 else 0 else height).coerceAtLeast(1).toFloat()
             val scale = minOf(1f, availableWidth / safeWidth, availableHeight / safeHeight)
             val w = safeWidth * scale
             val h = safeHeight * scale
-            val left = (metrics.width - w) / 2f
+            val left = metrics.leftInset + (metrics.width - metrics.leftInset - metrics.rightInset - rightBar - w) / 2f
             // Keep the existing portrait placement (80dp above center), within system safe bands.
-            val requestedTop = if (preferredTop != 0) preferredTop.toFloat() + style.topBar else
-                (metrics.height - h - barHeight) / 2f + style.topBar - if (portrait) 80f * style.density else 0f
+            val requestedTop = if (preferredTop != 0) preferredTop.toFloat() + style.topBar else if (portrait)
+                (metrics.height - h - barHeight) / 2f + style.topBar - 80f * style.density
+                else metrics.topInset + (metrics.height - metrics.topInset - metrics.bottomInset - h - barHeight) / 2f + style.topBar
             val minTop = metrics.topInset + style.margin + style.topBar
             val maxTop = (metrics.height - metrics.bottomInset - style.margin - h -
                 if (portrait) style.bottomBar else 0f).coerceAtLeast(minTop)
-            val maxLeft = (metrics.width - style.margin - rightBar - w).coerceAtLeast(style.margin)
-            return SceneRect(left.coerceIn(style.margin, maxLeft), requestedTop.coerceIn(minTop, maxTop), w, h)
+            val minLeft = metrics.leftInset + style.margin
+            val maxLeft = (metrics.width - metrics.rightInset - style.margin - rightBar - w).coerceAtLeast(minLeft)
+            return SceneRect(left.coerceIn(minLeft, maxLeft), requestedTop.coerceIn(minTop, maxTop), w, h)
         }
     }
 }

@@ -8,6 +8,8 @@ internal object ShellOwnershipProtocol {
     const val OWNER = "com.buildsession.betterYAMF.action.SHELL_OWNER"
     const val READY = "com.buildsession.betterYAMF.action.SHELL_READY"
     const val COOKIE = "shellOwnerCookie"
+    /** Optional, independently installed notification launch capability; not Launcher v2. */
+    const val NOTIFICATION_BRIDGE = "notificationWindowBridge"
     const val PEER = "shellPeerLifetime"
     const val VERSION = "shellIsolationVersion"
     const val BUILD = "shellIsolationBuild"

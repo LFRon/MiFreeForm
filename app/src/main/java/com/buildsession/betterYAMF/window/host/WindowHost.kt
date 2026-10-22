@@ -29,6 +29,11 @@ interface WindowHost {
 
     /** Adopt using the core's normal viewport; a staged source is displayed before this call. */
     fun openTask(): Boolean
+    /** Notification entry uses ordinary CORE geometry; activation completion is a scene fence. */
+    fun markNotificationEntry()
+    fun normalLayout(): com.buildsession.betterYAMF.window.api.TaskLayout
+    fun activate(requestId: Long, result: (com.buildsession.betterYAMF.window.api.CommandStatus) -> Unit)
+    fun cancelActivation(requestId: Long)
     fun onEntryCancelled(handoffId: Long)
 
     /** The source has relinquished its visible card after our first frame was committed. */

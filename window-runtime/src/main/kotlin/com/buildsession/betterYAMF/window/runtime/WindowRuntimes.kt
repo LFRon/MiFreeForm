@@ -8,6 +8,7 @@ import java.util.ArrayDeque
 /** The only construction boundary. No public signature exposes a CORE implementation type. */
 object WindowRuntimes {
     private val registry = WindowShellRegistry()
+    private val stashSlots = SideStashRegistry()
     private val windows = mutableSetOf<WindowRuntime>()
 
     /** Synchronous, stateless policy query, safe on a platform task-selection thread. It neither
@@ -16,6 +17,10 @@ object WindowRuntimes {
      * permission checks and direct-focus path. This does not change a scene or acquire focus.
      */
     fun acceptsTaskFocus(facts: TaskFocusFacts): Boolean = WindowSessionPolicy.acceptsTaskFocus(facts)
+    fun acceptsNotificationEntry(facts: NotificationEntryFacts): Boolean = NotificationEntryPolicy.accepts(facts)
+    /** Display policy recheck only; this does not replace click/permission validation. */
+    fun acceptsNotificationDisplay(metrics: SceneMetrics): Boolean =
+        NotificationEntryPolicy.acceptsDisplay(metrics.width > metrics.height)
 
     fun createWindow(session: SessionKey, options: WindowOptions, metrics: SceneMetrics,
         scheduler: RuntimeScheduler, ports: WindowPorts): WindowRuntimeHandle {
@@ -23,10 +28,11 @@ object WindowRuntimes {
         check(windows.all { it.isOwnerThread() }) { "Window sessions must share one serial owner" }
         require(windows.none { it.session.windowId == session.windowId }) { "Window id must be process-unique" }
         require(metrics.width > 0 && metrics.height > 0 && options.style.density.isFinite() && options.style.density > 0f)
-        return WindowRuntime(session, options, metrics, scheduler, ports, registry,
+        return WindowRuntime(session, options, metrics, scheduler, ports, registry, stashSlots,
             { current, taskId -> windows.toList().filter { it !== current &&
                 WindowSessionPolicy.replaces(taskId, it.boundTaskId) }.forEach { it.close(false) } },
-            { windows.remove(it) })
+            { windows.remove(it) },
+            { current -> windows.toList().filter { it !== current }.forEach { it.stashSlotsChanged() } })
             .also { windows.add(it) }
     }
 
@@ -45,14 +51,16 @@ private class WindowRuntime(
     private val scheduler: RuntimeScheduler,
     private val ports: WindowPorts,
     private val registry: WindowShellRegistry,
+    stashSlots: SideStashRegistry,
     private val binding: (WindowRuntime, Int) -> Unit,
-    private val retired: (WindowRuntime) -> Unit
+    private val retired: (WindowRuntime) -> Unit,
+    private val slotsChanged: (WindowRuntime) -> Unit
 ) : WindowRuntimeHandle {
     private val shell = registry.register(WindowRegistration(session.windowId, options.style.density))
     private val size = WindowLayoutPolicy.size(options, metrics)
     private val scene = WindowSceneController(session.windowId, options.style, metrics,
         WindowSceneController.initialContent(metrics, options.style, size.first, size.second,
-            WindowLayoutPolicy.preferredTop(options, metrics)), shell)
+            WindowLayoutPolicy.preferredTop(options, metrics)), shell, stashSlots)
     @Volatile private var published = scene.snapshot()
     private val events = ArrayDeque<WindowSceneEvent>()
     private val pendingFrames = mutableSetOf<Long>()
@@ -85,6 +93,7 @@ private class WindowRuntime(
     }
 
     fun isOwnerThread() = scheduler.isCurrentThread()
+    fun stashSlotsChanged() = enqueue(WindowSceneEvent.StashSlotsChanged)
     override fun snapshot(): WindowSceneFrame = published
     override fun bindTask(taskId: Int): Boolean {
         check(scheduler.isCurrentThread())
@@ -113,7 +122,7 @@ private class WindowRuntime(
                 entry = request
                 enqueue(WindowSceneEvent.OpenAsMini(entry.source, entry.dropX, entry.dropY,
                     entry.awaitSourceRelease, entry.sourceCornerRadius, entry.velocityX, entry.velocityY,
-                    entry.sourceImageAspect))
+                    entry.sourceImageAspect, entry.origin))
             }
             WindowEvent.VisualAvailable -> enqueue(WindowSceneEvent.VisualAvailable)
             WindowEvent.TaskAvailable -> if (adopted) enqueue(WindowSceneEvent.TaskAvailable)
@@ -152,7 +161,11 @@ private class WindowRuntime(
             }
             is WindowEvent.EntryCancelled -> if (event.handoffId == entry.handoffId && entry.retainedVisual && !sourceReleased)
                 enqueue(WindowSceneEvent.EntryAbort())
-            is WindowEvent.Metrics -> enqueue(WindowSceneEvent.Metrics(event.value))
+            is WindowEvent.Metrics -> enqueue(WindowSceneEvent.Metrics(event.value,
+                if (adopted) fixedViewport else null))
+            is WindowEvent.KeyboardOcclusion -> enqueue(WindowSceneEvent.KeyboardOcclusion(event.bottomInset))
+            is WindowEvent.Activate -> enqueue(WindowSceneEvent.Activate(event.requestId, event.origin))
+            is WindowEvent.CancelActivation -> enqueue(WindowSceneEvent.CancelActivation(event.requestId))
             is WindowEvent.Visibility -> if (!fullscreenReleased && prepared && lastVisibility != event.visible) {
                 lastVisibility = event.visible
                 enqueue(WindowSceneEvent.Visibility(event.visible))
@@ -182,11 +195,11 @@ private class WindowRuntime(
             fixedViewport = layout.logicalViewport
             adopted = true // Register ownership before an adapter can synchronously return a callback.
             val accepted = ports.tasks.adopt(layout)
-            if (!accepted) close(true, true)
+            if (!accepted) close(true, scene.restoreToFrontOnFailure())
             accepted
         } catch (error: Throwable) {
             try { ports.lifecycle.failed(WindowFailure.EXECUTION, error) }
-            finally { close(true, true) }
+            finally { close(true, scene.restoreToFrontOnFailure()) }
             false
         } finally {
             draining = wasDraining
@@ -200,7 +213,7 @@ private class WindowRuntime(
             catch (error: Throwable) {
                 if (!destroyed && !closing) {
                     try { ports.lifecycle.failed(WindowFailure.EXECUTION, error) }
-                    finally { close(true, true) }
+                    finally { close(true, scene.restoreToFrontOnFailure()) }
                 }
             }
         }
@@ -233,7 +246,7 @@ private class WindowRuntime(
             }
         } catch (error: Throwable) {
             try { ports.lifecycle.failed(WindowFailure.EXECUTION, error) }
-            finally { close(true, true) }
+            finally { close(true, scene.restoreToFrontOnFailure()) }
         } finally { draining = false }
     }
 
@@ -243,9 +256,11 @@ private class WindowRuntime(
             effect is WindowSceneEffect.RequestFrame || effect is WindowSceneEffect.SystemCommand ||
             effect is WindowSceneEffect.HandoffFullscreen || effect == WindowSceneEffect.ActivateEntry)) return
         when (effect) {
+            WindowSceneEffect.StashSlotsChanged -> slotsChanged(this)
+            is WindowSceneEffect.ActivationResult -> ports.lifecycle.activated(effect.requestId, effect.status)
             is WindowSceneEffect.AbortEntry -> {
                 effect.failure?.let { ports.lifecycle.failed(it) }
-                close(true, true)
+                close(true, scene.restoreToFrontOnFailure())
             }
             WindowSceneEffect.ActivateEntry -> if (!adopted && sourceReleased) {
                 entryActivationAuthorized = true
@@ -321,7 +336,7 @@ private class WindowRuntime(
             WindowSceneEffect.FinishOwnershipLoss -> close(false, false)
             is WindowSceneEffect.Failed -> {
                 ports.lifecycle.failed(effect.reason)
-                close(true, true)
+                close(true, scene.restoreToFrontOnFailure())
             }
         }
     }

@@ -16,6 +16,7 @@ adapters/
   android17/pixelLauncher/   PixelOS 17 / Pixel Launcher 17、907 的源码核对候选
   android17/system/          经核对的任务组织器与绘制同步实现选择
   android17/shell/           SystemUI / Shell 转场、装饰及任务归属隔离
+  android17/notification/    LOS 24 通知点击、原生启动与按记录身份清理
   common/launcher/           Quickstep Hook 注册、输入归一、源画面与控制器交接
   common/organizer/          共享任务/表面机制
   common/system/             绘制、Android 事实、广播与像素传输
@@ -33,6 +34,8 @@ adapters/
 系统侧通过 `SystemAdapters` 选择 Android 后端，`YAMFManager` 不再直接指定 `SmoothWindowBackend`。在 `systemReady` 前核对关键任务、表面迁移和绘制接口，再安装原生 Hook；窗口执行仍通过 `WindowBackend` 和现有公共执行端口连接。
 
 Android 17 还需启用 `com.android.systemui` 的模块作用域。Shell 与系统使用独立的拥有者协商，确认相同构建和归属标记后才创建根；SystemUI 死亡使入口能力失效，正常重建后重新协商。它不占用 Launcher 的 v2 对端登记表，也不改变像素协议。隔离机制、源码点位与资源规则见 [Shell 接入说明](android17/shell/README.md)。
+
+通知入口单独预解析并安装在 `android17/notification`。输入侧保留通知行检查和原生解锁，包装保留下来的解锁后接口；执行侧关联唯一 cookie、原生 Task 对象及 token，经稳定事件和执行端口恢复场景。是否接管、目标布局、模式、轨迹、失败后的去向由 CORE 决定；临时启动容器、权限、绘制就绪与通知记录清理留在 AD。签名不匹配只撤回通知能力，不影响已安装的 Shell / Recents 路径。公共契约见 [`window-api/README.md`](../../../../../../../../../window-api/README.md) 的横屏通知入口说明。
 
 Android 17 的 `AutomaticTaskFocusGuard` 还隔离自动选焦点：LOS 24.0 的 `RecentsController.setInputConsumerEnabled()` 调用 `ATMS.focusTopTask(displayId)`，原生会选到米窗置顶根内的可聚焦叶任务，产生额外 `TO_FRONT` 并使最近任务取消。适配器关联同线程的自动请求，只在原生 WM 锁内的 `setFocusedTask(int, ActivityRecord)` 选择阶段重读候选归属，经 `WindowRuntimes.acceptsTaskFocus(TaskFocusFacts)` 调用 CORE 策略跳过所有受管任务。保留原生权限检查、Binder 身份、锁及非米窗候选顺序；用户触摸、显式置前和全屏交还不受自动请求影响。调用结束或抛错即清除关联，没有轮询、手势计时或焦点定时恢复；选择异常报告 Error 并放弃该次自动焦点变更。
 

@@ -8,8 +8,7 @@ import kotlin.math.roundToInt
 object WindowViewportPolicy {
     fun logicalBounds(displayWidth: Int, contentWidth: Int, contentHeight: Int): WindowRect {
         require(displayWidth > 0 && contentWidth > 0 && contentHeight > 0)
-        // Match fullscreen UI density in the destination orientation. Always using the short
-        // display edge also in landscape creates an incorrectly narrow logical application.
+        // Caller selects the portrait reference width, independent of physical display rotation.
         val height = (displayWidth.toDouble() * contentHeight / contentWidth).roundToInt().coerceAtLeast(1)
         return WindowRect(0, 0, displayWidth, height)
     }

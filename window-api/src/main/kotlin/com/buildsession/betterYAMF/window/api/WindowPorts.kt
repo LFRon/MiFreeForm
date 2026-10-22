@@ -30,17 +30,23 @@ data class WindowOptions(
     val landscapeY: Int = 0
 )
 
+enum class ContentOrientation { UNSPECIFIED, PORTRAIT }
+
 /** Selected by CORE before adoption. normalContent is in display pixels; logicalViewport is the
  * application's fixed logical pixel bounds. Presentation scales/crops content without relayout;
- * it must not silently change app density or rotation. Fullscreen relinquishes this constraint.
+ * it must not silently change app density. contentOrientation constrains only the hosted task's
+ * application configuration; display rotation remains real. Fullscreen relinquishes the lease.
  */
-data class TaskLayout(val normalContent: SceneRect, val logicalViewport: WindowRect)
+data class TaskLayout(val normalContent: SceneRect, val logicalViewport: WindowRect,
+    /** Task-local configuration; never rotates the display or changes application density. */
+    val contentOrientation: ContentOrientation = ContentOrientation.UNSPECIFIED)
 data class FrameSubmission(val session: SessionKey, val frameId: Long, val frame: WindowSceneFrame)
 data class DropTargetVisual(
     val kind: DropKind?, val active: Boolean, val cornerRadiusPx: Float,
     val sideLeft: SceneRect, val sideRight: SceneRect, val coordinateSpace: SceneMetrics
 )
 
+enum class EntryOrigin { RECENTS, NOTIFICATION }
 data class EntryRequest(
     val handoffId: Long = 0L,
     val source: SceneRect? = null,
@@ -53,7 +59,8 @@ data class EntryRequest(
     /** Display pixels/second, normalized from the source platform's own velocity units. */
     val velocityX: Float = 0f,
     val velocityY: Float = 0f,
-    val sourceImageAspect: Float? = null
+    val sourceImageAspect: Float? = null,
+    val origin: EntryOrigin = EntryOrigin.RECENTS
 )
 
 data class HomeMaintenanceFacts(
@@ -124,6 +131,11 @@ interface SourceHandoffPort {
 
 interface WindowLifecyclePort {
     fun taskReleased()
+    /** Exactly one terminal result for Activate. DONE witnesses a committed, interactive live
+     * scene, including restoration from an edge icon. It is not PendingIntent launch acceptance.
+     * The request id belongs to the caller; superseding/cancelling must not complete a later id.
+     */
+    fun activated(requestId: Long, status: CommandStatus) {}
     /** Diagnostic cause is delivered outward, never interpreted by CORE. */
     fun failed(reason: WindowFailure, cause: Throwable? = null)
     /** Exactly once. Dispose this session's native input window, draw listeners, pixels and other
@@ -151,6 +163,15 @@ sealed interface WindowEvent {
     data class SourceReleased(val handoffId: Long) : WindowEvent
     data class EntryCancelled(val handoffId: Long) : WindowEvent
     data class Metrics(val value: SceneMetrics) : WindowEvent
+    /** Temporary bottom occlusion in display pixels, including the IME. Does not change slots. */
+    data class KeyboardOcclusion(val bottomInset: Int) : WindowEvent
+    /** Reveal/restore this exact task session and explicitly raise it. Positive caller identity.
+     * A concurrent fullscreen operation rejects activation as SUPERSEDED without reacquisition.
+     * The default notification origin also keeps a failed launch's native release in background.
+     */
+    data class Activate(val requestId: Long, val origin: EntryOrigin = EntryOrigin.NOTIFICATION) : WindowEvent
+    /** Cancel only this activation's completion; a later request and native task remain owned. */
+    data class CancelActivation(val requestId: Long) : WindowEvent
     data class Visibility(val visible: Boolean) : WindowEvent
     data class TaskColor(val color: Int) : WindowEvent
     data class HomeForeground(val facts: HomeMaintenanceFacts) : WindowEvent

@@ -10,7 +10,7 @@ internal object SideStashPolicy {
     private const val ICON_SIZE_DP = 52f
     private const val VISIBLE_FRACTION = 0.45f
 
-    private fun size(metrics: SceneMetrics, style: SceneStyle): Float = minOf(
+    fun size(metrics: SceneMetrics, style: SceneStyle): Float = minOf(
         ICON_SIZE_DP * style.density, metrics.width.toFloat(),
         (metrics.height - metrics.topInset - metrics.bottomInset - style.margin * 2f).coerceAtLeast(1f)
     ).coerceAtLeast(1f)
@@ -32,6 +32,8 @@ internal object SideStashPolicy {
         val (top, bottom) = centerRange(metrics, style)
         val centerY = top + (bottom - top) * anchor.coerceIn(0f, 1f)
         val peek = size * VISIBLE_FRACTION
+        // Stashed icons peek from the physical edge. Insets constrain ordinary content/admission,
+        // not this off-screen target; otherwise a landscape cutout exposes the entire icon.
         return SceneRect(if (side == WindowSide.LEFT) peek - size else metrics.width - peek,
             centerY - size / 2f, size, size)
     }

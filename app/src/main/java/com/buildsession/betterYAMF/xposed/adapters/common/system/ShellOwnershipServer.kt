@@ -17,6 +17,7 @@ import com.buildsession.betterYAMF.xposed.utils.logWarning
  * SystemUI. Marker acknowledgement precedes root creation; binder death revokes new entry.
  */
 internal object ShellOwnershipServer {
+    var notificationCapability: (() -> IBinder?)? = null
     val cookie: IBinder = Binder()
     private class Peer(val binder: IBinder, val identity: ShellProcessIdentity, val death: IBinder.DeathRecipient)
     @Volatile private var acknowledged = false
@@ -133,7 +134,10 @@ internal object ShellOwnershipServer {
             .setPackage(ShellOwnershipProtocol.PACKAGE)
             .putExtra(ShellOwnershipProtocol.VERSION, ShellOwnershipProtocol.CURRENT)
             .putExtra(ShellOwnershipProtocol.BUILD, BuildConfig.BUILD_TIME)
-            .putExtras(Bundle().apply { putBinder(ShellOwnershipProtocol.COOKIE, cookie) }))
+            .putExtras(Bundle().apply {
+                putBinder(ShellOwnershipProtocol.COOKIE, cookie)
+                putBinder(ShellOwnershipProtocol.NOTIFICATION_BRIDGE, notificationCapability?.invoke())
+            }))
     }
 
     private fun reject(reason: String) {

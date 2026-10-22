@@ -511,6 +511,42 @@ object YAMFManager : IYAMFManager.Stub() {
         reportEntry(startCmd, CommandStatus.FAILED)
     }
 
+    /** Unbound, transparent host: CORE selects the launch viewport before any native launch.
+     * Notification requests are correlated by a native launch cookie, never by package/component.
+     */
+    internal fun prepareNotificationHost(): WindowHost {
+        var created: WindowHost? = null
+        AppWindow(CommonContextWrapper.createAppCompatContext(systemUiContext.createContext())) { host, _ ->
+            addWindow(host)
+            host.markNotificationEntry()
+            created = host
+        }
+        return checkNotNull(created) { "Notification host could not be created" }
+    }
+
+    /** Reuse exactly the selected native task. A temporary unbound host is discarded without
+     * releasing any task when the PendingIntent chose an existing session.
+     */
+    internal fun claimNotificationTask(preparedHost: WindowHost, taskId: Int, requestId: Long,
+        selectedHost: (WindowHost) -> Unit, result: (CommandStatus) -> Unit): WindowHost? {
+        val existing = activeWindows.values.firstOrNull { it !== preparedHost && it.currentTaskId == taskId &&
+            windowBackend.isTaskManaged(taskId) }
+        val selected = existing ?: preparedHost
+        selectedHost(selected)
+        if (existing != null) preparedHost.onDestroy(false)
+        else {
+            if (activeWindows[preparedHost.windowId] !== preparedHost) { result(CommandStatus.FAILED); return null }
+            preparedHost.bindTask(taskId)
+            if (!activateWindowTask(preparedHost)) {
+                preparedHost.onDestroy(true)
+                result(CommandStatus.FAILED)
+                return null
+            }
+        }
+        selected.activate(requestId, result)
+        return selected
+    }
+
     private fun reportEntry(startCmd: StartCmd?, status: CommandStatus) {
         startCmd?.sourcePackage?.let { destination ->
             UserScopedBroadcasts.send(systemContext, Intent(Protocol.ACTION_WINDOW_PRESENTED).setPackage(destination)

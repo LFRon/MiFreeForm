@@ -12,7 +12,6 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.provider.Settings
-import android.util.DisplayMetrics
 import android.view.Choreographer
 import android.view.Display
 import android.view.GestureDetector
@@ -70,6 +69,7 @@ class AppWindow(val context: Context, private val onWindowInit: (WindowHost, Int
     private var loggedSideStash: String? = null
     private var entryVisualLogged: String? = null
     private var stagedEntry = false
+    private val activationResults = mutableMapOf<Long, (CommandStatus) -> Unit>()
     private val style = SceneStyle(context.resources.displayMetrics.density,
         config.windowRoundedCorner.toFloat(), config.barRoundedCorner.toFloat(), config.animationSpeed,
         runCatching { Settings.Global.getFloat(context.contentResolver, Settings.Global.ANIMATOR_DURATION_SCALE, 1f) }.getOrDefault(1f),
@@ -93,8 +93,7 @@ class AppWindow(val context: Context, private val onWindowInit: (WindowHost, Int
             }
             override fun prepare(commandId: Long, layout: TaskLayout, result: (CommandStatus) -> Unit): WindowOperation {
                 updateApplicationIcon()
-                return YAMFManager.windowBackend.preparePresentation(currentTaskId,
-                    layout.normalContent.rounded().toAndroidRect()) { status ->
+                return YAMFManager.windowBackend.preparePresentation(currentTaskId, layout) { status ->
                     if (status == CommandStatus.FAILED) logError(TAG, "prepare failed window=$windowId task=$currentTaskId command=$commandId")
                     else log("reYAMF_EntryV2") { "task prepared status=$status task=$currentTaskId command=$commandId handoff=$sourceHandoffId" }
                     result(status)
@@ -189,6 +188,9 @@ class AppWindow(val context: Context, private val onWindowInit: (WindowHost, Int
                 return WindowOperation { finish(DestinationResult.Superseded) }
             }
         }, object : WindowLifecyclePort {
+            override fun activated(requestId: Long, status: CommandStatus) {
+                activationResults.remove(requestId)?.invoke(status)
+            }
             override fun taskReleased() {
                 fullscreenReleased = true
                 YAMFManager.onHostTaskReleased(this@AppWindow)
@@ -231,6 +233,10 @@ class AppWindow(val context: Context, private val onWindowInit: (WindowHost, Int
     }
     init {
         view.onPointer = ::onPointer
+        view.setOnApplyWindowInsetsListener { _, insets ->
+            runtime.post(WindowEvent.KeyboardOcclusion(insets.getInsets(android.view.WindowInsets.Type.ime()).bottom))
+            insets
+        }
         runCatching {
             check(SurfaceFrameSynchronizer.configureOverlay(params)) { "Required shell window capabilities are unavailable" }
             check(synchronizer.attach()) { "Required frame/input synchronization is unavailable" }
@@ -290,6 +296,15 @@ class AppWindow(val context: Context, private val onWindowInit: (WindowHost, Int
     }
     override fun openTask() = runtime.activateTask()
     override fun onEntryCancelled(handoffId: Long) = runtime.post(WindowEvent.EntryCancelled(handoffId))
+    override fun markNotificationEntry() = runtime.post(WindowEvent.Entry(EntryRequest(origin = EntryOrigin.NOTIFICATION)))
+    override fun normalLayout() = runtime.normalLayout()
+    override fun activate(requestId: Long, result: (CommandStatus) -> Unit) {
+        if (destroyed || runtime.destroyed || requestId <= 0L) { result(CommandStatus.SUPERSEDED); return }
+        if (activationResults.containsKey(requestId)) { result(CommandStatus.SUPERSEDED); return }
+        activationResults[requestId] = result
+        runtime.post(WindowEvent.Activate(requestId))
+    }
+    override fun cancelActivation(requestId: Long) = runtime.post(WindowEvent.CancelActivation(requestId))
     override fun onSourceReleased(handoffId: Long) = runtime.post(WindowEvent.SourceReleased(handoffId))
     override fun onPresentationInvalidated() = runtime.post(WindowEvent.PresentationInvalidated)
     override fun onTaskOwnershipLost() = runtime.post(WindowEvent.TaskOwnershipLost)
@@ -361,11 +376,7 @@ class AppWindow(val context: Context, private val onWindowInit: (WindowHost, Int
         YAMFManager.unregisterHost(this)
     }
     private fun readMetrics(): SceneMetrics {
-        val dm = DisplayMetrics()
-        displayManager.getDisplay(Display.DEFAULT_DISPLAY)?.getRealMetrics(dm)
-        return SceneMetrics(dm.widthPixels, dm.heightPixels, SystemBarMetrics.statusBarHeightPx(),
-            SystemBarMetrics.navigationBarHeightPx(), Display.DEFAULT_DISPLAY,
-            displayManager.getDisplay(Display.DEFAULT_DISPLAY)?.rotation ?: 0)
+        return SystemBarMetrics.sceneMetrics()
     }
 
     private fun overlayParams(title: String) = WindowManager.LayoutParams(

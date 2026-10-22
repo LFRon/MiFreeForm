@@ -48,6 +48,7 @@ class WindowRuntimeTest {
         val finished = mutableListOf<Pair<Boolean, Boolean>>()
         val adopted = mutableListOf<TaskLayout>()
         val preparations = mutableListOf<TaskLayout>()
+        val activations = mutableListOf<Pair<Long, CommandStatus>>()
         var existing: WindowRect? = null
         var prepareResult: ((CommandStatus) -> Unit)? = null
         var prepareCancelled = 0
@@ -120,6 +121,7 @@ class WindowRuntimeTest {
                     }
                 }
             }, object : WindowLifecyclePort {
+                override fun activated(requestId: Long, status: CommandStatus) { activations += requestId to status }
                 override fun taskReleased() { releaseNotifications++ }
                 override fun failed(reason: WindowFailure, cause: Throwable?) { failures += reason }
                 override fun finish(releaseTask: Boolean, restoreToFront: Boolean) { finished += releaseTask to restoreToFront }
@@ -132,6 +134,159 @@ class WindowRuntimeTest {
         }
         fun ordinary() { assertTrue(handle.activateTask()); handle.post(WindowEvent.TaskAvailable) }
         fun settle() { repeat(150) { clock.step() } }
+    }
+
+    @Test fun notificationEntryCompletionRequiresACommittedInteractiveLiveFrame() {
+        val f = fixture(autoCommit = false)
+        f.handle.post(WindowEvent.Entry(EntryRequest(origin = EntryOrigin.NOTIFICATION)))
+        f.handle.post(WindowEvent.Activate(901))
+        f.ordinary()
+        f.settle()
+        assertTrue(f.activations.isEmpty())
+        assertFalse(f.handle.snapshot().acceptsContent)
+        f.commits.last()(CommandStatus.DONE) // Terminal geometry only reopens input in the NEXT frame.
+        assertTrue(f.handle.snapshot().acceptsContent)
+        assertTrue(f.activations.isEmpty())
+        f.commits.last()(CommandStatus.DONE)
+        assertEquals(listOf(901L to CommandStatus.DONE), f.activations)
+        assertEquals(1, f.raises)
+    }
+
+    @Test fun reactivationHidesBeforePreparingAndOldCompletionCannotFinishTheNextRequest() {
+        val f = fixture(autoPrepare = false, autoCommit = false)
+        f.ordinary(); f.prepareResult!!(CommandStatus.DONE); f.settle()
+        f.commits.last()(CommandStatus.DONE)
+        val oldFrame = f.commits.last()
+        f.handle.post(WindowEvent.Activate(11))
+        assertFalse(f.handle.snapshot().acceptsContent)
+        assertEquals(0f, f.handle.snapshot().taskAlpha, 0f)
+        assertEquals(1, f.preparations.size)
+        oldFrame(CommandStatus.DONE)
+        assertEquals(1, f.preparations.size)
+        f.commits.last()(CommandStatus.DONE)
+        assertEquals(2, f.preparations.size)
+        f.handle.post(WindowEvent.Activate(12))
+        f.handle.post(WindowEvent.CancelActivation(11))
+        assertEquals(listOf(11L to CommandStatus.SUPERSEDED), f.activations)
+        f.prepareResult!!(CommandStatus.DONE); f.settle()
+        f.commits.last()(CommandStatus.DONE)
+        assertTrue(f.handle.snapshot().acceptsContent)
+        assertEquals(1, f.activations.size)
+        f.commits.last()(CommandStatus.DONE)
+        f.commits.last()(CommandStatus.FAILED) // Duplicate terminal callback is discarded.
+        assertEquals(listOf(11L to CommandStatus.SUPERSEDED, 12L to CommandStatus.DONE), f.activations)
+        assertFalse(f.handle.destroyed)
+    }
+
+    @Test fun activationFailureAndCancellationNeverReportLaunchAcceptanceAsSuccess() {
+        val f = fixture(autoPrepare = false)
+        f.ordinary(); f.handle.post(WindowEvent.Activate(31))
+        f.prepareResult!!(CommandStatus.FAILED)
+        assertEquals(listOf(31L to CommandStatus.FAILED), f.activations)
+        assertTrue(f.handle.destroyed)
+        assertEquals(listOf(true to false), f.finished)
+        val other = fixture()
+        other.handle.post(WindowEvent.Activate(32))
+        other.handle.post(WindowEvent.CancelActivation(32))
+        other.ordinary(); other.settle()
+        assertEquals(listOf(32L to CommandStatus.SUPERSEDED), other.activations)
+        assertTrue(other.handle.snapshot().acceptsContent)
+        assertFalse(other.handle.destroyed)
+    }
+
+    @Test fun notificationFailuresReleaseInBackgroundWhileRecentsStillRestoresTheOriginalApp() {
+        for (origin in EntryOrigin.entries) for (adopted in listOf(false, true)) {
+            val f = fixture(autoPrepare = false)
+            f.handle.post(WindowEvent.Entry(EntryRequest(origin = origin)))
+            if (adopted) {
+                f.ordinary()
+                f.prepareResult!!(CommandStatus.FAILED)
+            } else {
+                f.adoptionAccepted = false
+                assertFalse(f.handle.activateTask())
+            }
+            assertTrue(f.handle.destroyed)
+            assertEquals(listOf(true to (origin == EntryOrigin.RECENTS)), f.finished)
+        }
+    }
+
+    @Test fun notificationPresenterExceptionsCannotBringTheFailedAppToForeground() {
+        val f = fixture()
+        f.handle.post(WindowEvent.Entry(EntryRequest(origin = EntryOrigin.NOTIFICATION)))
+        f.duringPresent = { error("native presenter failed") }
+        f.ordinary()
+        assertTrue(f.handle.destroyed)
+        assertEquals(listOf(true to false), f.finished)
+    }
+
+    @Test fun activationRestoresAnEdgeIconWithoutCreatingASecondSessionOrViewport() {
+        val f = fixture(); f.ordinary(); f.settle()
+        val id = f.key.windowId
+        f.handle.post(WindowEvent.Input(WindowInputEvent.Press(id, 1, RegionId.HANDLE, 500f, 1300f)))
+        f.handle.post(WindowEvent.Input(WindowInputEvent.Move(id, 2, RegionId.HANDLE, 1260f, 1300f)))
+        f.handle.post(WindowEvent.Input(WindowInputEvent.Up(id, 3, RegionId.HANDLE, 1260f, 1300f)))
+        f.settle()
+        assertNotNull(f.handle.snapshot().sideStash)
+        val viewport = f.adopted.single().logicalViewport
+        f.handle.post(WindowEvent.Activate(77)); f.settle()
+        assertNull(f.handle.snapshot().sideStash)
+        assertTrue(f.handle.snapshot().acceptsContent)
+        assertEquals(listOf(77L to CommandStatus.DONE), f.activations)
+        assertEquals(1, f.adopted.size)
+        assertEquals(viewport, f.preparations.last().logicalViewport)
+        assertTrue(f.finished.isEmpty())
+    }
+
+    @Test fun activationDuringIconRestorationContinuesTheRestoreAcrossPreparation() {
+        for (waitingForCommit in listOf(false, true)) {
+            val f = fixture(autoPrepare = false, autoCommit = false)
+            f.ordinary(); f.prepareResult!!(CommandStatus.DONE); f.settle()
+            f.commits.last()(CommandStatus.DONE)
+            val id = f.key.windowId
+            f.handle.post(WindowEvent.Input(WindowInputEvent.Press(id, f.clock.now, RegionId.HANDLE, 500f, 1300f)))
+            f.handle.post(WindowEvent.Input(WindowInputEvent.Move(id, f.clock.now + 10, RegionId.HANDLE, 1260f, 1300f)))
+            f.handle.post(WindowEvent.Input(WindowInputEvent.Up(id, f.clock.now + 20, RegionId.HANDLE, 1260f, 1300f)))
+            f.settle(); f.commits.last()(CommandStatus.DONE)
+            val icon = checkNotNull(f.handle.snapshot().input.bounds)
+            val x = icon.left + icon.width / 2f; val y = icon.top + icon.height / 2f
+            f.handle.post(WindowEvent.Input(WindowInputEvent.Press(id, f.clock.now, RegionId.STASH_HANDLE, x, y)))
+            f.handle.post(WindowEvent.Input(WindowInputEvent.Up(id, f.clock.now + 10, RegionId.STASH_HANDLE, x, y)))
+            if (waitingForCommit) f.settle()
+            assertNotNull(f.handle.snapshot().sideStash)
+            assertFalse(f.handle.snapshot().acceptsContent)
+
+            f.handle.post(WindowEvent.Activate(78))
+            assertEquals(0f, f.handle.snapshot().taskAlpha, 0f)
+            f.commits.last()(CommandStatus.DONE)
+            assertEquals(2, f.preparations.size)
+            f.prepareResult!!(CommandStatus.DONE); f.settle()
+            f.commits.last()(CommandStatus.DONE)
+            assertNull("Restoring icon must not be stashed again", f.handle.snapshot().sideStash)
+            assertTrue(f.handle.snapshot().acceptsContent)
+            assertTrue(f.activations.isEmpty())
+            f.commits.last()(CommandStatus.DONE)
+            assertEquals(listOf(78L to CommandStatus.DONE), f.activations)
+            assertEquals(1, f.adopted.size)
+            assertTrue(f.failures.isEmpty())
+        }
+    }
+
+    @Test fun anActivationCannotWaitOnOrReacquireATaskAlreadyBeingHandedToFullscreen() {
+        val f = fixture(); f.ordinary(); f.settle()
+        val c = f.handle.snapshot().content
+        val x = c.left + 100f; val y = c.bottom + 10f
+        f.handle.post(WindowEvent.Input(WindowInputEvent.Press(f.key.windowId, f.clock.now, RegionId.BAR_BOTTOM, x, y)))
+        f.handle.post(WindowEvent.Input(WindowInputEvent.Move(f.key.windowId, f.clock.now + 10, RegionId.BAR_BOTTOM, x, y + 500)))
+        f.handle.post(WindowEvent.Input(WindowInputEvent.Up(f.key.windowId, f.clock.now + 20, RegionId.BAR_BOTTOM, x, y + 500)))
+        f.settle()
+        assertNotNull(f.fullscreenResult)
+        val prepares = f.preparations.size
+        f.handle.post(WindowEvent.Activate(88))
+        assertEquals(listOf(88L to CommandStatus.SUPERSEDED), f.activations)
+        assertEquals(prepares, f.preparations.size)
+        f.fullscreenResult!!(FullscreenHandoffResult(CommandStatus.DONE, true)); f.settle()
+        assertTrue(f.handle.destroyed)
+        assertEquals(1, f.activations.size)
     }
 
     @Test fun synchronousPreparationDoesNotCancelAnAlreadyCompletedOperation() {
@@ -278,9 +433,9 @@ class WindowRuntimeTest {
         val f = fixture(); f.retained(); f.handle.post(WindowEvent.SourceReleased(73))
         f.destinationReady!!(SceneMetrics(2780, 1264, 100, 70, rotation = 1))
         val actual = f.adopted.single()
-        assertEquals(1973f, actual.normalContent.width, 0.1f)
-        assertEquals(518f, actual.normalContent.height, 0.1f)
-        assertEquals(2780, actual.logicalViewport.width)
+        assertTrue(actual.normalContent.width < actual.normalContent.height)
+        assertEquals(1264, actual.logicalViewport.width)
+        assertEquals(ContentOrientation.PORTRAIT, actual.contentOrientation)
     }
 
     @Test fun queuedMetricsCannotMixAnotherDisplayWidthIntoTheChosenAdoptionLayout() {
@@ -295,8 +450,8 @@ class WindowRuntimeTest {
         f.destinationReady!!(SceneMetrics(2780, 1264, 100, 70, rotation = 1))
         assertTrue(changed)
         val layout = f.adopted.single()
-        assertEquals(1973f, layout.normalContent.width, 0.1f)
-        assertEquals(2780, layout.logicalViewport.width)
+        assertTrue(layout.normalContent.width < layout.normalContent.height)
+        assertEquals(1264, layout.logicalViewport.width)
         assertTrue(f.failures.isEmpty())
     }
 

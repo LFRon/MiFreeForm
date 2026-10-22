@@ -6,7 +6,7 @@ import com.buildsession.betterYAMF.window.api.WindowRect
  * revoked by WM. Clean each override only while its native identity and value still match;
  * another Task object which reused the ID is never ours. Native mode 5 is FREEFORM.
  */
-internal class TaskOverrideLease(val task: Any, val viewport: WindowRect) {
+internal class TaskOverrideLease(val task: Any, var viewport: WindowRect) {
     /** Only true after this adoption suppressed an otherwise-focusable native container. */
     var focusSuppressed = false
     fun canRestoreFocus(currentTask: Any, currentFocusable: Boolean): Boolean =

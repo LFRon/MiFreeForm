@@ -134,9 +134,9 @@ class DropTargetCalculatorTest {
     }
 
     @Test
-    fun landscape_shorterSideDeterminesRadius() {
+    fun landscapeCornersBelongToTheSideEvenWhenCallerAllowsCorners() {
         val r = DropTargetCalculator.compute(10f, 10f, 2000, 1000, allowCorners = true)
-        assertEquals(DropKind.CORNER_TL, r.hover)
+        assertEquals(DropKind.SIDE_LEFT, r.hover)
         assertTrue(r.active)
     }
 }

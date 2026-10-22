@@ -24,5 +24,7 @@ class HookShell : IXposedHookLoadPackage {
         EzXHelperInit.initHandleLoadPackage(lpparam)
         runCatching { Android17ShellAdapter.install(lpparam.classLoader) }
             .onFailure { logWarning("reYAMF_Shell", "Android 17 Shell adapter initialization failed", it) }
+        runCatching { com.buildsession.betterYAMF.xposed.adapters.android17.notification.NotificationWindowAdapter.install(lpparam.classLoader) }
+            .onFailure { logWarning("reYAMF_Notification", "Notification capability unavailable; Shell hooks remain active", it) }
     }
 }

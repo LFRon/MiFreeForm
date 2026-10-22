@@ -84,6 +84,8 @@ internal object Android17ShellAdapter {
                     val marker = intent.extras?.getBinder(Wire.COOKIE) ?: return reject("missing owner cookie")
                     if (!marker.isBinderAlive) return reject("owner cookie is dead")
                     cookie = marker
+                    com.buildsession.betterYAMF.xposed.adapters.android17.notification.NotificationWindowAdapter
+                        .connect(intent.extras?.getBinder(Wire.NOTIFICATION_BRIDGE))
                     acknowledge()
                     reportedRejection = null
                     log(TAG) { "Shell ownership marker received build=${BuildConfig.BUILD_TIME} ready=${!failed}" }

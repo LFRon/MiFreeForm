@@ -121,14 +121,15 @@ class WindowSceneControllerTest {
         assertEquals(1, d.effects.count { it == WindowSceneEffect.ActivateEntry })
     }
 
-    @Test fun aRotatingHomeSelectsTheLandscapeViewportInsteadOfForcingPortrait() {
+    @Test fun aRotatingHomeKeepsTheDisplayLandscapeWithAPortraitOrdinaryTask() {
         val d = Driver()
         d.send(WindowSceneEvent.OpenAsMini(SceneRect(300f, 200f, 700f, 400f), awaitSourceRelease = true))
         d.send(WindowSceneEvent.VisualAvailable)
-        d.send(WindowSceneEvent.EntryLayout(SceneMetrics(2780, 1264, 100, 70), 1973, 518))
+        d.send(WindowSceneEvent.EntryLayout(SceneMetrics(2780, 1264, 100, 70), 897, 1139))
         val preparation = d.send(WindowSceneEvent.TaskAvailable).filterIsInstance<WindowSceneEffect.Prepare>().single()
-        assertEquals(1973f, preparation.normalContent.width, 0.01f)
-        assertEquals(518f, preparation.normalContent.height, 0.01f)
+        assertTrue(preparation.normalContent.width < preparation.normalContent.height)
+        assertEquals(1264, d.scene.normalLayout().logicalViewport.width)
+        assertEquals(ShellMode.NORMAL, d.scene.shellSnapshot().mode)
         assertFalse(d.scene.snapshot().portrait)
         assertNull(d.requested)
     }
@@ -185,7 +186,7 @@ class WindowSceneControllerTest {
             val portrait = m.height >= m.width
             val rightBar = if (portrait) 0f else style.sideBar
             val bottomBar = if (portrait) style.bottomBar else 0f
-            assertEquals(10000f / 8000f, c.width / c.height, 0.001f)
+            assertEquals(if (portrait) 10000f / 8000f else 8000f / 10000f, c.width / c.height, 0.001f)
             assertTrue(c.left >= style.margin - 0.01f)
             assertTrue(c.right + rightBar <= m.width - style.margin + 0.01f)
             assertTrue(c.top - style.topBar >= m.topInset + style.margin - 0.01f)
@@ -206,7 +207,7 @@ class WindowSceneControllerTest {
                 assertEquals(normal.width, d.scene.normalViewport().width, 0.01f)
                 assertEquals(normal.height, d.scene.normalViewport().height, 0.01f)
             }
-            if (mini) { d.tap(); d.settle() }
+            if (mini) { d.restoreSide(); d.settle() }
             assertEquals(normal.width, d.scene.snapshot().content.width, 0.01f)
             assertEquals(normal.height, d.scene.snapshot().content.height, 0.01f)
         }
@@ -521,6 +522,12 @@ class WindowSceneControllerTest {
         }
         fun enter() = input(WindowInputEvent.RequestMini(1, time))
         fun tap() = input(WindowInputEvent.TapConfirmed(1, time, RegionId.BODY_MASK, 1100f, 220f))
+        fun restoreSide() {
+            val icon = requireNotNull(scene.snapshot().input.bounds)
+            val x = (icon.left + icon.right) / 2f; val y = (icon.top + icon.bottom) / 2f
+            press(RegionId.STASH_HANDLE, x, y)
+            input(WindowInputEvent.Up(1, time + 1L, RegionId.STASH_HANDLE, x, y))
+        }
         fun press(region: RegionId = RegionId.HANDLE, x: Float = 200f, y: Float = 700f) =
             input(WindowInputEvent.Press(1, time, region, x, y))
     }
@@ -824,7 +831,7 @@ class WindowSceneControllerTest {
     @Test fun rotationFitsTheRememberedNormalWindowWithoutChangingAspect() {
         val d = Driver(); d.ready(); d.settle(); d.enter(); d.settle()
         d.send(WindowSceneEvent.Metrics(SceneMetrics(2780, 1264, 100, 70)))
-        d.settle(); d.tap(); d.settle()
+        d.settle(); d.restoreSide(); d.settle()
         val f = d.scene.snapshot()
         assertTrue(f.outer.top >= 100f)
         assertTrue(f.outer.bottom <= 1264f - 70f)
@@ -847,7 +854,8 @@ class WindowSceneControllerTest {
         d.send(WindowSceneEvent.Metrics(SceneMetrics(2780, 1264, 100, 70))); d.settle()
         assertEquals(0f, d.scene.snapshot().outerBottomRadius, 0f)
         d.enter(); d.settle()
-        assertEquals(style.miniCorner, d.scene.snapshot().outerBottomRadius, 0f)
+        assertEquals(0f, d.scene.snapshot().outerBottomRadius, 0f)
+        assertEquals(ShellMode.NORMAL, d.scene.shellSnapshot().mode)
     }
 
     @Test fun highVelocityReleaseCannotFlingASettledWindowOutOfScreen() {

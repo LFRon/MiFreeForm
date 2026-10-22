@@ -227,9 +227,10 @@ object SmoothWindowBackend : WindowBackend {
     }
 
     override fun preparePresentation(
-        taskId: Int, normalBounds: Rect, onComplete: (CommandStatus) -> Unit
+        taskId: Int, layout: com.buildsession.betterYAMF.window.api.TaskLayout, onComplete: (CommandStatus) -> Unit
     ): WindowOperation {
-        val operation = Preparation(taskId, Rect(normalBounds), onComplete)
+        val c = layout.normalContent.rounded()
+        val operation = Preparation(taskId, Rect(c.left, c.top, c.right, c.bottom), layout, onComplete)
         preparations.put(taskId, operation)?.cancel()
         operation.start()
         return operation
@@ -239,6 +240,7 @@ object SmoothWindowBackend : WindowBackend {
     private class Preparation(
         private val taskId: Int,
         private val bounds: Rect,
+        private val layout: com.buildsession.betterYAMF.window.api.TaskLayout,
         private val onComplete: (CommandStatus) -> Unit
     ) : WindowOperation {
         private val handler = android.os.Handler(android.os.Looper.getMainLooper())
@@ -258,7 +260,11 @@ object SmoothWindowBackend : WindowBackend {
                 return
             }
             geometryByTask[taskId] = Rect(bounds)
-            appearanceByTask[taskId] = Appearance(alpha = 0f)
+            appearanceByTask[taskId] = appearanceOf(taskId).copy(alpha = 0f)
+            if (!SmoothTaskOrganizer.prepareTaskLayout(taskId, layout, bounds)) {
+                finish(CommandStatus.FAILED)
+                return
+            }
             SmoothTaskOrganizer.applyLeash(taskId, bounds)
             // LoS BLASTSyncEngine's default sync timeout is a failure bound, never a start delay.
             handler.postDelayed(timeout, 5000L)
@@ -270,15 +276,23 @@ object SmoothWindowBackend : WindowBackend {
         private fun awaitStableSurface() {
             if (completed || preparations[taskId] !== this) return
             stage = "system transition"
-            if (!SmoothTaskOrganizer.isLeashManaged(taskId)) finish(CommandStatus.FAILED)
-            else if (SmoothTaskOrganizer.isTaskSurfaceStable(taskId)) finish(CommandStatus.DONE)
-            else {
-                val callback = android.view.Choreographer.FrameCallback {
-                    frameCallback = null
-                    awaitStableSurface()
+            try {
+                if (!SmoothTaskOrganizer.isLeashManaged(taskId)) finish(CommandStatus.FAILED)
+                else if (SmoothTaskOrganizer.isTaskSurfaceStable(taskId) &&
+                    SmoothTaskOrganizer.matchesTaskLayout(taskId, layout)) finish(CommandStatus.DONE)
+                else {
+                    val callback = android.view.Choreographer.FrameCallback {
+                        frameCallback = null
+                        awaitStableSurface()
+                    }
+                    frameCallback = callback
+                    android.view.Choreographer.getInstance().postFrameCallback(callback)
                 }
-                frameCallback = callback
-                android.view.Choreographer.getInstance().postFrameCallback(callback)
+            } catch (error: Throwable) {
+                // This observer runs outside the runtime's guarded synchronous port call.
+                // A native failure must close this operation, never escape into system_server.
+                logError(TAG, "prepare observation failed task=$taskId stage=$stage", error)
+                finish(CommandStatus.FAILED)
             }
         }
 

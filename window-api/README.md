@@ -26,29 +26,47 @@ EVL 和 EXL 在运行时内形成闭环：EVL 把端口结果和外部输入串�
 | `TaskSessionPort` | 任务认领、固定逻辑视口准备、全屏交还、置前 |
 | `ScenePresenter` | 完整场景帧和输入区域的同步落实、帧率请求、投放区绘制、保留像素释放 |
 | `SourceHandoffPort` | 目标桥接帧结果通知，以及源释放后的真实目标布局就绪观察 |
-| `WindowLifecyclePort` | 控制权释放通知、失败诊断、最终原生资源清理 |
+| `WindowLifecyclePort` | 激活帧完成、控制权释放通知、失败诊断、最终原生资源清理 |
 | `RuntimeScheduler` | 串行宿主、取消任务和外部单调帧时钟 |
 
 当前 Android 组合根在 `AppWindow`；Launcher 入口适配在 `LauncherGestureAdapter`；任务和帧机制分别在 `SmoothWindowBackend`、`SurfaceFrameSynchronizer`。注册、原始调用和 Hook 参数转换集中在 `NativeHooks`。这些 Android 内部接口可传原生对象，但不能替代或污染上述公共契约。
 
 ## 坐标、时间与布局
 
-- 场景和投放坐标使用 `SceneMetrics.displayId` 所指显示器在 `rotation`（0～3）下的像素坐标。原点在当前显示区域左上角，包含系统栏区域；安全区域由上下 inset 表达。输入适配器负责从 Launcher 或原生局部坐标转换。
+- 场景和投放坐标使用 `SceneMetrics.displayId` 所指显示器在 `rotation`（0～3）下的像素坐标。原点在当前显示区域左上角，包含系统栏区域；安全区域由上下左右 inset 表达。输入适配器负责从 Launcher 或原生局部坐标转换。临时输入法遮挡单独上报 `KeyboardOcclusion(bottomInset)`，不改变持久侧边槽位容量。
 - `EntryInput.gestureY` 保持在 DOWN 时的坐标系，用于位移判定；`x/y` 则跟随当前显示方向，用于命中投放区。跨显示器的输入会取消当前候选。
 - 输入时间、帧时间使用同一单调 uptime 毫秒基准。速度统一为像素/秒；例如 Quickstep 的像素/毫秒必须先转换。
 - 几何运动保持浮点精度；在 Android 事务和输入区域边界使用同一个 `SceneRect.rounded()` 规则。
-- `TaskLayout.normalContent` 是显示区域；`logicalViewport` 是应用逻辑视口。CORE 在认领前选择尺寸；EXL 保留既有任务实际使用的固定视口。每帧只缩放、裁剪和呈现，不每帧重排应用，不修改应用 DPI。
+- `TaskLayout.normalContent` 是显示区域；`logicalViewport` 是应用逻辑视口；`contentOrientation=PORTRAIT` 要求被承载应用的任务配置为竖屏，显示器方向保持真实值。CORE 在认领前选择尺寸；EXL 只提供既有固定视口事实，是否兼容或需要迁移由 CORE 判断。迁移旧横向视口时，先提交隐藏和关闭输入的帧，再准备新布局并等绘制提交，最后重新显示。每帧只缩放、裁剪和呈现，不每帧重排应用，不修改 DPI。
 - `WindowSceneFrame` 是完整、不可变的当前期望场景；`input` 已包含命中区域和内容穿透区域。适配器不得重新推导 mini、全屏或输入开放条件。`snapshot()` 返回期望帧，不是物理显示查询。
 
 ## 侧边图标收起
 
-左右侧边投放沿用现有投放区域，不依赖甩动速度；四角仍为显示应用内容的 mini。侧边收起、图标位置、内容与外壳到图标的过渡、恢复目标和触摸许可都由 CORE 决定。`SideStashPolicy` 使用屏幕安全区域保存纵向锚点，旋转后仍留在原侧边。
+左右侧边投放不依赖甩动速度。竖屏四角保留 mini；横屏禁止 mini，安全区域内的两侧包含四角，顶底中部只回屏。既有 mini 旋转到横屏会就近收为图标，两侧都满则恢复普通窗口；转回竖屏仍保持图标。最近任务入口按最终目标显示方向选择模式，返回竖屏 Home 时仍为 mini。
+
+槽位由共享的 CORE `SideStashRegistry` 分配，图标 52dp、最小间距 8dp，按原纵向锚点选择最近空槽。收起意图即预留，恢复终态提交或销毁才释放。旋转时优先保留较早收起的窗口，容量不足的窗口恢复普通形态；新收起请求满位则保留原形态，普通窗口仍为普通窗口，竖屏 mini 仍为 mini，模式、画面和输入保持一致。没有溢出侧栏或持续轮询。
 
 `WindowSceneFrame.sideStash` 给出同一任务的图标矩形、圆角和透明度；`shellAlpha` 控制外壳，`taskAlpha` 控制内容。AD 仅绘制当前帧，不另启 View 动画、计时器或根据速度判断收起。`taskVisible=false` 要在场景同步事务中隐藏整个内容子树及其原生触摸目标，保留认领与固定逻辑视口；不能把它转换成 WM 任务可见性变化、关闭、全屏或重启应用。
 
 `taskFocusable=false` 暂时禁止该任务获焦；恢复 `true` 只撤销同一原生认领的焦点抑制，不强行把任务置前。适配器应使用原生生命周期/输入刷新路径，不能仅写字段，也不能按每帧重新执行焦点事务。控制权丢失时，按原生任务身份和当前覆盖值清理本会话的抑制。
 
 收起后 `input` 只覆盖屏内露出的图标，使用 `STASH_HANDLE`。输入适配器转发 Press/Move/Up/Cancel；CORE 判定点按并恢复，无需额外的点击确认延迟，也不把图标拖动/甩动作用到隐藏任务。动画中的点按从当前姿态和速度续接；取消点按不停止收起动画。恢复终态的同步提交确认前保留触摸屏障与焦点抑制，迟到、合并和隐藏帧的确认不能提前开放输入。
+
+## 横屏通知入口与任务激活
+
+通知到达不会创建窗口。输入适配器在原生解锁检查之后采集 `NotificationEntryFacts`，通过 `WindowRuntimes.acceptsNotificationEntry()` 查询普通横屏通知点击是否适用。临近原生启动时，通过 `acceptsNotificationDisplay(metrics)` 再次检查当前显示是否允许该入口；这只重查 CORE 的显示策略，不替代通知事实或原生权限校验。持续服务、媒体、通话、进度、气泡、全屏通知、组摘要和锁定资料夹保留原生路径。
+
+新窗口在认领前发送 `EntryRequest(origin=NOTIFICATION)`，由 CORE 选择居中竖向布局与普通淡入；`RECENTS` 为向后兼容的默认值，保留原始 UP、保留源像素和目标交接屏障。横屏应用布局沿用竖屏默认尺寸比例并等比适配安全区，逻辑宽度使用显示短边，动画不重排应用。
+
+`WindowEvent.Activate(requestId, origin=NOTIFICATION)` 针对同一原生任务的现有会话恢复 mini/侧边图标、准备当前应用内容并明确置前；新任务也可在准备前登记该请求。请求 ID 为调用方正数且在该会话内不可复用。`WindowLifecyclePort.activated(requestId, status)` 的 `DONE` 只在可交互实时帧的同步事务提交后产生；任务准备完成、启动返回成功和动画结束都不足以产生该结果。`CancelActivation(requestId)` 只结束匹配的等待，不销毁用户窗口、不影响后续激活；被新请求替代时旧请求回 `SUPERSEDED`。已有全屏操作时立即回 `SUPERSEDED`，不等待或重新认领正在交还的任务。
+
+重新准备布局打断图标展开时，CORE 保留已经选定的普通窗口目标并续接恢复；尚未释放的图标和输入屏障不能被误判为新的收起意图，槽位仍等恢复帧提交后才释放。
+
+入口来源也决定失败后的去向：CORE 对通知新建或激活的会话选择后台释放，避免失败时以全屏抢占原前台应用；最近任务入口沿用原有恢复置前策略。EXL 在认领拒绝、准备失败、呈现失败及异常清理中统一执行 CORE 的选择，不自行推导去向。
+
+当前 LOS 24 AD 使用独立可选的单向 Binder 通知桥接，不改变 Launcher v2 协议。它保留原 PendingIntent、用户、深链和草稿，按 LOS 无系统展开动画分支生成启动参数，用临时隐藏容器及每次启动独有的 cookie 关联真正选中的叶任务。延后认领前校验原生 Task 对象与容器 token，同步认领时再次核对，不能仅凭任务 ID 接管后来复用该 ID 的任务。临时容器不能成为全屏恢复父级；已存在会话按任务身份复用，不按包名合并。SystemUI 通过原生通知行点击检查及解锁后回调接入，不依赖被 R8 内联删除的启动辅助方法；上浮退出与面板收起使用原生机制，小窗几何及淡入由 CORE 计算。晚到的启动确认不能收起该通知行后来更新的悬浮通知，也不再次折叠用户重新打开的通知栏。
+
+通知清理由真实激活完成触发。AD 给每个 NMS NotificationRecord 附带私有代次元数据，传到 SystemUI；完成时在 NMS 实际执行线程与锁内同时核对对象身份、代次和待发布更新，复用原生点击统计与取消原语，只处理被点中的记录。启动失败保留通知；发送原 PendingIntent 后失败不再次发送或改走全屏。可选通知签名绑定失败不会关闭已有 Recents/Shell 能力。
 
 ## 会话和异步约束
 

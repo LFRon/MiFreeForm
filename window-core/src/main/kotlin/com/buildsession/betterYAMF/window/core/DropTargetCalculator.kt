@@ -20,7 +20,8 @@ object DropTargetCalculator {
         y: Float,
         screenWidth: Int,
         screenHeight: Int,
-        allowCorners: Boolean
+        allowCorners: Boolean,
+        topInset: Int = 0, bottomInset: Int = 0, leftInset: Int = 0, rightInset: Int = 0
     ): Highlight {
         val sw = screenWidth.toFloat()
         val sh = screenHeight.toFloat()
@@ -36,7 +37,7 @@ object DropTargetCalculator {
 
         val minDist = min(distTL, min(distTR, min(distBL, distBR)))
 
-        val corner = if (allowCorners) {
+        val corner = if (allowCorners && sw <= sh) {
             when {
                 distTL == minDist && distTL < proximityRadius -> DropKind.CORNER_TL
                 distTR == minDist && distTR < proximityRadius -> DropKind.CORNER_TR
@@ -53,16 +54,18 @@ object DropTargetCalculator {
         }
 
         val side = when {
-            x < proximityRadius -> DropKind.SIDE_LEFT
-            x > sw - proximityRadius -> DropKind.SIDE_RIGHT
+            x < leftInset + proximityRadius -> DropKind.SIDE_LEFT
+            x > sw - rightInset - proximityRadius -> DropKind.SIDE_RIGHT
             else -> null
         }
 
+        val top = if (sw > sh) topInset.toFloat() else sh * SIDE_HEIGHT_START_RATIO
+        val bottom = if (sw > sh) sh - bottomInset else sh * SIDE_HEIGHT_END_RATIO
         val active = when (side) {
             DropKind.SIDE_LEFT ->
-                x < sw * SIDE_WIDTH_RATIO && y > sh * SIDE_HEIGHT_START_RATIO && y < sh * SIDE_HEIGHT_END_RATIO
+                x < leftInset + sw * SIDE_WIDTH_RATIO && y >= top && y < bottom
             DropKind.SIDE_RIGHT ->
-                x > sw * (1f - SIDE_WIDTH_RATIO) && y > sh * SIDE_HEIGHT_START_RATIO && y < sh * SIDE_HEIGHT_END_RATIO
+                x > sw * (1f - SIDE_WIDTH_RATIO) - rightInset && y >= top && y < bottom
             else -> false
         }
 

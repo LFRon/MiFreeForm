@@ -19,7 +19,8 @@ data class SceneRect(val left: Float, val top: Float, val width: Float, val heig
 
 /** Display pixel coordinates in the declared physical rotation (0..3), never Launcher-local dp. */
 data class SceneMetrics(val width: Int, val height: Int, val topInset: Int, val bottomInset: Int,
-    val displayId: Int = 0, val rotation: Int = 0)
+    val displayId: Int = 0, val rotation: Int = 0,
+    val leftInset: Int = 0, val rightInset: Int = 0)
 
 /** Uniform cover projection; TOP preserves the header as a viewport changes height. */
 enum class ContentAlignment { CENTER, TOP }

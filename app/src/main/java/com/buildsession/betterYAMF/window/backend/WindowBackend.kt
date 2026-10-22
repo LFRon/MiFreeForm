@@ -81,7 +81,8 @@ interface WindowBackend {
      * Cancelling/releasing the session invalidates its outstanding callbacks before another session
      * can use the same task identity.
      */
-    fun preparePresentation(taskId: Int, normalBounds: Rect, onComplete: (CommandStatus) -> Unit): WindowOperation
+    fun preparePresentation(taskId: Int, layout: com.buildsession.betterYAMF.window.api.TaskLayout,
+        onComplete: (CommandStatus) -> Unit): WindowOperation
 
     /**
      * Write a complete presentation into the frame transaction without applying it.

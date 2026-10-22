@@ -14,6 +14,7 @@ class WindowShellController(
     private var mode = ShellMode.NORMAL
     private var screenWidth = 0
     private var screenHeight = 0
+    private var screenMetrics = SceneMetrics(0, 0, 0, 0)
 
     private var pressedRegion: RegionId? = null
     private var pressX = 0f
@@ -33,6 +34,12 @@ class WindowShellController(
     fun onScreenMetricsChanged(width: Int, height: Int) {
         screenWidth = width
         screenHeight = height
+        screenMetrics = SceneMetrics(width, height, 0, 0)
+    }
+
+    fun onScreenMetricsChanged(metrics: SceneMetrics) {
+        onScreenMetricsChanged(metrics.width, metrics.height)
+        screenMetrics = metrics
     }
 
     fun snapshot(): ShellSnapshot = ShellSnapshot(
@@ -58,7 +65,7 @@ class WindowShellController(
 
     /** 外部请求进入 mini（如"打开即 mini"）：仅 NORMAL→MINI 迁移，幂等。 */
     private fun onRequestMini(): List<WindowCommand> {
-        if (mode != ShellMode.NORMAL) return emptyList()
+        if (mode != ShellMode.NORMAL || screenWidth > screenHeight) return emptyList()
         return listOf(
             modeCommand(ShellMode.MINI) { id -> WindowCommand.EnterMini(windowId, DropKind.CORNER_TR, id) }
         )
@@ -128,7 +135,9 @@ class WindowShellController(
                 event.screenY,
                 screenWidth,
                 screenHeight,
-                allowCorners = mode == ShellMode.NORMAL
+                allowCorners = mode == ShellMode.NORMAL,
+                topInset = screenMetrics.topInset, bottomInset = screenMetrics.bottomInset,
+                leftInset = screenMetrics.leftInset, rightInset = screenMetrics.rightInset
             )
             dropActive = if (highlight.active) highlight.hover else null
             out += WindowCommand.DropHover(windowId, highlight.hover, highlight.active)
@@ -274,6 +283,15 @@ class WindowShellController(
     fun restoreSide(): List<WindowCommand> = if (mode == ShellMode.STASHED)
         listOf(modeCommand(ShellMode.NORMAL) { id -> WindowCommand.RestoreSide(windowId, id) })
         else emptyList()
+
+    fun restoreMini(): List<WindowCommand> = if (mode == ShellMode.MINI)
+        listOf(modeCommand(ShellMode.NORMAL) { id -> WindowCommand.ExitMini(windowId, id) }) else emptyList()
+
+    /** Rotation has removed MINI as a valid mode. Capacity is selected by the scene registry. */
+    fun migrateMini(side: WindowSide?): List<WindowCommand> = if (mode == ShellMode.MINI)
+        if (side == null) restoreMini() else listOf(modeCommand(ShellMode.STASHED) {
+            id -> WindowCommand.StashSide(windowId, side, id)
+        }) else emptyList()
 
     private fun raiseIfNeeded(out: MutableList<WindowCommand>) {
         if (!topPort.isTop(windowId)) {

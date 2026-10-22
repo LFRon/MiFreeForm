@@ -149,6 +149,8 @@ object SmoothTaskOrganizer {
     private val shapedTasks = ConcurrentHashMap.newKeySet<Int>()
 
     private val originalParentTokens = ConcurrentHashMap<Int, Any>()
+    private val notificationStages = ConcurrentHashMap<Int, NotificationTaskStage>()
+    private val notificationSelection = ThreadLocal<NotificationTaskSelection?>()
     private val overrideLeases = ConcurrentHashMap<Int, TaskOverrideLease>()
     private val adoptedTasks = ConcurrentHashMap.newKeySet<Int>()
     private val adoptionsInProgress = ConcurrentHashMap.newKeySet<Int>()
@@ -168,7 +170,191 @@ object SmoothTaskOrganizer {
     fun currentLogicalViewport(taskId: Int): Rect? =
         if (isLeashManaged(taskId)) logicalBounds[taskId]?.let(::Rect) else null
 
-    fun isFloatingRootTask(taskId: Int): Boolean = taskId > 0 && taskId == floatingRootTaskId
+    /** Called only after CORE's hidden/input-closed frame committed (initial adoption is already
+     * staged). LOS TaskFragment computes portrait Configuration/dp/appBounds from floating bounds;
+     * ActivityRecord's multi-window path ignores the Activity's requested display orientation.
+     * No density override, display rotation override, or global ignore-orientation flag.
+     */
+    internal fun prepareTaskLayout(taskId: Int, layout: com.buildsession.betterYAMF.window.api.TaskLayout,
+        physical: Rect): Boolean = runCatching {
+        val lease = overrideLeases[taskId] ?: return false
+        if (!isLeashManaged(taskId)) return false
+        val task = lease.task
+        val wm = XposedHelpers.getObjectField(task, "mWmService")
+        synchronized(XposedHelpers.getObjectField(wm, "mGlobalLock")) {
+            if (overrideLeases[taskId] !== lease || !isLeashManaged(taskId) || !isInOurSubtree(task)) return false
+            val parent = XposedHelpers.callMethod(task, "getParent")?.let { XposedHelpers.callMethod(it, "asTask") }
+            if (parent != null && notificationStages.containsKey(XposedHelpers.getIntField(parent, "mTaskId"))) {
+                // A reused task may have been moved into this launch's hidden container. CORE's
+                // hidden frame has now committed; promote it while still hidden, then await draw.
+                val wct = newWct()
+                val token = XposedHelpers.getObjectField(XposedHelpers.callMethod(task, "getTaskInfo"), "token")
+                XposedHelpers.callMethod(wct, "reparent", token, checkNotNull(launchRootToken()), true)
+                applyWct(wct)
+            }
+            val v = layout.logicalViewport
+            if (layout.contentOrientation == com.buildsession.betterYAMF.window.api.ContentOrientation.PORTRAIT)
+                check(v.height > v.width) { "Portrait layout needs a portrait viewport" }
+            val selected = Rect(v.left, v.top, v.right, v.bottom)
+            if (logicalBounds[taskId] != selected) {
+                logicalBounds[taskId] = selected
+                lease.viewport = v
+                shapedTasks.remove(taskId)
+            }
+            if (!initialPresentations.containsKey(taskId)) {
+                val stage = InitialPresentation(Rect(physical))
+                initialPresentations[taskId] = stage
+                fenceInitialDraw(taskId, lease.task, stage)
+            }
+        }
+        true
+    }.onFailure { logError(TAG, "task layout preparation failed task=$taskId", it) }.getOrDefault(false)
+
+    internal fun matchesTaskLayout(taskId: Int, layout: com.buildsession.betterYAMF.window.api.TaskLayout): Boolean {
+        val lease = overrideLeases[taskId] ?: return false
+        val task = lease.task
+        val wm = XposedHelpers.getObjectField(task, "mWmService")
+        return synchronized(XposedHelpers.getObjectField(wm, "mGlobalLock")) {
+            if (overrideLeases[taskId] !== lease || !isLeashManaged(taskId) || !isInOurSubtree(task)) false else {
+                val top = XposedHelpers.callMethod(task, "getTopNonFinishingActivity") ?: return@synchronized false
+                val config = XposedHelpers.callMethod(top, "getConfiguration") as android.content.res.Configuration
+                layout.contentOrientation != com.buildsession.betterYAMF.window.api.ContentOrientation.PORTRAIT ||
+                    config.orientation == android.content.res.Configuration.ORIENTATION_PORTRAIT && config.screenHeightDp >= config.screenWidthDp
+            }
+        }
+    }
+
+    fun isFloatingRootTask(taskId: Int): Boolean = taskId > 0 &&
+        (taskId == floatingRootTaskId || notificationStages.containsKey(taskId))
+
+    /** Hidden organizer-owned child. The original PendingIntent selects its actual task normally;
+     * launchRootTask contains its first surface without a fullscreen flash. No user task is made
+     * into this temporary root, and no task-id/package heuristic correlates the launch.
+     */
+    internal fun createNotificationStage(layout: com.buildsession.betterYAMF.window.api.TaskLayout): NotificationTaskStage {
+        check(entryReady)
+        val root = checkNotNull(launchRootToken())
+        val previous = mutableMapOf<Int, NotificationTaskStage.PreviousTask>()
+        val infos = XposedHelpers.callMethod(Instances.activityTaskManager, "getTasks", Int.MAX_VALUE, false, false, -1) as List<*>
+        for (info in infos.filterIsInstance<ActivityManager.RunningTaskInfo>()) {
+            val task = resolveTaskByToken(XposedHelpers.getObjectField(info, "token")) ?: continue
+            val wm = XposedHelpers.getObjectField(task, "mWmService")
+            synchronized(XposedHelpers.getObjectField(wm, "mGlobalLock")) {
+                val parent = XposedHelpers.callMethod(task, "getParent")
+                val parentTask = parent?.let { XposedHelpers.callMethod(it, "asTask") }
+                val parentToken = parentTask?.let { XposedHelpers.getObjectField(
+                    XposedHelpers.callMethod(it, "getTaskInfo"), "token") }
+                val config = XposedHelpers.callMethod(task, "getRequestedOverrideConfiguration") as android.content.res.Configuration
+                val wc = XposedHelpers.getObjectField(config, "windowConfiguration")
+                val parentStage = parentTask?.let { notificationStages[XposedHelpers.getIntField(it, "mTaskId")] }
+                previous[info.taskId] = if (parentStage != null) {
+                    parentStage.previous[info.taskId]?.takeIf { it.task === task }
+                        ?: NotificationTaskStage.PreviousTask(task, null, Rect(), 0)
+                } else NotificationTaskStage.PreviousTask(task, parentToken,
+                    Rect(XposedHelpers.callMethod(task, "getRequestedOverrideBounds") as Rect),
+                    XposedHelpers.callMethod(wc, "getWindowingMode") as Int)
+            }
+        }
+        val builder = XposedHelpers.newInstance(Instances.systemContext.classLoader.loadClass("android.window.TaskCreationParams\$Builder"))
+        XposedHelpers.callMethod(builder, "setName", "reYAMF_notification_stage")
+        XposedHelpers.callMethod(builder, "setDisplayId", 0)
+        XposedHelpers.callMethod(builder, "setParentContainer", root)
+        XposedHelpers.callMethod(builder, "setWindowingMode", WINDOWING_MODE_FREEFORM)
+        XposedHelpers.callMethod(builder, "setLaunchCookie", ShellOwnershipServer.cookie)
+        val appeared = checkNotNull(XposedHelpers.callMethod(checkNotNull(organizerControllerRef), "createTask",
+            XposedHelpers.callMethod(builder, "build")))
+        val info = XposedHelpers.callMethod(appeared, "getTaskInfo") as ActivityManager.RunningTaskInfo
+        val stage = NotificationTaskStage(info.taskId, XposedHelpers.getObjectField(info, "token"), previous)
+        notificationStages[info.taskId] = stage // Record before fallible setup, for complete cleanup.
+        var raw: SurfaceControl? = null
+        try {
+            raw = XposedHelpers.callMethod(appeared, "getLeash") as SurfaceControl
+            val leash = checkNotNull(ownLeash(raw))
+            try { SurfaceControl.Transaction().use { tx -> tx.setAlpha(leash, 0f); XposedHelpers.callMethod(tx, "hide", leash); tx.apply() } }
+            finally { releaseQuietly(leash) }
+            val v = layout.logicalViewport
+            val wct = newWct()
+            XposedHelpers.callMethod(wct, "setBounds", stage.token, Rect(v.left, v.top, v.right, v.bottom))
+            // This is the TEMPORARY empty container only, not a hosted task. WOC's force-hidden
+            // state prevents native transitions from exposing the first surface. TaskInfo cookies
+            // still arrive from ActivityStarter#postStartActivityProcessing before app drawing;
+            // adoption out of this container starts the ordinary prepare/draw/fade-in path.
+            XposedHelpers.callMethod(wct, "setHidden", stage.token, true)
+            applyWct(wct)
+            return stage
+        } catch (error: Throwable) { disposeNotificationStage(stage); throw error }
+        finally { releaseQuietly(raw) }
+    }
+
+    /** No WM lock crosses host/IPC work. The scoped native identity is checked a second time
+     * inside synchronous adoption, immediately before publishing ownership or using its token.
+     */
+    internal fun <T> withNotificationTaskSelection(selection: NotificationTaskSelection, claim: () -> T): T {
+        val wm = XposedHelpers.getObjectField(selection.task, "mWmService")
+        synchronized(XposedHelpers.getObjectField(wm, "mGlobalLock")) {
+            check(resolveTaskByToken(selection.token) === selection.task &&
+                XposedHelpers.getIntField(selection.task, "mTaskId") == selection.taskId &&
+                XposedHelpers.callMethod(selection.task, "getDisplayId") == 0) { "Notification task selection is stale" }
+            check(!isLeashManaged(selection.taskId) || overrideLeases[selection.taskId]?.task === selection.task) {
+                "Notification task belongs to a different native lease"
+            }
+        }
+        val previous = notificationSelection.get()
+        notificationSelection.set(selection)
+        return try { claim() } finally {
+            if (previous == null) notificationSelection.remove() else notificationSelection.set(previous)
+        }
+    }
+
+    internal fun captureNotificationRestoration(stage: NotificationTaskStage, taskId: Int) {
+        if (isLeashManaged(taskId)) return // Preserve the existing session's restoration lease.
+        val task = taskInfoById(taskId)?.let { resolveTaskByToken(XposedHelpers.getObjectField(it, "token")) } ?: return
+        val previous = stage.previous[taskId]?.takeIf { it.task === task }
+        val parent = previous?.parentToken?.takeIf { token ->
+            resolveTaskByToken(token)?.let { !isFloatingRootTask(XposedHelpers.getIntField(it, "mTaskId")) } == true
+        }
+        if (parent == null) originalParentTokens.remove(taskId) else originalParentTokens[taskId] = parent
+    }
+
+    /** Dispose only this container. A failed/unclaimed launch is returned to its prelaunch parent
+     * (or the normal display area) in the background; never remove an application's task.
+     */
+    internal fun disposeNotificationStage(stage: NotificationTaskStage) {
+        if (stage.closed) return
+        stage.closed = true
+        var disposed = false
+        try {
+            val task = resolveTaskByToken(stage.token) ?: run { disposed = true; return }
+            val wm = XposedHelpers.getObjectField(task, "mWmService")
+            synchronized(XposedHelpers.getObjectField(wm, "mGlobalLock")) {
+                val count = XposedHelpers.callMethod(task, "getChildCount") as Int
+                val wct = newWct()
+                for (index in 0 until count) {
+                    val child = XposedHelpers.callMethod(task, "getChildAt", index)
+                    val id = XposedHelpers.getIntField(child, "mTaskId")
+                    val token = XposedHelpers.getObjectField(XposedHelpers.callMethod(child, "getTaskInfo"), "token")
+                    val previous = stage.previous[id]?.takeIf { it.task === child }
+                    val parent = previous?.parentToken?.takeIf { resolveTaskByToken(it) != null }
+                    XposedHelpers.callMethod(wct, "reparent", token, parent, false)
+                    XposedHelpers.callMethod(wct, "setWindowingMode", token, previous?.mode ?: 0)
+                    XposedHelpers.callMethod(wct, "setBounds", token, previous?.bounds ?: Rect())
+                }
+                if (count > 0) applyWct(wct)
+                check((XposedHelpers.callMethod(task, "getChildCount") as Int) == 0)
+                val removal = newWct()
+                XposedHelpers.callMethod(removal, "removeTask", stage.token)
+                applyWct(removal)
+                disposed = true
+            }
+        } catch (error: Throwable) { logError(TAG, "notification stage cleanup failed task=${stage.taskId}", error) }
+        finally {
+            if (disposed) {
+                notificationStages.remove(stage.taskId, stage)
+                leashes.remove(stage.taskId)?.let(::releaseQuietly)
+            } else stage.closed = false // Keep tracking a failed cleanup; never forget an owned native container.
+            updateRootVisibility()
+        }
+    }
 
     /** 承载根是否已具备 always-on-top 置顶身份（生效后宿主应让路，不再抢层）。 */
     fun isRootAlwaysOnTop(): Boolean = rootAlwaysOnTop
@@ -192,6 +378,7 @@ object SmoothTaskOrganizer {
     fun managedTaskIds(): IntArray {
         val ids = ArrayList<Int>(adoptedTasks.size + 1)
         if (floatingRootTaskId > 0) ids.add(floatingRootTaskId)
+        ids.addAll(notificationStages.keys)
         ids.addAll(adoptedTasks)
         return ids.toIntArray()
     }
@@ -950,10 +1137,15 @@ object SmoothTaskOrganizer {
             ) as? List<*> ?: return false
             val info = runningTasks.find { XposedHelpers.getIntField(it, "taskId") == taskId } ?: return false
             val token = XposedHelpers.getObjectField(info, "token")
+            notificationSelection.get()?.let { expected ->
+                check(expected.taskId == taskId && resolveTaskByToken(token) === expected.task) {
+                    "Notification task changed before adoption"
+                }
+            }
             val parentTaskId = runCatching { XposedHelpers.getIntField(info, "parentTaskId") }.getOrDefault(-1)
             // 启动即入根（ActivityOptions#setLaunchRootTask）时父级就是承载根本身：不能把它记为
             // "原父级"，否则释放（回全屏）会把任务又塞回我们根里。回落默认 TaskDisplayArea（null）。
-            if (parentTaskId != -1 && parentTaskId != floatingRootTaskId) {
+            if (parentTaskId != -1 && !isFloatingRootTask(parentTaskId)) {
                 runningTasks.find { XposedHelpers.getIntField(it, "taskId") == parentTaskId }?.let {
                     originalParentTokens[taskId] = XposedHelpers.getObjectField(it, "token")
                 }

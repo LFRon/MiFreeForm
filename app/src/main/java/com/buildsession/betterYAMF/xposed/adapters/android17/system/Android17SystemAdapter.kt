@@ -6,6 +6,7 @@ import com.buildsession.betterYAMF.xposed.adapters.SurfacePolicies
 import com.buildsession.betterYAMF.xposed.adapters.common.organizer.SmoothWindowBackend
 import com.buildsession.betterYAMF.xposed.adapters.common.system.SystemHookInstaller
 import com.buildsession.betterYAMF.xposed.hook.bridge.NativeHooks
+import de.robv.android.xposed.XposedHelpers
 
 /** LoS 24.0 and PixelOS seventeen use this reviewed organizer/draw-sync mechanism.
  * Resolve signatures before installing global task hooks; structure alone is not device proof.
@@ -23,6 +24,13 @@ internal object Android17SystemAdapter : AndroidSystemAdapter {
         task.getDeclaredMethod("fillTaskInfo", android.app.TaskInfo::class.java, Boolean::class.javaPrimitiveType,
             classLoader.loadClass("com.android.server.wm.TaskDisplayArea"))
         task.getDeclaredField("mLaunchCookie"); task.getDeclaredField("mTaskOrganizer")
+        // These layout-readiness members are inherited. Resolve and warm the same native-call
+        // cache used by the frame waiter before any task Hook or window is installed.
+        val activity = classLoader.loadClass("com.android.server.wm.ActivityRecord")
+        check(XposedHelpers.findMethodBestMatch(task, "getTopNonFinishingActivity",
+            *emptyArray<Class<*>>()).returnType == activity)
+        check(XposedHelpers.findMethodBestMatch(activity, "getConfiguration",
+            *emptyArray<Class<*>>()).returnType == android.content.res.Configuration::class.java)
         android.app.TaskInfo::class.java.getField("launchCookies")
         classLoader.loadClass("com.android.server.wm.WindowOrganizerController").getDeclaredMethod("getTaskOrganizerController")
         classLoader.loadClass("android.window.TaskCreationParams\$Builder").getDeclaredMethod("setLaunchCookie", android.os.IBinder::class.java)
@@ -44,6 +52,13 @@ internal object Android17SystemAdapter : AndroidSystemAdapter {
         }
         catch (error: Throwable) { registrations.asReversed().forEach { it.unhook() }; throw error }
         installed = true
+        runCatching {
+            com.buildsession.betterYAMF.xposed.adapters.android17.notification.NotificationWindowServer.install(classLoader)
+            com.buildsession.betterYAMF.xposed.adapters.common.system.ShellOwnershipServer.notificationCapability = {
+                com.buildsession.betterYAMF.xposed.adapters.android17.notification.NotificationWindowServer.capability
+            }
+        }.onFailure { com.buildsession.betterYAMF.xposed.utils.logWarning("reYAMF_Notification",
+            "Notification capability unavailable; existing Recents/Shell hooks remain active", it) }
     }
 
     override fun windowBackend(): WindowBackend {

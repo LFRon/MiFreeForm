@@ -2,6 +2,7 @@ package com.buildsession.betterYAMF.window.core
 
 import com.buildsession.betterYAMF.window.api.TaskFocusFacts
 import com.buildsession.betterYAMF.window.api.TaskFocusOrigin
+import com.buildsession.betterYAMF.window.api.EntryOrigin
 
 /** Cross-window task rules. Visual stacking never grants automatic global input focus. */
 object WindowSessionPolicy {
@@ -14,4 +15,10 @@ object WindowSessionPolicy {
      */
     fun acceptsTaskFocus(facts: TaskFocusFacts): Boolean =
         facts.origin == TaskFocusOrigin.DIRECT || !facts.windowOwned
+
+    /** Notification windows must never replace the foreground app with fullscreen on failure. */
+    fun restoreToFrontOnFailure(origin: EntryOrigin): Boolean = when (origin) {
+        EntryOrigin.RECENTS -> true
+        EntryOrigin.NOTIFICATION -> false
+    }
 }
