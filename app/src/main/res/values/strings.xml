@@ -1,4 +1,7 @@
 <resources>
+    <string name="module_detection_unsupported">Detection not supported yet</string>
+    <string name="module_detection_deferred_message">Activation and scope detection will be added after migrating to libxposed 102. This message does not mean the module is inactive.</string>
+    <string name="sidebar_overlay_permission_message">Allow display over other apps to use the sidebar.</string>
     <string name="app_name">BetterYAMF</string>
     <string name="details">Details</string>
     <string name="unknown_error">Unknown Error</string>

@@ -390,6 +390,9 @@ object YAMFManager : IYAMFManager.Stub() {
         if (config.defaultWindowHeight == LEGACY_DEFAULT_WINDOW_HEIGHT) {
             config.defaultWindowHeight = 0
         }
+        runCatching {
+            UserService.register(systemContext, activityManagerService)
+        }.onFailure { logWarning(TAG, "App connection bridge unavailable", it) }
         // log(TAG, "config: $config")
     }
 

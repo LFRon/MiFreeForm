@@ -11,7 +11,20 @@ import com.buildsession.betterYAMF.manager.services.YAMFManagerProxy
  */
 object WindowGateway {
 
-    private val openCountStubs = mutableMapOf<(Int) -> Unit, IOpenCountListener>()
+    private class OpenCountSubscription(var listener: ((Int) -> Unit)?) {
+        val stub = object : IOpenCountListener.Stub() {
+            override fun onUpdate(count: Int) { runMain { listener?.invoke(count) } }
+        }
+    }
+    private val openCountStubs = mutableMapOf<(Int) -> Unit, OpenCountSubscription>()
+
+    init {
+        YAMFManagerProxy.addConnectionListener { binder ->
+            if (binder != null) openCountStubs.values.toList().forEach { subscription ->
+                runCatching { YAMFManagerProxy.registerOpenCountListener(subscription.stub) }
+            }
+        }
+    }
 
     fun createWindow(appInfo: AppInfo) {
         YAMFManagerProxy.createWindowUserspace(appInfo)
@@ -27,16 +40,17 @@ object WindowGateway {
 
     /** 打开窗口数变化回调（回调保证在主线程派发）。 */
     fun registerOpenCountListener(listener: (Int) -> Unit) {
-        val stub = object : IOpenCountListener.Stub() {
-            override fun onUpdate(count: Int) {
-                runMain { listener(count) }
-            }
-        }
-        openCountStubs[listener] = stub
-        YAMFManagerProxy.registerOpenCountListener(stub)
+        unregisterOpenCountListener(listener)
+        val subscription = OpenCountSubscription(listener)
+        openCountStubs[listener] = subscription
+        runCatching { YAMFManagerProxy.registerOpenCountListener(subscription.stub) }
     }
 
     fun unregisterOpenCountListener(listener: (Int) -> Unit) {
-        openCountStubs.remove(listener)?.let { YAMFManagerProxy.unregisterOpenCountListener(it) }
+        openCountStubs.remove(listener)?.let { subscription ->
+            // Detach the Activity before IPC, including failed unregisters and queued callbacks.
+            subscription.listener = null
+            runCatching { YAMFManagerProxy.unregisterOpenCountListener(subscription.stub) }
+        }
     }
 }

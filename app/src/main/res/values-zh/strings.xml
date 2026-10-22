@@ -1,4 +1,7 @@
 <resources>
+    <string name="module_detection_unsupported">暂不支持检测</string>
+    <string name="module_detection_deferred_message">模块激活及作用域完整性检测将在迁移至 libxposed 102 后补充。当前提示不代表模块未激活。</string>
+    <string name="sidebar_overlay_permission_message">使用侧边栏需要允许显示在其他应用上层。</string>
     <string name="app_name">BetterYAMF</string>
     <string name="details">详情</string>
     <string name="unknown_error">未知错误</string>

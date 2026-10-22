@@ -17,7 +17,11 @@
 
 安装需要支持本工程 Xposed 接口的框架，例如 LSPosed。当前 Android 17 实现需要同时启用 **`android`、`com.android.systemui` 和实际承担最近任务手势的 Launcher**。SystemUI 承载 Shell，小窗后端会等待同一构建的 Shell 隔离确认；缺少其作用域或仍驻留旧代码时，后端不宣告入口可用。侧边栏等应用侧浮层按界面提示授予悬浮窗权限。
 
-安装或更新 APK 后，应检查应用中的激活状态与系统驻留模块的构建信息。APK 更新成功不等于 Launcher / `system_server` 已加载新代码；驻留版本的生效方式由所用框架决定。
+安装或更新 APK 后，应在 Hook 框架中检查模块及所需作用域。APK 更新成功不等于 Launcher / `system_server` 已加载新代码；驻留版本的生效方式由所用框架决定。
+
+顶栏及状态卡片目前显示“暂不支持检测”，模块激活及作用域完整性检测将在迁移至 **libxposed 102** 后补充。这一提示不代表模块未激活，也不根据服务连接或后端就绪状态推断作用域是否完整。
+
+当前没有额外的进程完整性探测、回报或检测定时器。设置、窗口命令所需的应用服务连接按启动、前台及 UID 活跃事件建立，不进行周期轮询。悬浮窗权限仅在用户主动启动侧边栏时申请，不影响查看应用界面。
 
 ## 架构
 
@@ -179,6 +183,8 @@ gradle :app:lintDebug :app:lintRelease :app:compileDebugAndroidTestKotlin
 - `compileDebugAndroidTestKotlin` 只编译设备测试；实际设备验证另行执行，不能用编译成功替代原生交接验证。
 
 ## 日志与排查
+
+模块管理界面通过 `ModuleInfoGateway` 读取检测支持情况和配置服务的连接状态，通过 `SettingsRepository` 提交类型明确的设置意图；不引用 Hook、反射、Binder 或 JSON 传输实现。连接状态仅用于配置与窗口命令，不作为激活判断。服务迟到连接会刷新配置界面和重新登记窗口计数，断开时不会把默认配置写回系统。
 
 米窗自身日志统一通过 `AppLog` 与 `xposed.utils.Logging` 输出：Debug 保留调试日志；Release 仅保留 Warning / Error。普通调试接口使用 `inline` 延迟消息和编译期 `BuildConfig.DEBUG`，Release 会裁剪输出及消息求值，不执行相应的字符串拼接和调试取数。系统和第三方库日志不受这个开关控制。
 

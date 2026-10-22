@@ -33,6 +33,14 @@ adapters/
 
 系统侧通过 `SystemAdapters` 选择 Android 后端，`YAMFManager` 不再直接指定 `SmoothWindowBackend`。在 `systemReady` 前核对关键任务、表面迁移和绘制接口，再安装原生 Hook；窗口执行仍通过 `WindowBackend` 和现有公共执行端口连接。
 
+### 应用服务连接
+
+当前 UI 不提供激活及作用域完整性检测，统一提示将在迁移 libxposed 102 后补充。Shell/Launcher 中不安装额外的状态回报器；现有入口协商、Shell 隔离与窗口就绪屏障继续按原契约执行。
+
+`UserService` 在 `systemReady` 完成配置初始化后安装应用连接桥接，仅供设置和窗口命令使用。应用发送共享发送者身份的显式连接请求；系统核对实际 UID、包名及发送用户，只向该用户的模块 Provider 回传服务 Binder，不查询或回传 Hook 完整性状态。UID 活跃事件保留为兼容推送入口，登记后补取一次活跃快照，不在包服务发布时读取 UID 或等待 activity 服务。Provider IPC 由独立消息队列合并处理，并在 `finally` 调用 `removeContentProviderExternalAsUser` 归还每次取得的外部引用；不在 AM/WM 或主线程等待应用。
+
+源码依据为 LOS 24.0 的 `UidObserverController.register/dispatchUidsChangedForObserver`、`ActivityManagerService.isUidActive`、`ContextImpl.sendBroadcast` / `BroadcastOptions.setShareIdentityEnabled`、`ContentProvider.getCallingAttributionSource` 及 `ContentProviderHelper.removeContentProviderExternalAsUser`。连接桥接不修改现有 v2 action、字段或 AIDL 次序。
+
 Android 17 还需启用 `com.android.systemui` 的模块作用域。Shell 与系统使用独立的拥有者协商，确认相同构建和归属标记后才创建根；SystemUI 死亡使入口能力失效，正常重建后重新协商。它不占用 Launcher 的 v2 对端登记表，也不改变像素协议。隔离机制、源码点位与资源规则见 [Shell 接入说明](android17/shell/README.md)。
 
 通知入口单独预解析并安装在 `android17/notification`。输入侧保留通知行检查和原生解锁，包装保留下来的解锁后接口；执行侧关联唯一 cookie、原生 Task 对象及 token，经稳定事件和执行端口恢复场景。是否接管、目标布局、模式、轨迹、失败后的去向由 CORE 决定；临时启动容器、权限、绘制就绪与通知记录清理留在 AD。签名不匹配只撤回通知能力，不影响已安装的 Shell / Recents 路径。公共契约见 [`window-api/README.md`](../../../../../../../../../window-api/README.md) 的横屏通知入口说明。

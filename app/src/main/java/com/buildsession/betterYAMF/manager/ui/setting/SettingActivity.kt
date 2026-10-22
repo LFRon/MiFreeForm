@@ -5,11 +5,17 @@ import androidx.activity.enableEdgeToEdge
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
+import androidx.core.widget.doAfterTextChanged
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
+import kotlinx.coroutines.launch
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.slider.Slider
 import com.buildsession.betterYAMF.R
 import com.buildsession.betterYAMF.databinding.ActivitySettingBinding
 import com.buildsession.betterYAMF.manager.core.settings.SettingsRepository
+import com.buildsession.betterYAMF.manager.core.gateway.ModuleInfoGateway
 import com.buildsession.betterYAMF.common.model.Config as YAMFConfig
 
 class SettingActivity : AppCompatActivity() {
@@ -18,6 +24,9 @@ class SettingActivity : AppCompatActivity() {
     private val binding get() = _binding
 
     lateinit var config: YAMFConfig
+    private var applyingConfig = false
+    private var sizesEdited = false
+    private var hadService = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -31,6 +40,23 @@ class SettingActivity : AppCompatActivity() {
         }
 
         initData()
+        binding?.etSizeW?.doAfterTextChanged { if (!applyingConfig) sizesEdited = true }
+        binding?.etSizeH?.doAfterTextChanged { if (!applyingConfig) sizesEdited = true }
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                ModuleInfoGateway.serviceConnected.collect { connected ->
+                    binding?.apply {
+                        listOf(etSizeW, etSizeH, sliderRounded, sliderBarRounded, sliderAnimationSpeed,
+                            btnResetConfig).forEach { it.isEnabled = connected }
+                        if (connected && !hadService && !sizesEdited) {
+                            config = SettingsRepository.load()
+                            applyConfigToViews()
+                        }
+                    }
+                    hadService = connected
+                }
+            }
+        }
     }
 
     private fun initData() {
@@ -46,6 +72,7 @@ class SettingActivity : AppCompatActivity() {
                     .setPositiveButton(R.string.reset) { _, _ ->
                         SettingsRepository.resetToDefaults()
                         config = SettingsRepository.current()
+                        sizesEdited = false
                         applyConfigToViews()
                     }
                     .show()
@@ -56,7 +83,6 @@ class SettingActivity : AppCompatActivity() {
 
                 override fun onStopTrackingTouch(slider: Slider) {
                     tvRoundedValue.text = "${slider.value.toInt()}"
-                    config.windowRoundedCorner = slider.value.toInt()
                     SettingsRepository.setWindowRoundedCorner(slider.value.toInt())
                 }
             })
@@ -66,7 +92,6 @@ class SettingActivity : AppCompatActivity() {
 
                 override fun onStopTrackingTouch(slider: Slider) {
                     tvBarRoundedValue.text = "${slider.value.toInt()}"
-                    config.barRoundedCorner = slider.value.toInt()
                     SettingsRepository.setBarRoundedCorner(slider.value.toInt())
                 }
             })
@@ -80,7 +105,6 @@ class SettingActivity : AppCompatActivity() {
                     } else{
                         "${slider.value.toInt()}"
                     }
-                    config.animationSpeed = slider.value
                     SettingsRepository.setAnimationSpeed(slider.value)
                 }
             })
@@ -88,33 +112,38 @@ class SettingActivity : AppCompatActivity() {
     }
 
     private fun applyConfigToViews() {
-        binding?.apply {
-            etSizeH.hint = getString(R.string.window_size_auto)
-            etSizeH.setText(if (config.defaultWindowHeight > 0) config.defaultWindowHeight.toString() else "")
-            etSizeW.setText(config.defaultWindowWidth.toString())
-            sliderRounded.value = config.windowRoundedCorner.toFloat()
-            sliderBarRounded.value = config.barRoundedCorner.toFloat()
-            sliderAnimationSpeed.value = config.animationSpeed
-            tvRoundedValue.text = "${config.windowRoundedCorner}"
-            tvBarRoundedValue.text = "${config.barRoundedCorner}"
-            tvAnimationSpeedValue.text = if (config.animationSpeed == 5100f) {
-                getString(R.string.default_speed)
-            } else {
-                "${config.animationSpeed.toFloat()}"
+        applyingConfig = true
+        try {
+            binding?.apply {
+                etSizeH.hint = getString(R.string.window_size_auto)
+                etSizeH.setText(if (config.defaultWindowHeight > 0) config.defaultWindowHeight.toString() else "")
+                etSizeW.setText(config.defaultWindowWidth.toString())
+                sliderRounded.value = config.windowRoundedCorner.toFloat()
+                sliderBarRounded.value = config.barRoundedCorner.toFloat()
+                sliderAnimationSpeed.value = config.animationSpeed
+                tvRoundedValue.text = "${config.windowRoundedCorner}"
+                tvBarRoundedValue.text = "${config.barRoundedCorner}"
+                tvAnimationSpeedValue.text = if (config.animationSpeed == 5100f) {
+                    getString(R.string.default_speed)
+                } else {
+                    "${config.animationSpeed.toFloat()}"
+                }
             }
+        } finally { applyingConfig = false }
+    }
+
+    override fun onStop() {
+        if (sizesEdited && ModuleInfoGateway.serviceConnected.value) binding?.apply {
+            val height = etSizeH.text.toString().toIntOrNull() ?: 0
+            val width = etSizeW.text.toString().toIntOrNull()
+            SettingsRepository.setWindowSize(width, height)
+            sizesEdited = false
         }
+        super.onStop()
     }
 
     override fun onDestroy() {
+        _binding = null
         super.onDestroy()
-        binding?.apply {
-            val height = etSizeH.text.toString().toIntOrNull() ?: 0
-            val width = etSizeW.text.toString().toIntOrNull()
-            // 读-改-写：其他字段取模块最新值（单写者语义）
-            SettingsRepository.update { cfg ->
-                cfg.defaultWindowHeight = height
-                if (width != null) cfg.defaultWindowWidth = width
-            }
-        }
     }
 }

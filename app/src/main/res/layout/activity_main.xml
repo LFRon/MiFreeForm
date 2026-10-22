@@ -42,12 +42,12 @@
                         android:gravity="start"/>
 
                     <TextView
+                        android:id="@+id/tvHookSummary"
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
                         android:textSize="14sp"
                         android:textColor="?android:textColor"
-                        android:text="@string/a_yamf_fork"
-                        android:textStyle="italic"
+                        android:text="@string/module_detection_unsupported"
                         android:gravity="start"/>
                 </LinearLayout>
             </com.google.android.material.appbar.MaterialToolbar>
@@ -85,7 +85,7 @@
                         android:layout_width="24dp"
                         android:layout_height="24dp"
                         android:layout_centerVertical="true"
-                        app:srcCompat="@drawable/ic_round_check_circle_24"
+                        app:srcCompat="@drawable/ic_warning_amber_24"
                         app:tint="?colorOnPrimary"
                         tools:ignore="ContentDescription" />
 
@@ -99,7 +99,7 @@
                         android:textAppearance="?textAppearanceTitleMedium"
                         android:textColor="?colorOnPrimary"
                         android:textSize="16sp"
-                        tools:text="Magisk: activated" />
+                        tools:text="@string/module_detection_unsupported" />
 
                     <com.google.android.material.textview.MaterialTextView
                         android:id="@+id/tvVersion"

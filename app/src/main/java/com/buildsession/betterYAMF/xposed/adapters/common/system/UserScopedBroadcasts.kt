@@ -17,6 +17,7 @@ internal object UserScopedBroadcasts {
     data class Sender(val packageName: String, val userId: Int, val uid: Int)
 
     private val userOf by lazy { UserHandle::class.java.getMethod("of", Int::class.javaPrimitiveType) }
+    private val userIdOf by lazy { UserHandle::class.java.getMethod("getUserId", Int::class.javaPrimitiveType) }
     private val sendingUser by lazy { BroadcastReceiver::class.java.getMethod("getSendingUserId") }
     private val sentFromUid by lazy { runCatching { BroadcastReceiver::class.java.getMethod("getSentFromUid") }.getOrNull() }
     private val sentFromPackage by lazy { BroadcastReceiver::class.java.getMethod("getSentFromPackage") }
@@ -31,6 +32,8 @@ internal object UserScopedBroadcasts {
 
     fun deliveryUser(receiver: BroadcastReceiver): Int =
         (sendingUser.invoke(receiver) as Int).also { require(it >= 0) { "Missing broadcast delivery user" } }
+
+    fun userId(uid: Int): Int = userIdOf.invoke(null, uid) as Int
 
     fun senderUid(receiver: BroadcastReceiver): Int =
         sentFromUid?.invoke(receiver) as? Int ?: Process.INVALID_UID
@@ -73,9 +76,10 @@ internal object UserScopedBroadcasts {
     }
 
     /** System commands are received for their real delivery user, retaining sender permission. */
-    fun registerSystemReceiver(context: Context, receiver: BroadcastReceiver, filter: IntentFilter) {
+    fun registerSystemReceiver(context: Context, receiver: BroadcastReceiver, filter: IntentFilter,
+        senderPermission: String? = TRUSTED_SENDER_PERMISSION) {
         check(Process.myUid() == Process.SYSTEM_UID)
         register.invoke(context, receiver, userOf.invoke(null, -1), filter,
-            TRUSTED_SENDER_PERMISSION, null, Context.RECEIVER_EXPORTED)
+            senderPermission, null, Context.RECEIVER_EXPORTED)
     }
 }

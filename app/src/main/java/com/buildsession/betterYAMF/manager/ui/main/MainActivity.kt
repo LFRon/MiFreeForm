@@ -1,7 +1,6 @@
 package com.buildsession.betterYAMF.manager.ui.main
 
 import android.content.Intent
-import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
@@ -11,31 +10,38 @@ import android.view.MenuItem
 import android.view.View
 import android.widget.Toast
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.net.toUri
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
-import com.google.android.material.color.MaterialColors
-import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
+import kotlinx.coroutines.launch
 import com.google.android.material.slider.Slider
 import com.buildsession.betterYAMF.BuildConfig
 import com.buildsession.betterYAMF.R
-import com.buildsession.betterYAMF.common.getAttr
 import com.buildsession.betterYAMF.common.model.Config
 import com.buildsession.betterYAMF.databinding.ActivityMainBinding
 import com.buildsession.betterYAMF.manager.core.gateway.ModuleInfoGateway
+import com.buildsession.betterYAMF.manager.core.gateway.ActivationDetectionSupport
 import com.buildsession.betterYAMF.manager.core.gateway.WindowGateway
 import com.buildsession.betterYAMF.manager.core.settings.SettingsRepository
 import com.buildsession.betterYAMF.manager.sidebar.SidebarLauncher
 import com.buildsession.betterYAMF.manager.ui.setting.SettingActivity
-import com.buildsession.betterYAMF.manager.utils.TipUtil
 
 class MainActivity : AppCompatActivity() {
 
     private var _binding: ActivityMainBinding? = null
     private val binding get() = _binding
     lateinit var config: Config
-    private val CODE_DRAW_OVER_OTHER_APP_PERMISSION = 2084
+    private var applyingSettings = false
+    private var serviceWasConnected = false
+    private val overlayPermission = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+        if (Settings.canDrawOverlays(this)) SidebarLauncher.start(this)
+        else Toast.makeText(this, R.string.sidebar_overlay_permission_message, Toast.LENGTH_SHORT).show()
+    }
 
     companion object {
         const val TAG = "reYAMF_MainActivity"
@@ -64,70 +70,24 @@ class MainActivity : AppCompatActivity() {
 
         WindowGateway.registerOpenCountListener(openCountListener)
         initUi()
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                ModuleInfoGateway.serviceConnected.collect { onServiceConnectionChanged(it) }
+            }
+        }
 
-        if (!Settings.canDrawOverlays(this)) {
-            val intent = Intent(
-                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                Uri.parse("package:$packageName")
-            )
-            startActivityForResult(intent, CODE_DRAW_OVER_OTHER_APP_PERMISSION)
-        } else {}
     }
 
     private fun initUi() {
         config = SettingsRepository.load()
-        val buildTime = ModuleInfoGateway.buildTime
-        when(buildTime) {
-            0L -> {
-                binding?.apply {
-                    ivIcon.setImageResource(R.drawable.ic_error_outline_24)
-                    tvActive.setText(R.string.not_activated)
-                    tvVersion.visibility = View.GONE
-                    val colorError = theme.getAttr(com.google.android.material.R.attr.colorError).data
-                    val colorOnError = theme.getAttr(com.google.android.material.R.attr.colorOnError).data
-                    mcvStatus.setCardBackgroundColor(colorError)
-                    mcvStatus.outlineAmbientShadowColor = colorError
-                    mcvStatus.outlineSpotShadowColor = colorError
-                    tvActive.setTextColor(colorOnError)
-                    tvVersion.setTextColor(colorOnError)
-                    mcvInfo.visibility = View.GONE
-                    mcvSideBar.visibility = View.GONE
-                }
-            }
-            BuildConfig.BUILD_TIME -> {
-                binding?.apply {
-                    ivIcon.setImageResource(R.drawable.ic_round_check_circle_24)
-                    tvActive.setText(R.string.activated)
-                    tvVersion.text = buildString {
-                        append(ModuleInfoGateway.versionName)
-                        append(" (${ModuleInfoGateway.versionCode})")
-                    }
-                }
-            }
-            else -> {
-                binding?.apply {
-                    ivIcon.setImageResource(R.drawable.ic_warning_amber_24)
-                    tvActive.setText(R.string.need_reboot)
-                    tvVersion.text = buildString {
-                        append("system: ${ModuleInfoGateway.versionName} (${ModuleInfoGateway.versionCode})\n")
-                        append("module: ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})")
-                    }
-                    mcvStatus.setCardBackgroundColor(MaterialColors.harmonizeWithPrimary(this@MainActivity, getColor(R.color.color_warning)))
-                    mcvStatus.setOnClickListener {
-                        MaterialAlertDialogBuilder(this@MainActivity)
-                            .setTitle(R.string.need_reboot)
-                            .setMessage(R.string.need_reboot_message)
-                            .setPositiveButton(R.string.reboot) { _, _->
-                                TipUtil.showTip(this@MainActivity, "do it yourself")
-                            }
-                            .show()
-                    }
-                    sliderTransparency.value = config.sidebarTransparency.toFloat()
-                    tvTransparencyValue.text = "${config.sidebarTransparency}"
-                }
+        when (ModuleInfoGateway.activationDetection) {
+            ActivationDetectionSupport.UNSUPPORTED -> binding?.apply {
+                tvHookSummary.setText(R.string.module_detection_unsupported)
+                tvActive.setText(R.string.module_detection_unsupported)
+                tvVersion.setText(R.string.module_detection_deferred_message)
+                ivIcon.setImageResource(R.drawable.ic_warning_amber_24)
             }
         }
-
         if (Build.VERSION.PREVIEW_SDK_INT != 0) {
             binding?.systemVersion?.text = buildString {
                 append(Build.VERSION.CODENAME)
@@ -143,16 +103,19 @@ class MainActivity : AppCompatActivity() {
 
         binding?.apply {
             btLaunchSideBar.setOnClickListener {
-                SidebarLauncher.start(this@MainActivity)
+                if (Settings.canDrawOverlays(this@MainActivity)) SidebarLauncher.start(this@MainActivity)
+                else overlayPermission.launch(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    "package:$packageName".toUri()))
             }
 
             msSideBar.isChecked = config.launchSideBarAtBoot
             msSideBar.setOnCheckedChangeListener { _, isChecked ->
-                SettingsRepository.setLaunchSideBarAtBoot(isChecked)
+                if (!applyingSettings) SettingsRepository.setLaunchSideBarAtBoot(isChecked)
             }
 
             msSideBarPosition.isChecked = config.sidebarPosition
             msSideBarPosition.setOnCheckedChangeListener { _, isChecked ->
+                if (applyingSettings) return@setOnCheckedChangeListener
                 SettingsRepository.setSidebarPosition(isChecked)
                 // 重启侧边栏以应用左右（镜像）变更：先停后启（宽限 1s 待服务完全退出）
                 SidebarLauncher.restart(this@MainActivity, 1000L)
@@ -167,6 +130,7 @@ class MainActivity : AppCompatActivity() {
             msEnableSideBar.isChecked = config.enableSidebar
 
             msEnableSideBar.setOnCheckedChangeListener { _, isChecked ->
+                if (applyingSettings) return@setOnCheckedChangeListener
                 if (isChecked) {
                     innerClSidebar.visibility = View.VISIBLE
                 } else {
@@ -176,6 +140,8 @@ class MainActivity : AppCompatActivity() {
                 SettingsRepository.setEnableSidebar(isChecked)
             }
 
+            sliderTransparency.value = config.sidebarTransparency.toFloat()
+            tvTransparencyValue.text = config.sidebarTransparency.toString()
             sliderTransparency.addOnSliderTouchListener(object : Slider.OnSliderTouchListener {
                 override fun onStartTrackingTouch(slider: Slider) {}
 
@@ -187,6 +153,29 @@ class MainActivity : AppCompatActivity() {
                 }
             })
         }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        ModuleInfoGateway.requestServiceConnection()
+    }
+
+    private fun onServiceConnectionChanged(connected: Boolean) {
+        val view = binding ?: return
+        view.mcvSideBar.visibility = if (connected) View.VISIBLE else View.GONE
+        if (connected && !serviceWasConnected) {
+            applyingSettings = true
+            try {
+                config = SettingsRepository.load()
+                view.msSideBar.isChecked = config.launchSideBarAtBoot
+                view.msSideBarPosition.isChecked = config.sidebarPosition
+                view.msEnableSideBar.isChecked = config.enableSidebar
+                view.innerClSidebar.visibility = if (config.enableSidebar) View.VISIBLE else View.GONE
+                view.sliderTransparency.value = config.sidebarTransparency.toFloat()
+                view.tvTransparencyValue.text = config.sidebarTransparency.toString()
+            } finally { applyingSettings = false }
+        }
+        serviceWasConnected = connected
     }
 
     override fun onCreateOptionsMenu(menu: Menu?): Boolean {
@@ -228,26 +217,9 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        if (requestCode == CODE_DRAW_OVER_OTHER_APP_PERMISSION) {
-            if (resultCode == RESULT_OK) {
-                //startService(Intent(this, SidebarUserSpace::class.java))
-            } else {
-                Toast.makeText(
-                    this,
-                    "Draw over other app permission not available. Closing the application",
-                    Toast.LENGTH_SHORT
-                ).show()
-
-                finish()
-            }
-        } else {
-            super.onActivityResult(requestCode, resultCode, data)
-        }
-    }
-
     override fun onDestroy() {
         super.onDestroy()
         WindowGateway.unregisterOpenCountListener(openCountListener)
+        _binding = null
     }
 }
