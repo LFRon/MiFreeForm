@@ -16,3 +16,5 @@ local.properties
 /Documents/
 /upload.bat
 /.github/
+/.signing/
+/keystore.properties
