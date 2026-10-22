@@ -152,7 +152,13 @@ CORE 输出的可交互帧提交后才回报激活成功，随后在 NMS 执行�
 
 ## 构建与验证
 
-本地已验证的构建使用 Gradle 8.13 与 Android SDK 36，构建 JDK 使用 17 或兼容版本；源码与 JVM 模块目标字节码为 Java 11。配置 `local.properties` 的 `sdk.dir` 或 Android SDK 环境变量后，在仓库根目录执行：
+本地已验证的构建使用 Gradle 8.13 与 Android SDK 36，构建 JDK 使用 17 或兼容版本；源码与 JVM 模块目标字节码为 Java 11。构建前配置 `local.properties` 的 `sdk.dir` 或 Android SDK 环境变量。
+
+首次在新环境构建 APK 前，将 `keystore.properties.example` 复制为 `keystore.properties`，填写自己的密钥文件、别名和密码；相对密钥路径以仓库根目录为基准。Debug 和 Release 共用该签名配置，包名均为 `com.buildsession.betterYAMF`。签名文件与真实配置已加入 Git 忽略；缺少配置时应用构建明确失败，三个 JVM 模块仍可单独验证。
+
+本地签名保存在 `.signing/betteryamf.p12`，证书别名为 `betteryamf`。请将密钥与 `keystore.properties` 一起备份，后续构建继续使用同一份密钥。首次从其他签名迁移时，包名相同也不能直接覆盖旧 APK；新签名配置下的 Debug 和 Release 可以互相覆盖，仍须满足 Android 的版本与安装策略。
+
+完成签名配置后，在仓库根目录执行：
 
 ```bash
 # 以下 gradle 指已安装的 Gradle 8.13
@@ -168,7 +174,7 @@ gradle :app:lintDebug :app:lintRelease :app:compileDebugAndroidTestKotlin
 仓库 Wrapper 当前指定 Gradle 8.11.1；使用 `./gradlew` 时应留意这一版本差异。`gradle.properties` 中含本地代理配置，构建前按自己的网络环境调整或删除。
 
 - Debug：`app/build/outputs/apk/debug/app-debug.apk`。
-- Release：`app/build/outputs/apk/release/app-release-unsigned.apk`。当前未配置 Release 签名，安装或发布前需自行签名。
+- Release：`app/build/outputs/apk/release/app-release.apk`，构建时自动使用项目签名。
 - JVM 测试覆盖公共策略、运行时端口、同步/异步完成、取消和旧结果隔离，并检查模块依赖边界。
 - `compileDebugAndroidTestKotlin` 只编译设备测试；实际设备验证另行执行，不能用编译成功替代原生交接验证。
 

@@ -1,4 +1,5 @@
 import java.io.ByteArrayOutputStream
+import java.util.Properties
 
 plugins {
     alias(libs.plugins.android.application)
@@ -9,6 +10,27 @@ plugins {
     alias(libs.plugins.hiltAndroid)
 }
 
+// Kept outside version control. Both variants use this project-owned signing identity.
+val signingPropertiesFile = rootProject.file("keystore.properties")
+val signingProperties = Properties().apply {
+    if (signingPropertiesFile.isFile) signingPropertiesFile.inputStream().use { load(it) }
+}
+val projectKeystore = signingProperties.getProperty("storeFile")?.takeIf { it.isNotBlank() }
+    ?.let { rootProject.file(it) }
+val validateProjectSigning by tasks.registering {
+    group = "verification"
+    description = "Checks the local signing configuration shared by Debug and Release."
+    doLast {
+        check(signingPropertiesFile.isFile) {
+            "Missing keystore.properties. Copy keystore.properties.example and configure your signing key."
+        }
+        val missing = listOf("storeFile", "storePassword", "keyAlias", "keyPassword")
+            .filter { signingProperties.getProperty(it).isNullOrBlank() }
+        check(missing.isEmpty()) { "Missing signing properties: ${missing.joinToString()}" }
+        check(projectKeystore?.isFile == true) { "The keystore configured by storeFile does not exist." }
+    }
+}
+
 android {
     val buildTime = System.currentTimeMillis()
     val baseVersionName = "Preview1.1"
@@ -16,6 +38,7 @@ android {
     compileSdk = 36
 
     defaultConfig {
+        // No build-type suffix: Debug and Release update the same installed package.
         applicationId = "com.buildsession.betterYAMF"
         minSdk = 33
         targetSdk = 36
@@ -31,6 +54,13 @@ android {
 
         buildConfigField("long", "BUILD_TIME", buildTime.toString())
     }
+    val projectSigning = signingConfigs.create("project") {
+        storeFile = projectKeystore
+        storeType = signingProperties.getProperty("storeType", "PKCS12")
+        storePassword = signingProperties.getProperty("storePassword")
+        keyAlias = signingProperties.getProperty("keyAlias")
+        keyPassword = signingProperties.getProperty("keyPassword")
+    }
     packaging {
         resources.excludes.addAll(
             arrayOf(
@@ -40,7 +70,11 @@ android {
         )
     }
     buildTypes {
+        getByName("debug") {
+            signingConfig = projectSigning
+        }
         release {
+            signingConfig = projectSigning
             isMinifyEnabled = false
             isShrinkResources = false
             proguardFiles(
@@ -66,6 +100,9 @@ android {
         abortOnError = false
     }
 }
+
+// Validate before app compilation/packaging; JVM-only modules and IDE sync need no private key.
+tasks.named("preBuild") { dependsOn(validateProjectSigning) }
 
 dependencies {
     implementation(project(":window-runtime"))
