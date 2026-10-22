@@ -253,13 +253,17 @@ class AppWindow(val context: Context, private val onWindowInit: (WindowHost, Int
         if (destroyed) return
         runCatching {
             if (event.actionMasked == MotionEvent.ACTION_DOWN) {
-                gestureRegion = view.frame?.input?.regionAt(event.rawX, event.rawY)
+                val frame = view.frame
+                gestureRegion = frame?.input?.regionAt(event.rawX, event.rawY)
+                log(TAG) { "shell input down window=$windowId task=$currentTaskId down=${event.downTime} region=$gestureRegion content=${frame?.acceptsContent} mini=${frame?.miniFraction} fullscreen=${frame?.fullscreen?.stage}" }
                 val region = gestureRegion ?: return
                 input(WindowInputEvent.Press(windowId, event.eventTime, region, event.rawX, event.rawY))
             }
             val region = gestureRegion ?: return
             val moving = region == RegionId.BODY_MASK || region == RegionId.HANDLE
             if (moving) detector.onTouchEvent(event)
+            if (BuildConfig.DEBUG && (event.actionMasked == MotionEvent.ACTION_UP || event.actionMasked == MotionEvent.ACTION_CANCEL))
+                log(TAG) { "shell input end window=$windowId task=$currentTaskId down=${event.downTime} region=$region action=${event.actionMasked}" }
             when (event.actionMasked) {
                 MotionEvent.ACTION_MOVE -> if (!moving)
                     input(WindowInputEvent.Move(windowId, event.eventTime, region, event.rawX, event.rawY))

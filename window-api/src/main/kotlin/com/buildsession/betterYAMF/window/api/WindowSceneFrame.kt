@@ -96,6 +96,9 @@ data class WindowSceneFrame(
     val outerRadius: Float,
     val contentRadius: Float,
     val controlsAlpha: Float,
+    /** Application-content pass-through only. Shell gestures are resolved separately in [input];
+     * a visible ordinary bar may remain usable while content awaits its terminal commit.
+     */
     val acceptsContent: Boolean,
     val portrait: Boolean,
     val fullscreenHint: Boolean = false,

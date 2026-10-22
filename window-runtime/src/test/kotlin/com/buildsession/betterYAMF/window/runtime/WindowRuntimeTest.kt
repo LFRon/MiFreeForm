@@ -289,6 +289,36 @@ class WindowRuntimeTest {
         assertEquals(1, f.activations.size)
     }
 
+    @Test fun thePublishedOpeningSceneRoutesOneBottomBarStreamThroughFullscreenWithoutReAdoption() {
+        val f = fixture(); f.ordinary(); f.settle()
+        val id = f.key.windowId
+        f.handle.post(WindowEvent.Input(WindowInputEvent.RequestMini(id, f.clock.now))); f.settle()
+        f.handle.post(WindowEvent.Input(WindowInputEvent.TapConfirmed(id, f.clock.now, RegionId.BODY_MASK, 1100f, 200f)))
+        repeat(8) { f.clock.step() }
+        val shown = f.frames.last().frame
+        assertFalse(shown.acceptsContent)
+        assertNull(shown.input.passThrough)
+        val x = shown.content.left + shown.content.width / 2f
+        val y = (shown.content.bottom + shown.outer.bottom) / 2f
+        // Match AppWindow/LOS dispatch: choose from the scene at DOWN, retain it through UP.
+        val region = checkNotNull(shown.input.regionAt(x, y))
+        assertEquals(RegionId.BAR_BOTTOM, region)
+        f.handle.post(WindowEvent.Input(WindowInputEvent.Press(id, f.clock.now, region, x, y)))
+        f.handle.post(WindowEvent.Input(WindowInputEvent.Move(id, f.clock.now + 10, region, x + 150f, y + 500f)))
+        repeat(15) { f.clock.step() }
+        assertEquals(FullscreenStage.DRAGGING, f.handle.snapshot().fullscreen!!.stage)
+        assertEquals(shown.content.top, f.handle.snapshot().content.top, 1f)
+        f.handle.post(WindowEvent.Input(WindowInputEvent.Up(id, f.clock.now + 20, region, x + 150f, y + 500f)))
+        f.settle()
+        assertNotNull(f.fullscreenResult)
+        assertEquals(1, f.adopted.size)
+        assertEquals(1, f.preparations.size)
+        assertTrue(f.failures.isEmpty())
+        f.fullscreenResult!!(FullscreenHandoffResult(CommandStatus.DONE, true)); f.settle()
+        assertTrue(f.handle.destroyed)
+        assertEquals(listOf(false to true), f.finished)
+    }
+
     @Test fun synchronousPreparationDoesNotCancelAnAlreadyCompletedOperation() {
         val f = fixture(); f.immediateResourceCallback = true
         assertTrue(f.handle.activateTask())

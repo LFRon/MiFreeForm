@@ -10,8 +10,8 @@ class FullscreenTransitionTest {
     private val normal = SceneRect(180f, 700f, 898f, 1139f)
     private val style = SceneStyle(3.2f, 20f, 12f)
 
-    private inner class Driver(scale: Float = 1f) {
-        val scene = WindowSceneController(1, style.copy(animatorScale = scale), metrics, normal)
+    private inner class Driver(scale: Float = 1f, display: SceneMetrics = metrics) {
+        val scene = WindowSceneController(1, style.copy(animatorScale = scale), display, normal)
         val effects = mutableListOf<WindowSceneEffect>()
         val frames = mutableListOf<WindowSceneEffect.Present>()
         var requested: Long? = null
@@ -33,10 +33,13 @@ class FullscreenTransitionTest {
         fun commit(frame: WindowSceneEffect.Present = frames.last(), status: CommandStatus = CommandStatus.DONE) =
             send(WindowSceneEvent.FrameCommitted(frame.frameId, status))
         fun input(event: WindowInputEvent) = send(WindowSceneEvent.Input(event))
-        fun ready() {
+        fun prepare() {
             send(WindowSceneEvent.TaskAvailable)
             val id = effects.filterIsInstance<WindowSceneEffect.Prepare>().last().commandId
             send(WindowSceneEvent.Prepared(id, CommandStatus.DONE))
+        }
+        fun ready() {
+            prepare()
             settle()
             effects.clear(); frames.clear()
         }
@@ -57,6 +60,138 @@ class FullscreenTransitionTest {
         fun exit() { press(); move(500f); up(500f); settle() }
         fun result(id: Long, status: CommandStatus, released: Boolean) =
             send(WindowSceneEvent.FullscreenHandoff(id, FullscreenHandoffResult(status, released)))
+        fun openMini() {
+            input(WindowInputEvent.RequestMini(1, time)); settle()
+            input(WindowInputEvent.TapConfirmed(1, time, RegionId.BODY_MASK, 1100f, 200f))
+        }
+        fun barPoint(): Pair<Float, Float> {
+            val f = scene.snapshot()
+            return if (f.portrait) f.content.left + f.content.width / 2f to (f.content.bottom + f.outer.bottom) / 2f
+                else (f.content.right + f.outer.right) / 2f to f.content.top + f.content.height / 2f
+        }
+        fun downAtBar(): Triple<RegionId, Float, Float> {
+            val (x, y) = barPoint()
+            val region = scene.snapshot().input.regionAt(x, y)
+            assertEquals(if (scene.snapshot().portrait) RegionId.BAR_BOTTOM else RegionId.BAR_SIDE, region)
+            input(WindowInputEvent.Press(1, time, checkNotNull(region), x, y))
+            return Triple(region, x, y)
+        }
+    }
+
+    @Test fun aBottomBarGrabDuringMiniExpansionStartsFullscreenInsteadOfMovingTheWindow() {
+        for (ticks in listOf(8, 24)) {
+            val d = Driver(); d.ready(); d.openMini(); repeat(ticks) { d.tick() }
+            val before = d.scene.snapshot()
+            assertFalse(before.acceptsContent)
+            val lateOpeningFrame = d.frames.last()
+            val (region, x, y) = d.downAtBar()
+            assertEquals(before.content, d.scene.snapshot().content)
+            d.input(WindowInputEvent.Move(1, d.time, region, x + 200f, y + 500f))
+            repeat(20) { d.tick() }
+            val preview = d.scene.snapshot()
+            assertEquals(FullscreenStage.DRAGGING, preview.fullscreen!!.stage)
+            assertEquals(before.content.top, preview.content.top, 1f)
+            assertTrue(preview.content.width > before.content.width)
+            assertNull(preview.input.passThrough)
+            assertTrue(d.effects.none { it is WindowSceneEffect.SystemCommand &&
+                it.command is WindowCommand.DropZoneShow })
+            d.commit(lateOpeningFrame)
+            assertFalse(d.scene.snapshot().acceptsContent)
+            d.input(WindowInputEvent.Up(1, d.time, region, x + 200f, y + 500f)); d.settle()
+            assertEquals(1, d.handoffs().size)
+        }
+    }
+
+    @Test fun releasingOrCancellingABarGrabWithoutMovingStillCompletesTheInterruptedOpening() {
+        for (cancel in listOf(false, true)) {
+            val d = Driver(); d.ready(); d.openMini(); repeat(8) { d.tick() }
+            val before = d.scene.snapshot().content
+            val (x, y) = d.barPoint()
+            // Also exercise the continuation independently of the frame's hit classification.
+            d.input(WindowInputEvent.Press(1, d.time, RegionId.BAR_BOTTOM, x, y))
+            assertEquals(before, d.scene.snapshot().content)
+            if (cancel) d.input(WindowInputEvent.Cancel(1, d.time + 10, RegionId.BAR_BOTTOM, x, y))
+            else d.input(WindowInputEvent.Up(1, d.time + 10, RegionId.BAR_BOTTOM, x, y))
+            d.settle()
+            assertEquals(normal, d.scene.snapshot().content)
+            assertEquals(0f, d.scene.snapshot().miniFraction, 0f)
+            assertTrue(d.scene.snapshot().acceptsContent)
+            assertNull(d.scene.snapshot().fullscreen)
+            assertTrue(d.handoffs().isEmpty())
+        }
+    }
+
+    @Test fun normalContentStaysShieldedDuringOpeningWhileMiniStillUsesItsBodyGesture() {
+        val d = Driver(); d.ready()
+        d.input(WindowInputEvent.RequestMini(1, d.time)); d.settle()
+        val mini = d.scene.snapshot()
+        assertEquals(RegionId.BODY_MASK, mini.input.regionAt(mini.content.left + mini.content.width / 2f,
+            mini.content.top + mini.content.height / 2f))
+        d.input(WindowInputEvent.TapConfirmed(1, d.time, RegionId.BODY_MASK, 1100f, 200f))
+        repeat(8) { d.tick() }
+        val opening = d.scene.snapshot()
+        assertFalse(opening.acceptsContent)
+        assertNull(opening.input.passThrough)
+        assertNull(opening.input.regionAt(opening.content.left + opening.content.width / 2f,
+            opening.content.top + opening.content.height / 2f))
+        d.downAtBar()
+    }
+
+    @Test fun aBarGrabDuringFadeInWorksInBothDisplayOrientations() {
+        for (display in listOf(metrics, SceneMetrics(2780, 1264, 100, 70, rotation = 1))) {
+            val d = Driver(display = display); d.prepare(); repeat(8) { d.tick() }
+            assertTrue(d.scene.snapshot().alpha > 0f)
+            assertFalse(d.scene.snapshot().acceptsContent)
+            val (region, x, y) = d.downAtBar()
+            d.input(WindowInputEvent.Move(1, d.time, region, x, y + 500f))
+            d.input(WindowInputEvent.Up(1, d.time + 20, region, x, y + 500f)); d.settle()
+            assertEquals(1, d.handoffs().size)
+        }
+    }
+
+    @Test fun anUncommittedOpeningFrameDoesNotTurnTheBarIntoABodyDrag() {
+        for (scale in listOf(0f, 1f)) {
+            val d = Driver(scale); d.ready(); d.autoCommit = false; d.openMini(); d.settle()
+            assertFalse(d.scene.snapshot().acceptsContent)
+            val old = d.frames.last()
+            val (region, x, y) = d.downAtBar()
+            d.input(WindowInputEvent.Move(1, d.time, region, x, y + 500f))
+            d.commit(old)
+            assertEquals(FullscreenStage.DRAGGING, d.scene.snapshot().fullscreen!!.stage)
+            assertFalse(d.scene.snapshot().acceptsContent)
+            d.autoCommit = true
+            d.input(WindowInputEvent.Up(1, d.time + 20, region, x, y + 500f)); d.settle()
+            assertEquals(1, d.handoffs().size)
+        }
+    }
+
+    @Test fun aBarGrabDuringThePreviousWindowFlingKeepsItsOwnFullscreenGesture() {
+        val d = Driver(); d.ready()
+        d.input(WindowInputEvent.Press(1, d.time, RegionId.HANDLE, 500f, 710f))
+        d.input(WindowInputEvent.Move(1, d.time + 20, RegionId.HANDLE, 700f, 910f))
+        d.input(WindowInputEvent.Fling(1, d.time + 40, -1000f, 2400f))
+        d.input(WindowInputEvent.Up(1, d.time + 40, RegionId.HANDLE, 700f, 910f))
+        repeat(4) { d.tick() }
+        assertTrue(d.scene.isAnimating())
+        assertFalse(d.scene.snapshot().acceptsContent)
+        val (region, x, y) = d.downAtBar()
+        d.input(WindowInputEvent.Move(1, d.time, region, x, y + 500f))
+        d.input(WindowInputEvent.Up(1, d.time + 20, region, x, y + 500f)); d.settle()
+        assertEquals(1, d.handoffs().size)
+        assertTrue(d.effects.none { it == WindowSceneEffect.FinishClose })
+    }
+
+    @Test fun retainedSourcePixelsCannotAdvertiseOrAcceptShellGesturesBeforeNativeReadiness() {
+        val d = Driver()
+        d.send(WindowSceneEvent.OpenAsMini(SceneRect(200f, 300f, 600f, 900f), awaitSourceRelease = true))
+        d.send(WindowSceneEvent.VisualAvailable)
+        val frozen = d.scene.snapshot()
+        assertTrue(frozen.showEntryImage)
+        assertNull(frozen.input.passThrough)
+        assertTrue(frozen.input.regions.all { it.region == null })
+        d.press(); d.move(500f); d.up(500f); d.settle()
+        assertEquals(frozen, d.scene.snapshot())
+        assertTrue(d.handoffs().isEmpty())
     }
 
     @Test fun pullHasDiminishingGrowthAndKeepsItsTopAndAspect() {
@@ -242,12 +377,12 @@ class FullscreenTransitionTest {
     @Test fun bridgeTouchesCannotStartABodyGestureAndCommittedExitIgnoresAllGestures() {
         val d = Driver(0f); d.ready(); d.press(); d.move(500f)
         val preview = d.scene.snapshot()
-        assertNull(preview.hitTest(preview.content.left + 20f, preview.content.top + 20f, style))
+        assertNull(preview.input.regionAt(preview.content.left + 20f, preview.content.top + 20f))
         assertEquals(RegionId.BAR_BOTTOM,
-            preview.hitTest(preview.content.left + 20f, preview.content.bottom + 10f, style))
+            preview.input.regionAt(preview.content.left + 20f, preview.content.bottom + 10f))
         d.up(500f)
         assertEquals(FullscreenStage.WAITING, d.scene.snapshot().fullscreen!!.stage)
-        assertNull(d.scene.snapshot().hitTest(500f, 2700f, style))
+        assertNull(d.scene.snapshot().input.regionAt(500f, 2700f))
     }
 
     @Test fun supersededBridgeFenceIsRetriedAndStaleInputCannotRestartTaskWrites() {

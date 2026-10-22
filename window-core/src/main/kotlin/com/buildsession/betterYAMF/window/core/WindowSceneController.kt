@@ -124,8 +124,7 @@ class WindowSceneController(
                 taskReady = false
                 effects += WindowSceneEffect.FinishOwnershipLoss
             }
-            is WindowSceneEvent.Input -> if (ready && taskReady && !awaitingSourceRelease &&
-                entryVisual == EntryVisual.LIVE && !entryFlight && permitsInput(event.event)) input(event.event)
+            is WindowSceneEvent.Input -> if (canHandleInput() && permitsInput(event.event)) input(event.event)
             is WindowSceneEvent.OpenAsMini -> {
                 entryOrigin = event.origin
                 openAsMini = event.origin == EntryOrigin.RECENTS
@@ -337,6 +336,9 @@ class WindowSceneController(
         return effects.toList()
     }
 
+    private fun canHandleInput(): Boolean = ready && taskReady && visible && !repreparing &&
+        !awaitingSourceRelease && entryVisual == EntryVisual.LIVE && !entryFlight
+
     private fun permitsInput(event: WindowInputEvent): Boolean = if (sideStash != null)
         event is WindowInputEvent.Pointer && event.region == RegionId.STASH_HANDLE
         else when (fullscreenStage) {
@@ -350,13 +352,26 @@ class WindowSceneController(
 
     private fun input(event: WindowInputEvent) {
         if (event.windowId != windowId) return
+        val barPress = event is WindowInputEvent.Press &&
+            (event.region == RegionId.BAR_BOTTOM || event.region == RegionId.BAR_SIDE)
         if (event is WindowInputEvent.Press && event.region != RegionId.STASH_HANDLE) {
+            if (barPress && previewBase == null) {
+                // Capture the ordinary destination BEFORE cancelling its opening animation.
+                // A tap/cancel without a MOVE must still resume that destination, not freeze
+                // a partly expanded mini or a partly faded window as the new normal pose.
+                previewBase = if (pose.mini > 0f || pose.normalChrome < 1f || pose.alpha < 1f)
+                    Pose(clamp(fitNormalContent(normalContent, true), 0f), 0f, 1f)
+                else pose
+            }
             interrupt()
-            if (fullscreenStage == FullscreenStage.RETURNING) fullscreenStage = FullscreenStage.DRAGGING
+            if (barPress) fullscreenStage = FullscreenStage.DRAGGING
             dragBase = pose
             resizeBase = pose.content
         }
         shell.onInput(event).forEach(::command)
+        // The bar owns this stream even before its first MOVE. Keep native content blocked
+        // through UP/CANCEL and preserve the captured geometry while retargeting the springs.
+        if (barPress) republish()
     }
 
     private fun command(command: WindowCommand) {
@@ -903,6 +918,8 @@ class WindowSceneController(
     )
 
     private fun frame(): WindowSceneFrame {
+        val inputReady = canHandleInput()
+        val shellMode = shell.snapshot().mode
         val m = pose.mini.coerceIn(0f, 1f)
         val normal = pose.normalChrome.coerceIn(0f, 1f)
         val portrait = metrics.height >= metrics.width
@@ -950,8 +967,7 @@ class WindowSceneController(
             bridgeRadius(baseRadius),
             contentRadius,
             if (repreparing) 0f else normal * pose.alpha * (1f - pose.cover) * (1f - iconMix),
-            ready && taskReady && visible && shell.snapshot().mode == ShellMode.NORMAL && motion == null &&
-                pendingCompletion == null && entryVisual == EntryVisual.LIVE &&
+            inputReady && shellMode == ShellMode.NORMAL && motion == null && pendingCompletion == null &&
                 fullscreenStage == null && sideStash == null && m <= 0.001f && normal >= 0.999f,
             portrait, fullscreenHint,
             outerBottomRadius = bridgeRadius(baseBottomRadius),
@@ -972,7 +988,12 @@ class WindowSceneController(
             taskFocusable = sideStash == null && !repreparing,
             coordinateSpace = metrics
         )
-        return result.copy(input = WindowHitPolicy.resolve(result, style))
+        val inputMode = when {
+            !inputReady -> ShellInputMode.BLOCKED
+            shellMode == ShellMode.MINI -> ShellInputMode.MINI
+            else -> ShellInputMode.NORMAL
+        }
+        return result.copy(input = WindowHitPolicy.resolve(result, style, inputMode))
     }
 
     private fun controllerBrightness(): Int =
