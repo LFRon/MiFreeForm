@@ -116,6 +116,8 @@ object SmoothTaskOrganizer {
     /** 悬浮根是否已取得系统级置顶身份（always-on-top）：生效后宿主不得再做抢层动作。 */
     @Volatile
     private var rootAlwaysOnTop = false
+    /** One-time capability report: the missing FromHome hint repeats on every root setup. */
+    private var fromHomeHintReported = false
 
     private val leashes = ConcurrentHashMap<Int, SurfaceControl>()
     private val logicalBounds = ConcurrentHashMap<Int, Rect>()
@@ -260,7 +262,7 @@ object SmoothTaskOrganizer {
         XposedHelpers.callMethod(builder, "setDisplayId", 0)
         XposedHelpers.callMethod(builder, "setParentContainer", root)
         XposedHelpers.callMethod(builder, "setWindowingMode", WINDOWING_MODE_FREEFORM)
-        XposedHelpers.callMethod(builder, "setLaunchCookie", ShellOwnershipServer.cookie)
+        applyLaunchCookie(builder, ShellOwnershipServer.cookie)
         val appeared = checkNotNull(XposedHelpers.callMethod(checkNotNull(organizerControllerRef), "createTask",
             XposedHelpers.callMethod(builder, "build")))
         val info = XposedHelpers.callMethod(appeared, "getTaskInfo") as ActivityManager.RunningTaskInfo
@@ -838,7 +840,7 @@ object SmoothTaskOrganizer {
             XposedHelpers.callMethod(builder, "setName", "reYAMF_floating_root")
             XposedHelpers.callMethod(builder, "setDisplayId", 0)
             XposedHelpers.callMethod(builder, "setWindowingMode", WINDOWING_MODE_FREEFORM)
-            XposedHelpers.callMethod(builder, "setLaunchCookie", ShellOwnershipServer.cookie)
+            applyLaunchCookie(builder, ShellOwnershipServer.cookie)
             val params = XposedHelpers.callMethod(builder, "build")
 
             rootInitializationStep = "create-native-task"
@@ -892,8 +894,16 @@ object SmoothTaskOrganizer {
             // leave our root, and the normal ownership-lost path retires the old window host.
             XposedHelpers.callMethod(wct, "setReparentLeafTaskIfRelaunch",
                 arrayOf(tokenClass, java.lang.Boolean.TYPE), token, true)
-            XposedHelpers.callMethod(wct, "setReparentLeafTaskIfRelaunchFromHome",
-                arrayOf(tokenClass, java.lang.Boolean.TYPE), token, true)
+            // AOSP 17 keeps only the generic relaunch hint; the FromHome variant is gone.
+            runCatching {
+                XposedHelpers.callMethod(wct, "setReparentLeafTaskIfRelaunchFromHome",
+                    arrayOf(tokenClass, java.lang.Boolean.TYPE), token, true)
+            }.onFailure {
+                if (!fromHomeHintReported) {
+                    fromHomeHintReported = true
+                    logWarning(TAG, "AOSP17 lacks the FromHome relaunch hint; generic relaunch hint remains")
+                }
+            }
             applyWct(wct)
             check(floatingRootToken === token) { "Floating root changed during setup" }
             rootAlwaysOnTop = true
@@ -1862,6 +1872,15 @@ object SmoothTaskOrganizer {
     private fun newWct(): Any {
         val wctClass = Instances.systemContext.classLoader.loadClass("android.window.WindowContainerTransaction")
         return XposedHelpers.newInstance(wctClass)
+    }
+
+    /** AOSP 17 removed the public builder setter while retaining the Parcel field. */
+    private fun applyLaunchCookie(builder: Any, cookie: android.os.IBinder) {
+        val setter = runCatching {
+            builder.javaClass.getMethod("setLaunchCookie", android.os.IBinder::class.java)
+        }.getOrNull()
+        if (setter != null) setter.invoke(builder, cookie)
+        else XposedHelpers.setObjectField(builder, "mLaunchCookie", cookie)
     }
 
     private fun applyWct(wct: Any) {

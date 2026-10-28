@@ -33,7 +33,10 @@ internal object Android17SystemAdapter : AndroidSystemAdapter {
             *emptyArray<Class<*>>()).returnType == android.content.res.Configuration::class.java)
         android.app.TaskInfo::class.java.getField("launchCookies")
         classLoader.loadClass("com.android.server.wm.WindowOrganizerController").getDeclaredMethod("getTaskOrganizerController")
-        classLoader.loadClass("android.window.TaskCreationParams\$Builder").getDeclaredMethod("setLaunchCookie", android.os.IBinder::class.java)
+        classLoader.loadClass("android.window.TaskCreationParams\$Builder").let { builder ->
+            if (runCatching { builder.getDeclaredMethod("setLaunchCookie", android.os.IBinder::class.java) }.isFailure)
+                builder.getDeclaredField("mLaunchCookie")
+        }
         classLoader.loadClass("com.android.server.wm.WindowContainer")
             .getDeclaredMethod("migrateToNewSurfaceControl", tx)
         val window = classLoader.loadClass("com.android.server.wm.WindowState")
