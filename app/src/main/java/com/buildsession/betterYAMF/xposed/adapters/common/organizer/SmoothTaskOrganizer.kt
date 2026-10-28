@@ -16,12 +16,12 @@ import com.buildsession.betterYAMF.xposed.utils.Instances
 import com.buildsession.betterYAMF.xposed.utils.log
 import com.buildsession.betterYAMF.xposed.utils.logWarning
 import com.buildsession.betterYAMF.xposed.utils.logError
-import com.github.kyuubiran.ezxhelper.utils.findMethod
+import com.buildsession.betterYAMF.xposed.utils.findMethod
 import com.buildsession.betterYAMF.xposed.hook.bridge.NativeHooks.hookBefore
 import com.buildsession.betterYAMF.xposed.hook.bridge.NativeHooks.hookAfter
 import com.buildsession.betterYAMF.xposed.hook.bridge.NativeHooks
-import com.github.kyuubiran.ezxhelper.utils.paramCount
-import de.robv.android.xposed.XposedHelpers
+import com.buildsession.betterYAMF.xposed.utils.paramCount
+import com.buildsession.betterYAMF.xposed.utils.Reflect
 import net.bytebuddy.ByteBuddy
 import net.bytebuddy.android.AndroidClassLoadingStrategy
 import net.bytebuddy.implementation.MethodDelegation
@@ -135,7 +135,7 @@ object SmoothTaskOrganizer {
 
     /** LoS SurfaceControl:4088 supports fractional crop; probe once for older platforms. */
     private val fractionalCrop by lazy {
-        XposedHelpers.findMethodExactIfExists(SurfaceControl.Transaction::class.java, "setCrop",
+        Reflect.findMethodExactIfExists(SurfaceControl.Transaction::class.java, "setCrop",
             SurfaceControl::class.java, Float::class.javaPrimitiveType, Float::class.javaPrimitiveType,
             Float::class.javaPrimitiveType, Float::class.javaPrimitiveType).also {
             if (it == null) logWarning(TAG, "fractional crop unavailable; viewport edges use integer crop precision")
@@ -182,16 +182,16 @@ object SmoothTaskOrganizer {
         val lease = overrideLeases[taskId] ?: return false
         if (!isLeashManaged(taskId)) return false
         val task = lease.task
-        val wm = XposedHelpers.getObjectField(task, "mWmService")
-        synchronized(XposedHelpers.getObjectField(wm, "mGlobalLock")) {
+        val wm = Reflect.getObjectField(task, "mWmService")
+        synchronized(Reflect.requireObjectField(wm, "mGlobalLock")) {
             if (overrideLeases[taskId] !== lease || !isLeashManaged(taskId) || !isInOurSubtree(task)) return false
-            val parent = XposedHelpers.callMethod(task, "getParent")?.let { XposedHelpers.callMethod(it, "asTask") }
-            if (parent != null && notificationStages.containsKey(XposedHelpers.getIntField(parent, "mTaskId"))) {
+            val parent = Reflect.callMethod(task, "getParent")?.let { Reflect.callMethod(it, "asTask") }
+            if (parent != null && notificationStages.containsKey(Reflect.getIntField(parent, "mTaskId"))) {
                 // A reused task may have been moved into this launch's hidden container. CORE's
                 // hidden frame has now committed; promote it while still hidden, then await draw.
                 val wct = newWct()
-                val token = XposedHelpers.getObjectField(XposedHelpers.callMethod(task, "getTaskInfo"), "token")
-                XposedHelpers.callMethod(wct, "reparent", token, checkNotNull(launchRootToken()), true)
+                val token = Reflect.getObjectField(Reflect.callMethod(task, "getTaskInfo"), "token")
+                Reflect.callMethod(wct, "reparent", token, checkNotNull(launchRootToken()), true)
                 applyWct(wct)
             }
             val v = layout.logicalViewport
@@ -215,11 +215,11 @@ object SmoothTaskOrganizer {
     internal fun matchesTaskLayout(taskId: Int, layout: com.buildsession.betterYAMF.window.api.TaskLayout): Boolean {
         val lease = overrideLeases[taskId] ?: return false
         val task = lease.task
-        val wm = XposedHelpers.getObjectField(task, "mWmService")
-        return synchronized(XposedHelpers.getObjectField(wm, "mGlobalLock")) {
+        val wm = Reflect.getObjectField(task, "mWmService")
+        return synchronized(Reflect.requireObjectField(wm, "mGlobalLock")) {
             if (overrideLeases[taskId] !== lease || !isLeashManaged(taskId) || !isInOurSubtree(task)) false else {
-                val top = XposedHelpers.callMethod(task, "getTopNonFinishingActivity") ?: return@synchronized false
-                val config = XposedHelpers.callMethod(top, "getConfiguration") as android.content.res.Configuration
+                val top = Reflect.callMethod(task, "getTopNonFinishingActivity") ?: return@synchronized false
+                val config = Reflect.callMethod(top, "getConfiguration") as android.content.res.Configuration
                 layout.contentOrientation != com.buildsession.betterYAMF.window.api.ContentOrientation.PORTRAIT ||
                     config.orientation == android.content.res.Configuration.ORIENTATION_PORTRAIT && config.screenHeightDp >= config.screenWidthDp
             }
@@ -237,51 +237,51 @@ object SmoothTaskOrganizer {
         check(entryReady)
         val root = checkNotNull(launchRootToken())
         val previous = mutableMapOf<Int, NotificationTaskStage.PreviousTask>()
-        val infos = XposedHelpers.callMethod(Instances.activityTaskManager, "getTasks", Int.MAX_VALUE, false, false, -1) as List<*>
+        val infos = Reflect.callMethod(Instances.activityTaskManager, "getTasks", Int.MAX_VALUE, false, false, -1) as List<*>
         for (info in infos.filterIsInstance<ActivityManager.RunningTaskInfo>()) {
-            val task = resolveTaskByToken(XposedHelpers.getObjectField(info, "token")) ?: continue
-            val wm = XposedHelpers.getObjectField(task, "mWmService")
-            synchronized(XposedHelpers.getObjectField(wm, "mGlobalLock")) {
-                val parent = XposedHelpers.callMethod(task, "getParent")
-                val parentTask = parent?.let { XposedHelpers.callMethod(it, "asTask") }
-                val parentToken = parentTask?.let { XposedHelpers.getObjectField(
-                    XposedHelpers.callMethod(it, "getTaskInfo"), "token") }
-                val config = XposedHelpers.callMethod(task, "getRequestedOverrideConfiguration") as android.content.res.Configuration
-                val wc = XposedHelpers.getObjectField(config, "windowConfiguration")
-                val parentStage = parentTask?.let { notificationStages[XposedHelpers.getIntField(it, "mTaskId")] }
+            val task = resolveTaskByToken(Reflect.getObjectField(info, "token")) ?: continue
+            val wm = Reflect.getObjectField(task, "mWmService")
+            synchronized(Reflect.requireObjectField(wm, "mGlobalLock")) {
+                val parent = Reflect.callMethod(task, "getParent")
+                val parentTask = parent?.let { Reflect.callMethod(it, "asTask") }
+                val parentToken = parentTask?.let { Reflect.getObjectField(
+                    Reflect.callMethod(it, "getTaskInfo"), "token") }
+                val config = Reflect.callMethod(task, "getRequestedOverrideConfiguration") as android.content.res.Configuration
+                val wc = Reflect.getObjectField(config, "windowConfiguration")
+                val parentStage = parentTask?.let { notificationStages[Reflect.getIntField(it, "mTaskId")] }
                 previous[info.taskId] = if (parentStage != null) {
                     parentStage.previous[info.taskId]?.takeIf { it.task === task }
                         ?: NotificationTaskStage.PreviousTask(task, null, Rect(), 0)
                 } else NotificationTaskStage.PreviousTask(task, parentToken,
-                    Rect(XposedHelpers.callMethod(task, "getRequestedOverrideBounds") as Rect),
-                    XposedHelpers.callMethod(wc, "getWindowingMode") as Int)
+                    Rect(Reflect.callMethod(task, "getRequestedOverrideBounds") as Rect),
+                    Reflect.callMethod(wc, "getWindowingMode") as Int)
             }
         }
-        val builder = XposedHelpers.newInstance(Instances.systemContext.classLoader.loadClass("android.window.TaskCreationParams\$Builder"))
-        XposedHelpers.callMethod(builder, "setName", "reYAMF_notification_stage")
-        XposedHelpers.callMethod(builder, "setDisplayId", 0)
-        XposedHelpers.callMethod(builder, "setParentContainer", root)
-        XposedHelpers.callMethod(builder, "setWindowingMode", WINDOWING_MODE_FREEFORM)
+        val builder = Reflect.newInstance(Instances.systemContext.classLoader.loadClass("android.window.TaskCreationParams\$Builder"))
+        Reflect.callMethod(builder, "setName", "reYAMF_notification_stage")
+        Reflect.callMethod(builder, "setDisplayId", 0)
+        Reflect.callMethod(builder, "setParentContainer", root)
+        Reflect.callMethod(builder, "setWindowingMode", WINDOWING_MODE_FREEFORM)
         applyLaunchCookie(builder, ShellOwnershipServer.cookie)
-        val appeared = checkNotNull(XposedHelpers.callMethod(checkNotNull(organizerControllerRef), "createTask",
-            XposedHelpers.callMethod(builder, "build")))
-        val info = XposedHelpers.callMethod(appeared, "getTaskInfo") as ActivityManager.RunningTaskInfo
-        val stage = NotificationTaskStage(info.taskId, XposedHelpers.getObjectField(info, "token"), previous)
+        val appeared = checkNotNull(Reflect.callMethod(checkNotNull(organizerControllerRef), "createTask",
+            Reflect.callMethod(builder, "build")))
+        val info = Reflect.callMethod(appeared, "getTaskInfo") as ActivityManager.RunningTaskInfo
+        val stage = NotificationTaskStage(info.taskId, Reflect.requireObjectField(info, "token"), previous)
         notificationStages[info.taskId] = stage // Record before fallible setup, for complete cleanup.
         var raw: SurfaceControl? = null
         try {
-            raw = XposedHelpers.callMethod(appeared, "getLeash") as SurfaceControl
+            raw = Reflect.callMethod(appeared, "getLeash") as SurfaceControl
             val leash = checkNotNull(ownLeash(raw))
-            try { SurfaceControl.Transaction().use { tx -> tx.setAlpha(leash, 0f); XposedHelpers.callMethod(tx, "hide", leash); tx.apply() } }
+            try { SurfaceControl.Transaction().use { tx -> tx.setAlpha(leash, 0f); Reflect.callMethod(tx, "hide", leash); tx.apply() } }
             finally { releaseQuietly(leash) }
             val v = layout.logicalViewport
             val wct = newWct()
-            XposedHelpers.callMethod(wct, "setBounds", stage.token, Rect(v.left, v.top, v.right, v.bottom))
+            Reflect.callMethod(wct, "setBounds", stage.token, Rect(v.left, v.top, v.right, v.bottom))
             // This is the TEMPORARY empty container only, not a hosted task. WOC's force-hidden
             // state prevents native transitions from exposing the first surface. TaskInfo cookies
             // still arrive from ActivityStarter#postStartActivityProcessing before app drawing;
             // adoption out of this container starts the ordinary prepare/draw/fade-in path.
-            XposedHelpers.callMethod(wct, "setHidden", stage.token, true)
+            Reflect.callMethod(wct, "setHidden", stage.token, true)
             applyWct(wct)
             return stage
         } catch (error: Throwable) { disposeNotificationStage(stage); throw error }
@@ -292,11 +292,11 @@ object SmoothTaskOrganizer {
      * inside synchronous adoption, immediately before publishing ownership or using its token.
      */
     internal fun <T> withNotificationTaskSelection(selection: NotificationTaskSelection, claim: () -> T): T {
-        val wm = XposedHelpers.getObjectField(selection.task, "mWmService")
-        synchronized(XposedHelpers.getObjectField(wm, "mGlobalLock")) {
+        val wm = Reflect.getObjectField(selection.task, "mWmService")
+        synchronized(Reflect.requireObjectField(wm, "mGlobalLock")) {
             check(resolveTaskByToken(selection.token) === selection.task &&
-                XposedHelpers.getIntField(selection.task, "mTaskId") == selection.taskId &&
-                XposedHelpers.callMethod(selection.task, "getDisplayId") == 0) { "Notification task selection is stale" }
+                Reflect.getIntField(selection.task, "mTaskId") == selection.taskId &&
+                Reflect.callMethod(selection.task, "getDisplayId") == 0) { "Notification task selection is stale" }
             check(!isLeashManaged(selection.taskId) || overrideLeases[selection.taskId]?.task === selection.task) {
                 "Notification task belongs to a different native lease"
             }
@@ -310,10 +310,10 @@ object SmoothTaskOrganizer {
 
     internal fun captureNotificationRestoration(stage: NotificationTaskStage, taskId: Int) {
         if (isLeashManaged(taskId)) return // Preserve the existing session's restoration lease.
-        val task = taskInfoById(taskId)?.let { resolveTaskByToken(XposedHelpers.getObjectField(it, "token")) } ?: return
+        val task = taskInfoById(taskId)?.let { resolveTaskByToken(Reflect.getObjectField(it, "token")) } ?: return
         val previous = stage.previous[taskId]?.takeIf { it.task === task }
         val parent = previous?.parentToken?.takeIf { token ->
-            resolveTaskByToken(token)?.let { !isFloatingRootTask(XposedHelpers.getIntField(it, "mTaskId")) } == true
+            resolveTaskByToken(token)?.let { !isFloatingRootTask(Reflect.getIntField(it, "mTaskId")) } == true
         }
         if (parent == null) originalParentTokens.remove(taskId) else originalParentTokens[taskId] = parent
     }
@@ -327,24 +327,24 @@ object SmoothTaskOrganizer {
         var disposed = false
         try {
             val task = resolveTaskByToken(stage.token) ?: run { disposed = true; return }
-            val wm = XposedHelpers.getObjectField(task, "mWmService")
-            synchronized(XposedHelpers.getObjectField(wm, "mGlobalLock")) {
-                val count = XposedHelpers.callMethod(task, "getChildCount") as Int
+            val wm = Reflect.getObjectField(task, "mWmService")
+            synchronized(Reflect.requireObjectField(wm, "mGlobalLock")) {
+                val count = Reflect.callMethod(task, "getChildCount") as Int
                 val wct = newWct()
                 for (index in 0 until count) {
-                    val child = XposedHelpers.callMethod(task, "getChildAt", index)
-                    val id = XposedHelpers.getIntField(child, "mTaskId")
-                    val token = XposedHelpers.getObjectField(XposedHelpers.callMethod(child, "getTaskInfo"), "token")
+                    val child = Reflect.callMethod(task, "getChildAt", index)
+                    val id = Reflect.getIntField(child, "mTaskId")
+                    val token = Reflect.getObjectField(Reflect.callMethod(child, "getTaskInfo"), "token")
                     val previous = stage.previous[id]?.takeIf { it.task === child }
                     val parent = previous?.parentToken?.takeIf { resolveTaskByToken(it) != null }
-                    XposedHelpers.callMethod(wct, "reparent", token, parent, false)
-                    XposedHelpers.callMethod(wct, "setWindowingMode", token, previous?.mode ?: 0)
-                    XposedHelpers.callMethod(wct, "setBounds", token, previous?.bounds ?: Rect())
+                    Reflect.callMethod(wct, "reparent", token, parent, false)
+                    Reflect.callMethod(wct, "setWindowingMode", token, previous?.mode ?: 0)
+                    Reflect.callMethod(wct, "setBounds", token, previous?.bounds ?: Rect())
                 }
                 if (count > 0) applyWct(wct)
-                check((XposedHelpers.callMethod(task, "getChildCount") as Int) == 0)
+                check((Reflect.callMethod(task, "getChildCount") as Int) == 0)
                 val removal = newWct()
-                XposedHelpers.callMethod(removal, "removeTask", stage.token)
+                Reflect.callMethod(removal, "removeTask", stage.token)
                 applyWct(removal)
                 disposed = true
             }
@@ -371,7 +371,7 @@ object SmoothTaskOrganizer {
     /** 该任务是否已处于承载根子树（出生即入根或已认领）；供"重启进入会话"判定。 */
     fun isTaskInFloatingRoot(taskInfo: ActivityManager.RunningTaskInfo): Boolean = runCatching {
         // token 为隐藏字段（SDK 存根不含），统一走反射（与本模块既有风格一致）
-        val token = XposedHelpers.getObjectField(taskInfo, "token") ?: return false
+        val token = Reflect.getObjectField(taskInfo, "token") ?: return false
         val task = resolveTaskByToken(token) ?: return false
         isInOurSubtree(task)
     }.getOrDefault(false)
@@ -398,7 +398,7 @@ object SmoothTaskOrganizer {
     private fun ownLeash(source: SurfaceControl?): SurfaceControl? {
         if (source == null) return null
         return runCatching {
-            XposedHelpers.newInstance(SurfaceControl::class.java, source, "reYAMF_leash") as SurfaceControl
+            Reflect.newInstance(SurfaceControl::class.java, source, "reYAMF_leash") as SurfaceControl
         }.onFailure {
             log(TAG, "ownLeash failed; refusing a borrowed callback handle", it)
         }.getOrNull()
@@ -413,24 +413,24 @@ object SmoothTaskOrganizer {
     private fun resolveTaskByToken(token: Any?): Any? {
         if (token == null) return null
         return runCatching {
-            val binder = XposedHelpers.callMethod(token, "asBinder") as? android.os.IBinder
+            val binder = Reflect.callMethod(token, "asBinder") as? android.os.IBinder
                 ?: return null
             val wcClass = Instances.systemContext.classLoader
                 .loadClass("com.android.server.wm.WindowContainer")
-            val wc = XposedHelpers.callStaticMethod(wcClass, "fromBinder", binder) ?: return null
-            XposedHelpers.callMethod(wc, "asTask")
+            val wc = Reflect.callStaticMethod(wcClass, "fromBinder", binder) ?: return null
+            Reflect.callMethod(wc, "asTask")
         }.getOrNull()
     }
 
     /** Current WM ownership, read under its global lock by marker/registration/write guards. */
     internal fun ownsNativeTask(task: Any?): Boolean {
         if (task == null) return false
-        return isInOurSubtree(task) || pendingAdoption.contains(XposedHelpers.getIntField(task, "mTaskId")) ||
-            organizerDelegate.isInitialized() && XposedHelpers.getObjectField(task, "mTaskOrganizer") === organizer
+        return isInOurSubtree(task) || pendingAdoption.contains(Reflect.getIntField(task, "mTaskId")) ||
+            organizerDelegate.isInitialized() && Reflect.getObjectField(task, "mTaskOrganizer") === organizer
     }
 
     private fun isTaskOrganized(task: Any): Boolean =
-        (runCatching { XposedHelpers.callMethod(task, "isOrganized") }.getOrNull() as? Boolean) == true
+        (runCatching { Reflect.callMethod(task, "isOrganized") }.getOrNull() as? Boolean) == true
 
     // Ownership queries also run on early native focus paths. They must never initialize an
     // organizer (or its generated Binder implementation) merely to inspect an unrelated task.
@@ -463,11 +463,11 @@ object SmoothTaskOrganizer {
         var step = "controller"
         try {
             initialization = "initializing"
-            val organizerController = XposedHelpers.callMethod(
+            val organizerController = Reflect.callMethod(
                 Instances.activityTaskManager, "getWindowOrganizerController"
             )
             // Same AIDL accessor used by framework TaskOrganizer; no private controller field.
-            val taskOrganizerController = checkNotNull(XposedHelpers.callMethod(organizerController, "getTaskOrganizerController"))
+            val taskOrganizerController = checkNotNull(Reflect.callMethod(organizerController, "getTaskOrganizerController"))
             organizerControllerRef = taskOrganizerController
             step = "routing"
             if (!routingInstalled) { check(hookTaskOrganizerRouting()); routingInstalled = true }
@@ -486,16 +486,16 @@ object SmoothTaskOrganizer {
                 return
             }
             step = "organizer-registration"
-            val lock = XposedHelpers.getObjectField(taskOrganizerController, "mGlobalLock")
+            val lock = Reflect.requireObjectField(taskOrganizerController, "mGlobalLock")
             fun nativeRegistered(): Boolean = synchronized(lock) {
-                val states = XposedHelpers.getObjectField(taskOrganizerController, "mTaskOrganizerStates") as Map<*, *>
+                val states = Reflect.getObjectField(taskOrganizerController, "mTaskOrganizerStates") as Map<*, *>
                 states.containsKey(organizer.asBinder())
             }
             registered = nativeRegistered()
             if (!registered) {
                 // The native call can register successfully, then fail while enumerating tasks.
                 // Read its actual registry on recovery, rather than repeating a global sweep.
-                XposedHelpers.callMethod(taskOrganizerController, "registerTaskOrganizer", organizer)
+                Reflect.callMethod(taskOrganizerController, "registerTaskOrganizer", organizer)
                 registered = nativeRegistered()
                 check(registered) { "Native organizer registration did not complete" }
             }
@@ -570,11 +570,11 @@ object SmoothTaskOrganizer {
             val wc = Instances.systemContext.classLoader.loadClass("com.android.server.wm.WindowContainer")
             findMethod(wc) { name == "migrateToNewSurfaceControl" && paramCount == 1 }.hookAfter { param ->
                 runCatching {
-                    val task = XposedHelpers.callMethod(param.thisObject, "asTask") ?: return@runCatching
-                    val id = XposedHelpers.getIntField(task, "mTaskId")
+                    val task = Reflect.callMethod(param.thisObject, "asTask") ?: return@runCatching
+                    val id = Reflect.getIntField(task, "mTaskId")
                     val stage = initialPresentations[id] ?: return@runCatching
                     val tx = param.args[0] as? SurfaceControl.Transaction ?: return@runCatching
-                    val surface = XposedHelpers.callMethod(task, "getSurfaceControl") as? SurfaceControl ?: return@runCatching
+                    val surface = Reflect.callMethod(task, "getSurfaceControl") as? SurfaceControl ?: return@runCatching
                     val logical = logicalBounds[id] ?: return@runCatching
                     tx.setAlpha(surface, 0f)
                     check(writeLeashTransform(tx, id, surface, logical, stage.physical))
@@ -600,11 +600,11 @@ object SmoothTaskOrganizer {
      * additionally checks the current window's drawn state and native transition completion.
      */
     private fun fenceInitialDraw(taskId: Int, task: Any, stage: InitialPresentation) {
-        val wm = XposedHelpers.getObjectField(task, "mWmService")
-        synchronized(XposedHelpers.getObjectField(wm, "mGlobalLock")) {
-            val surface = XposedHelpers.callMethod(task, "getSurfaceControl") as SurfaceControl
+        val wm = Reflect.getObjectField(task, "mWmService")
+        synchronized(Reflect.requireObjectField(wm, "mGlobalLock")) {
+            val surface = Reflect.callMethod(task, "getSurfaceControl") as SurfaceControl
             val logical = requireNotNull(logicalBounds[taskId])
-            val wmTx = XposedHelpers.callMethod(task, "getSyncTransaction") as SurfaceControl.Transaction
+            val wmTx = Reflect.callMethod(task, "getSyncTransaction") as SurfaceControl.Transaction
             wmTx.setAlpha(surface, 0f)
             check(writeLeashTransform(wmTx, taskId, surface, logical, stage.physical))
             stage.surface = surface
@@ -624,8 +624,8 @@ object SmoothTaskOrganizer {
                     }
                 }
                 handedToWm = true
-                XposedHelpers.callMethod(task, "setMainWindowSizeChangeTransaction", tx)
-                XposedHelpers.callMethod(task, "scheduleAnimation")
+                Reflect.callMethod(task, "setMainWindowSizeChangeTransaction", tx)
+                Reflect.callMethod(task, "scheduleAnimation")
             } finally {
                 if (!handedToWm) tx.close()
             }
@@ -667,7 +667,7 @@ object SmoothTaskOrganizer {
         val routing = findMethod(taskClass) { name == "setTaskOrganizer" && paramCount == 2 }.hookBefore { param ->
             runCatching {
                 val task = param.thisObject
-                val taskId = runCatching { XposedHelpers.getIntField(task, "mTaskId") }.getOrDefault(-1)
+                val taskId = runCatching { Reflect.getIntField(task, "mTaskId") }.getOrDefault(-1)
                 val inOurs = isInOurSubtree(task) || pendingAdoption.contains(taskId)
                 val assigned = param.argument(0)
                 when {
@@ -781,7 +781,7 @@ object SmoothTaskOrganizer {
             }.hookBefore { param ->
                 runCatching {
                     val task = param.args[0] ?: return@runCatching
-                    val taskId = runCatching { XposedHelpers.getIntField(task, "mTaskId") }
+                    val taskId = runCatching { Reflect.getIntField(task, "mTaskId") }
                         .getOrDefault(-1)
                     if (taskId >= 0 && adoptedTasks.contains(taskId)) {
                         // 跳过原方法 = 不登记 → 收尾不会对我们恢复 true
@@ -800,11 +800,11 @@ object SmoothTaskOrganizer {
         var current: Any? = task
         var guard = 0
         while (current != null && guard++ < 16) {
-            val id = runCatching { XposedHelpers.getIntField(current, "mTaskId") }.getOrDefault(-1)
+            val id = runCatching { Reflect.getIntField(current, "mTaskId") }.getOrDefault(-1)
             if (id > 0 && id == floatingRootTaskId ||
-                XposedHelpers.getObjectField(current, "mLaunchCookie") == ShellOwnershipServer.cookie) return true
-            current = runCatching { XposedHelpers.callMethod(current, "getParent") }.getOrNull()?.let { parent ->
-                runCatching { XposedHelpers.callMethod(parent, "asTask") }.getOrNull()
+                Reflect.getObjectField(current, "mLaunchCookie") == ShellOwnershipServer.cookie) return true
+            current = runCatching { Reflect.callMethod(current, "getParent") }.getOrNull()?.let { parent ->
+                runCatching { Reflect.callMethod(parent, "asTask") }.getOrNull()
             }
         }
         return false
@@ -821,43 +821,43 @@ object SmoothTaskOrganizer {
             rootInitializationStep = "scan-cookie-owned-roots"
             // A prior createTask may have created the native root before a local copy/setup failed.
             // Recover that cookie-owned root instead of leaving an orphan and creating another.
-            val roots = XposedHelpers.callMethod(taskOrganizerController, "getRootTasks", 0, null) as List<*>
+            val roots = Reflect.callMethod(taskOrganizerController, "getRootTasks", 0, null) as List<*>
             val existing = roots.filterIsInstance<ActivityManager.RunningTaskInfo>().firstOrNull { info ->
-                resolveTaskByToken(XposedHelpers.getObjectField(info, "token"))?.let { task ->
-                    XposedHelpers.getObjectField(task, "mLaunchCookie") == ShellOwnershipServer.cookie
+                resolveTaskByToken(Reflect.getObjectField(info, "token"))?.let { task ->
+                    Reflect.getObjectField(task, "mLaunchCookie") == ShellOwnershipServer.cookie
                 } == true
             }
             if (existing != null) {
                 floatingRootTaskId = existing.taskId
-                floatingRootToken = XposedHelpers.getObjectField(existing, "token")
+                floatingRootToken = Reflect.getObjectField(existing, "token")
             }
         }
         if (floatingRootToken == null) {
             rootInitializationStep = "build-task-params"
             val classLoader = Instances.systemContext.classLoader
             val builderClass = classLoader.loadClass("android.window.TaskCreationParams\$Builder")
-            val builder = XposedHelpers.newInstance(builderClass)
-            XposedHelpers.callMethod(builder, "setName", "reYAMF_floating_root")
-            XposedHelpers.callMethod(builder, "setDisplayId", 0)
-            XposedHelpers.callMethod(builder, "setWindowingMode", WINDOWING_MODE_FREEFORM)
+            val builder = Reflect.newInstance(builderClass)
+            Reflect.callMethod(builder, "setName", "reYAMF_floating_root")
+            Reflect.callMethod(builder, "setDisplayId", 0)
+            Reflect.callMethod(builder, "setWindowingMode", WINDOWING_MODE_FREEFORM)
             applyLaunchCookie(builder, ShellOwnershipServer.cookie)
-            val params = XposedHelpers.callMethod(builder, "build")
+            val params = Reflect.callMethod(builder, "build")
 
             rootInitializationStep = "create-native-task"
-            val appearedInfo = checkNotNull(XposedHelpers.callMethod(taskOrganizerController, "createTask", params)) {
+            val appearedInfo = checkNotNull(Reflect.callMethod(taskOrganizerController, "createTask", params)) {
                 "createTask returned null (display/freeform/organizer prerequisites)"
             }
-            val taskInfo = XposedHelpers.callMethod(appearedInfo, "getTaskInfo") as ActivityManager.RunningTaskInfo
-            val rawLeash = XposedHelpers.callMethod(appearedInfo, "getLeash") as SurfaceControl
+            val taskInfo = Reflect.callMethod(appearedInfo, "getTaskInfo") as ActivityManager.RunningTaskInfo
+            val rawLeash = Reflect.callMethod(appearedInfo, "getLeash") as SurfaceControl
             // Record the native identity before any fallible local setup.
             floatingRootTaskId = taskInfo.taskId
-            floatingRootToken = XposedHelpers.getObjectField(taskInfo, "token")
+            floatingRootToken = Reflect.getObjectField(taskInfo, "token")
             rootInitializationStep = "retain-and-hide-root-leash"
             try {
                 val owned = checkNotNull(ownLeash(rawLeash))
                 // Hide the empty container before fallible organizer/AOT setup. A failed setup
                 // must not leave a top-level black container covering the current application.
-                try { SurfaceControl.Transaction().use { tx -> XposedHelpers.callMethod(tx, "hide", owned); tx.apply() } }
+                try { SurfaceControl.Transaction().use { tx -> Reflect.callMethod(tx, "hide", owned); tx.apply() } }
                 catch (error: Throwable) { releaseQuietly(owned); throw error }
                 bindRootLeash(owned)
             }
@@ -866,18 +866,18 @@ object SmoothTaskOrganizer {
         }
         rootInitializationStep = "validate-root-organizer"
         val rootTask = checkNotNull(resolveTaskByToken(floatingRootToken)) { "Floating root token is stale" }
-        val wm = XposedHelpers.getObjectField(rootTask, "mWmService")
-        synchronized(XposedHelpers.getObjectField(wm, "mGlobalLock")) {
-            if (XposedHelpers.callMethod(rootTask, "getParent") == null) {
+        val wm = Reflect.getObjectField(rootTask, "mWmService")
+        synchronized(Reflect.requireObjectField(wm, "mGlobalLock")) {
+            if (Reflect.callMethod(rootTask, "getParent") == null) {
                 retireFloatingRoot()
                 throw IllegalStateException("Floating root detached during initialization")
             }
-            XposedHelpers.callMethod(rootTask, "updateTaskOrganizerState")
-            if (XposedHelpers.getObjectField(rootTask, "mTaskOrganizer") !== organizer)
-                XposedHelpers.callMethod(rootTask, "setTaskOrganizer", organizer, false)
-            check(XposedHelpers.getObjectField(rootTask, "mTaskOrganizer") === organizer) { "Floating root organizer mismatch" }
+            Reflect.callMethod(rootTask, "updateTaskOrganizerState")
+            if (Reflect.getObjectField(rootTask, "mTaskOrganizer") !== organizer)
+                Reflect.callMethod(rootTask, "setTaskOrganizer", organizer, false)
+            check(Reflect.getObjectField(rootTask, "mTaskOrganizer") === organizer) { "Floating root organizer mismatch" }
             if (floatingRootLeash?.isValid != true) {
-                val current = XposedHelpers.callMethod(rootTask, "getSurfaceControl") as? SurfaceControl
+                val current = Reflect.callMethod(rootTask, "getSurfaceControl") as? SurfaceControl
                 bindRootLeash(checkNotNull(ownLeash(current)))
             }
         }
@@ -889,14 +889,14 @@ object SmoothTaskOrganizer {
             val token = checkNotNull(floatingRootToken)
             val wct = newWct()
             val tokenClass = Instances.systemContext.classLoader.loadClass("android.window.WindowContainerToken")
-            XposedHelpers.callMethod(wct, "setAlwaysOnTop", arrayOf(tokenClass, java.lang.Boolean.TYPE), token, true)
+            Reflect.callMethodTyped(wct, "setAlwaysOnTop", arrayOf(tokenClass, java.lang.Boolean.TYPE), token, true)
             // TaskDisplayArea#getOrCreateRootTask honors these on relaunch: recent/icon launches
             // leave our root, and the normal ownership-lost path retires the old window host.
-            XposedHelpers.callMethod(wct, "setReparentLeafTaskIfRelaunch",
+            Reflect.callMethodTyped(wct, "setReparentLeafTaskIfRelaunch",
                 arrayOf(tokenClass, java.lang.Boolean.TYPE), token, true)
             // AOSP 17 keeps only the generic relaunch hint; the FromHome variant is gone.
             runCatching {
-                XposedHelpers.callMethod(wct, "setReparentLeafTaskIfRelaunchFromHome",
+                Reflect.callMethodTyped(wct, "setReparentLeafTaskIfRelaunchFromHome",
                     arrayOf(tokenClass, java.lang.Boolean.TYPE), token, true)
             }.onFailure {
                 if (!fromHomeHintReported) {
@@ -948,7 +948,7 @@ object SmoothTaskOrganizer {
         val rootToken = floatingRootToken ?: return false
         return runCatching {
             val wct = newWct()
-            XposedHelpers.callMethod(wct, "reorder", rootToken, true)
+            Reflect.callMethod(wct, "reorder", rootToken, true)
             applyWct(wct)
             log(TAG) { "floating root reordered onTop" }
             true
@@ -966,9 +966,9 @@ object SmoothTaskOrganizer {
             val visible = adoptedTasks.isNotEmpty() || rootHasChildren()
             SurfaceControl.Transaction().use { tx ->
                 if (visible) {
-                    XposedHelpers.callMethod(tx, "show", leash)
+                    Reflect.callMethod(tx, "show", leash)
                 } else {
-                    XposedHelpers.callMethod(tx, "hide", leash)
+                    Reflect.callMethod(tx, "hide", leash)
                 }
                 tx.apply()
             }
@@ -981,7 +981,7 @@ object SmoothTaskOrganizer {
     /** 承载根下是否已有子任务（认领前的启动任务也计入；根可见性判定用）。 */
     private fun rootHasChildren(): Boolean = runCatching {
         val task = resolveTaskByToken(floatingRootToken) ?: return false
-        (XposedHelpers.callMethod(task, "getChildCount") as? Int ?: 0) > 0
+        (Reflect.callMethod(task, "getChildCount") as? Int ?: 0) > 0
     }.getOrDefault(false)
 
     /**
@@ -994,7 +994,7 @@ object SmoothTaskOrganizer {
      */
     private fun resolveShellOrganizer(): Any? = runCatching {
         val controller = organizerControllerRef ?: return null
-        val deque = XposedHelpers.getObjectField(controller, "mTaskOrganizers")
+        val deque = Reflect.getObjectField(controller, "mTaskOrganizers")
             as? java.util.ArrayDeque<*> ?: return null
         deque.toList().asReversed().firstOrNull { it != null && it !== organizer }
     }.getOrNull()
@@ -1007,7 +1007,7 @@ object SmoothTaskOrganizer {
             return
         }
         runCatching {
-            XposedHelpers.callMethod(shell, name, *args)
+            Reflect.callMethod(shell, name, *args)
             log(TAG) { "forward $name -> shell" }
         }.onFailure {
             log(TAG, "forward $name failed", it)
@@ -1142,22 +1142,22 @@ object SmoothTaskOrganizer {
             return false
         }
         return runCatching {
-            val runningTasks = XposedHelpers.callMethod(
+            val runningTasks = Reflect.callMethod(
                 Instances.activityTaskManager, "getTasks", Int.MAX_VALUE, false, false, -1
             ) as? List<*> ?: return false
-            val info = runningTasks.find { XposedHelpers.getIntField(it, "taskId") == taskId } ?: return false
-            val token = XposedHelpers.getObjectField(info, "token")
+            val info = runningTasks.find { Reflect.getIntField(it, "taskId") == taskId } ?: return false
+            val token = Reflect.getObjectField(info, "token")
             notificationSelection.get()?.let { expected ->
                 check(expected.taskId == taskId && resolveTaskByToken(token) === expected.task) {
                     "Notification task changed before adoption"
                 }
             }
-            val parentTaskId = runCatching { XposedHelpers.getIntField(info, "parentTaskId") }.getOrDefault(-1)
+            val parentTaskId = runCatching { Reflect.getIntField(info, "parentTaskId") }.getOrDefault(-1)
             // 启动即入根（ActivityOptions#setLaunchRootTask）时父级就是承载根本身：不能把它记为
             // "原父级"，否则释放（回全屏）会把任务又塞回我们根里。回落默认 TaskDisplayArea（null）。
             if (parentTaskId != -1 && !isFloatingRootTask(parentTaskId)) {
-                runningTasks.find { XposedHelpers.getIntField(it, "taskId") == parentTaskId }?.let {
-                    originalParentTokens[taskId] = XposedHelpers.getObjectField(it, "token")
+                runningTasks.find { Reflect.getIntField(it, "taskId") == parentTaskId }?.let {
+                    originalParentTokens[taskId] = Reflect.requireObjectField(it, "token")
                 }
             }
 
@@ -1192,7 +1192,7 @@ object SmoothTaskOrganizer {
                         WindowRect(bounds.left, bounds.top, bounds.right, bounds.bottom))
                     FreeformBackend.rememberTask(taskId, task)
                     if (!isTaskOrganized(task)) {
-                        runCatching { XposedHelpers.callMethod(task, "updateTaskOrganizerState") }
+                        runCatching { Reflect.callMethod(task, "updateTaskOrganizerState") }
                             .onFailure { log(TAG, "updateTaskOrganizerState failed task=$taskId", it) }
                         if (!isTaskOrganized(task)) {
                             logError(TAG, "ERROR adoptTask task=$taskId cannot be organized (no fallback), abort")
@@ -1212,11 +1212,11 @@ object SmoothTaskOrganizer {
                 // 真机实证）。圆角病根（A15+ 客户端自绘圆角 + 状态滞留）由
                 // toggleClientDrawnRoundedCornersOpt(false) 关掉自绘、交给 SF 裁剪根治，
                 // 见下方启用块与 writeLeashTransform 注释。
-                XposedHelpers.callMethod(wct, "setWindowingMode", token, WINDOWING_MODE_FREEFORM)
-                XposedHelpers.callMethod(wct, "setBounds", token, bounds)
+                Reflect.callMethod(wct, "setWindowingMode", token, WINDOWING_MODE_FREEFORM)
+                Reflect.callMethod(wct, "setBounds", token, bounds)
                 // LineageOS 24.0：reparent 为三参 (child, parent, onTop)
-                XposedHelpers.callMethod(wct, "reparent", token, rootToken, true)
-                XposedHelpers.callMethod(wct, "reorder", rootToken, true)
+                Reflect.callMethod(wct, "reparent", token, rootToken, true)
+                Reflect.callMethod(wct, "reorder", rootToken, true)
                 applyWct(wct)
                 if (stage != null) {
                     val task = requireNotNull(resolveTaskByToken(token))
@@ -1232,12 +1232,12 @@ object SmoothTaskOrganizer {
                 runCatching {
                     val surface = resolveTaskByToken(token)?.let {
                         runCatching {
-                            XposedHelpers.callMethod(it, "getSurfaceControl") as? SurfaceControl
+                            Reflect.callMethod(it, "getSurfaceControl") as? SurfaceControl
                         }.getOrNull()
                     } ?: leashes[taskId]
                     if (surface != null) {
                         SurfaceControl.Transaction().use { tx ->
-                            XposedHelpers.callMethod(
+                            Reflect.callMethod(
                                 tx, "toggleClientDrawnRoundedCornersOpt", surface, false
                             )
                             tx.apply()
@@ -1279,17 +1279,17 @@ object SmoothTaskOrganizer {
         try {
             return runCatching {
                 val origToken = originalParentTokens[taskId]
-                val runningTasks = XposedHelpers.callMethod(
+                val runningTasks = Reflect.callMethod(
                     Instances.activityTaskManager, "getTasks", Int.MAX_VALUE, false, false, -1
                 ) as? List<*> ?: return false
-                val info = runningTasks.find { XposedHelpers.getIntField(it, "taskId") == taskId } ?: run {
+                val info = runningTasks.find { Reflect.getIntField(it, "taskId") == taskId } ?: run {
                     // 任务已不存在（被划掉/进程死）：本地登记必须一并清掉，
                     // 否则 adopted/leash 永久悬挂 → 后续路由与点按全部异常。
                     forgetTask(taskId)
                     updateRootVisibility()
                     return false
                 }
-                val token = XposedHelpers.getObjectField(info, "token")
+                val token = Reflect.getObjectField(info, "token")
 
                 // 平台"重新启动即摘根"通路（TaskDisplayArea 摘根，如最近任务/图标点击）下，
                 // 任务在进入本方法前已离开我方根：此时若仍按 toFront=false 沉底，会把
@@ -1305,50 +1305,50 @@ object SmoothTaskOrganizer {
                 // 逐步容错：任一步骤异常不得阻断 tx.apply（否则复位整体丢失，圆角/裁剪残留——真机实证）。
                 leashes[taskId]?.let { leash ->
                     SurfaceControl.Transaction().use { tx ->
-                        runCatching { XposedHelpers.callMethod(tx, "setMatrix", leash, 1f, 0f, 0f, 1f) }
-                        runCatching { XposedHelpers.callMethod(tx, "setPosition", leash, 0f, 0f) }
+                        runCatching { Reflect.callMethod(tx, "setMatrix", leash, 1f, 0f, 0f, 1f) }
+                        runCatching { Reflect.callMethod(tx, "setPosition", leash, 0f, 0f) }
                         runCatching {
-                            XposedHelpers.callMethod(
+                            Reflect.callMethodTyped(
                                 tx, "setWindowCrop",
                                 arrayOf<Class<*>>(SurfaceControl::class.java, Rect::class.java), leash, null
                             )
                         }
-                        runCatching { XposedHelpers.callMethod(tx, "setCornerRadius", leash, 0f) }
+                        runCatching { Reflect.callMethod(tx, "setCornerRadius", leash, 0f) }
                         runCatching { tx.setAlpha(leash, 1f) }
                         // 恢复系统默认：客户端自绘圆角开关复位（同 TransitionController
                         // #cleanupRoundedCornerDisableOptTasks 的转场收尾语义）
                         runCatching {
                             val surface = resolveTaskByToken(token)?.let {
                                 runCatching {
-                                    XposedHelpers.callMethod(it, "getSurfaceControl") as? SurfaceControl
+                                    Reflect.callMethod(it, "getSurfaceControl") as? SurfaceControl
                                 }.getOrNull()
                             } ?: leash
-                            XposedHelpers.callMethod(
+                            Reflect.callMethod(
                                 tx, "toggleClientDrawnRoundedCornersOpt", surface, true
                             )
                         }
                         // 沉后台场景（effectiveToFront=false）：复位期间保持隐藏，
                         // 避免"复位→reparent"之间以原始变换闪现一帧；回前场景保持可见。
                         if (effectiveToFront) {
-                            runCatching { XposedHelpers.callMethod(tx, "show", leash) }
+                            runCatching { Reflect.callMethod(tx, "show", leash) }
                         } else {
-                            runCatching { XposedHelpers.callMethod(tx, "hide", leash) }
+                            runCatching { Reflect.callMethod(tx, "hide", leash) }
                         }
                         runCatching { tx.apply() }.onFailure { log(TAG, "reset leash apply failed task=$taskId", it) }
                     }
                 }
 
                 val wct = newWct()
-                XposedHelpers.callMethod(wct, "setWindowingMode", token, 1 /* FULLSCREEN */)
+                Reflect.callMethod(wct, "setWindowingMode", token, 1 /* FULLSCREEN */)
                 // LoS DesktopTasksController#addMoveToFullscreenChanges clears the freeform
                 // override as well. Otherwise the session's virtual size survives fullscreen.
-                XposedHelpers.callMethod(wct, "setBounds", token, Rect())
+                Reflect.callMethod(wct, "setBounds", token, Rect())
                 // 原父级为默认 TaskDisplayArea（parentTaskId=-1）时传 null：
                 // WindowOrganizerController#sanitizeAndApplyHierarchyOpForTask 对 null 取默认 TDA。
                 // null 实参无法走普通 varargs 解析，必须显式给出参数类型。
                 val tokenClass = Instances.systemContext.classLoader
                     .loadClass("android.window.WindowContainerToken")
-                XposedHelpers.callMethod(
+                Reflect.callMethodTyped(
                     wct, "reparent",
                     arrayOf(tokenClass, tokenClass, java.lang.Boolean.TYPE),
                     token, origToken, effectiveToFront
@@ -1382,26 +1382,26 @@ object SmoothTaskOrganizer {
     private fun resetTaskSurfaceNow(taskId: Int, tokenOverride: Any? = null): Boolean {
         return runCatching {
             val token = tokenOverride ?: run {
-                val runningTasks = XposedHelpers.callMethod(
+                val runningTasks = Reflect.callMethod(
                     Instances.activityTaskManager, "getTasks", Int.MAX_VALUE, false, false, -1
                 ) as? List<*> ?: return false
-                val info = runningTasks.find { XposedHelpers.getIntField(it, "taskId") == taskId } ?: return false
-                XposedHelpers.getObjectField(info, "token")
+                val info = runningTasks.find { Reflect.getIntField(it, "taskId") == taskId } ?: return false
+                Reflect.getObjectField(info, "token")
             }
             val taskObj = resolveTaskByToken(token) ?: return false
             val reset = TaskSurfaceHandoff.finish(taskObj) { surface, transaction ->
                 val sc = surface as SurfaceControl
                 val tx = transaction as SurfaceControl.Transaction
-                XposedHelpers.callMethod(tx, "setMatrix", sc, 1f, 0f, 0f, 1f)
+                Reflect.callMethod(tx, "setMatrix", sc, 1f, 0f, 0f, 1f)
                 tx.setPosition(sc, 0f, 0f)
-                XposedHelpers.callMethod(tx, "setWindowCrop",
+                Reflect.callMethodTyped(tx, "setWindowCrop",
                     arrayOf<Class<*>>(SurfaceControl::class.java, Rect::class.java), sc, null)
-                XposedHelpers.callMethod(tx, "setCornerRadius", sc, 0f)
-                runCatching { XposedHelpers.callMethod(tx, "setShadowRadius", sc, 0f) }
+                Reflect.callMethod(tx, "setCornerRadius", sc, 0f)
+                runCatching { Reflect.callMethod(tx, "setShadowRadius", sc, 0f) }
                     .onFailure { log(TAG, "restore shadow radius failed task=$taskId", it) }
                 tx.setAlpha(sc, 1f)
                 // Optional native corner optimization must not prevent visibility recovery.
-                runCatching { XposedHelpers.callMethod(tx, "toggleClientDrawnRoundedCornersOpt", sc, true) }
+                runCatching { Reflect.callMethod(tx, "toggleClientDrawnRoundedCornersOpt", sc, true) }
                     .onFailure { log(TAG, "restore corner opt failed task=$taskId", it) }
             }
             log(TAG) { "surface handoff task=$taskId reset=$reset (WM visibility queued)" }
@@ -1422,14 +1422,14 @@ object SmoothTaskOrganizer {
             logical.width(), logical.height(), physical.left, physical.top,
             physical.width(), physical.height(), appearance.cornerRadiusPx, appearance.contentAlignment
         ) ?: return false
-        XposedHelpers.callMethod(tx, "setMatrix", leash, transform.scale, 0f, 0f, transform.scale)
+        Reflect.callMethod(tx, "setMatrix", leash, transform.scale, 0f, 0f, transform.scale)
         tx.setPosition(leash, transform.x, transform.y)
         val crop = fractionalCrop
         if (crop != null) {
             crop.invoke(tx, leash, transform.cropLeft, transform.cropTop,
                 transform.cropLeft + transform.cropWidth, transform.cropTop + transform.cropHeight)
         } else {
-            XposedHelpers.callMethod(tx, "setWindowCrop", leash, Rect(
+            Reflect.callMethod(tx, "setWindowCrop", leash, Rect(
                 transform.cropLeft.roundToInt(), transform.cropTop.roundToInt(),
                 (transform.cropLeft + transform.cropWidth).roundToInt(),
                 (transform.cropTop + transform.cropHeight).roundToInt()
@@ -1437,9 +1437,9 @@ object SmoothTaskOrganizer {
         }
         // Client-drawn rounded-corner optimization remains disabled for the whole session (adopt /
         // transition cleanup guard / release). These are SF-only corners, never app-owned pixels.
-        XposedHelpers.callMethod(tx, "setCornerRadius", leash, transform.cornerRadius)
+        Reflect.callMethod(tx, "setCornerRadius", leash, transform.cornerRadius)
         tx.setAlpha(leash, appearance.alpha)
-        XposedHelpers.callMethod(tx, if (appearance.visible) "show" else "hide", leash)
+        Reflect.callMethod(tx, if (appearance.visible) "show" else "hide", leash)
         return true
     }
 
@@ -1451,20 +1451,20 @@ object SmoothTaskOrganizer {
     internal fun setPresentationFocusable(taskId: Int, focusable: Boolean): Boolean = runCatching {
         val lease = overrideLeases[taskId] ?: return false
         val task = lease.task
-        val wm = XposedHelpers.getObjectField(task, "mWmService")
-        synchronized(XposedHelpers.getObjectField(wm, "mGlobalLock")) {
+        val wm = Reflect.getObjectField(task, "mWmService")
+        synchronized(Reflect.requireObjectField(wm, "mGlobalLock")) {
             if (overrideLeases[taskId] !== lease || !isLeashManaged(taskId) || !isInOurSubtree(task)) return false
-            val current = XposedHelpers.getBooleanField(task, "mIsFocusable")
+            val current = Reflect.getBooleanField(task, "mIsFocusable")
             if (focusable && !lease.focusSuppressed) return true
             if (current == focusable) {
                 if (focusable) lease.focusSuppressed = false
                 return true
             }
             val info = taskInfoById(taskId) ?: return false
-            val token = XposedHelpers.getObjectField(info, "token")
+            val token = Reflect.getObjectField(info, "token")
             if (resolveTaskByToken(token) !== task) return false
             val wct = newWct()
-            XposedHelpers.callMethod(wct, "setFocusable", token, focusable)
+            Reflect.callMethod(wct, "setFocusable", token, focusable)
             // Remember before apply: cleanup must cover an exception after partial native work.
             if (!focusable) lease.focusSuppressed = true
             applyWct(wct)
@@ -1492,7 +1492,7 @@ object SmoothTaskOrganizer {
         }
         if (physical.width() <= 0 || physical.height() <= 0) return false
         return runCatching {
-            val current = runCatching { XposedHelpers.callMethod(task, "getBounds") as? Rect }.getOrNull()
+            val current = runCatching { Reflect.callMethod(task, "getBounds") as? Rect }.getOrNull()
 
             if (!shapedTasks.contains(taskId)) {
                 // 首次塑形：采用交接后目标显示器的宽度；应用只在此阶段确定逻辑视口。
@@ -1505,7 +1505,7 @@ object SmoothTaskOrganizer {
                     logError(TAG, "settleGeometry: no taskInfo task=$taskId")
                     return false
                 }
-                val token = XposedHelpers.getObjectField(info, "token") ?: run {
+                val token = Reflect.getObjectField(info, "token") ?: run {
                     logError(TAG, "settleGeometry: no token task=$taskId")
                     return false
                 }
@@ -1540,13 +1540,13 @@ object SmoothTaskOrganizer {
                         tx.close()
                         onPrepared?.invoke()
                     }
-                    XposedHelpers.callMethod(wct, "setBoundsChangeTransaction", token, tx)
+                    Reflect.callMethod(wct, "setBoundsChangeTransaction", token, tx)
                     // Same-process WCT holds this exact object, not a copy. Task:4686 merges it
                     // with the app's next draw; close only after that transaction commits.
                 } else {
                     return false
                 }
-                XposedHelpers.callMethod(wct, "setBounds", token, virtual)
+                Reflect.callMethod(wct, "setBounds", token, virtual)
                 applyWct(wct)
                 shapedTasks.add(taskId)
                 // 虚拟尺寸落点：无任何密度覆盖——应用密度恒为默认显示器值（小窗不改应用 DPI）。
@@ -1578,16 +1578,16 @@ object SmoothTaskOrganizer {
 
     /** 取任务 RunningTaskInfo（token 的唯一可靠来源；与 release 路径同一取法）。 */
     private fun taskInfoById(taskId: Int): Any? = runCatching {
-        val runningTasks = XposedHelpers.callMethod(
+        val runningTasks = Reflect.callMethod(
             Instances.activityTaskManager, "getTasks", Int.MAX_VALUE, false, false, -1
         ) as? List<*> ?: return null
-        runningTasks.find { XposedHelpers.getIntField(it, "taskId") == taskId }
+        runningTasks.find { Reflect.getIntField(it, "taskId") == taskId }
     }.getOrNull()
 
     /** 转场控制器句柄（ATMS.getTransitionController；A17 真实归属，见 WindowContainer 同源取法）。 */
     private val transitionController: Any? by lazy {
         runCatching {
-            XposedHelpers.callMethod(Instances.activityTaskManager, "getTransitionController")
+            Reflect.callMethod(Instances.activityTaskManager, "getTransitionController")
         }.onFailure {
             logWarning(TAG, "transition controller unavailable (stable-gate degrades to isAnimating)", it)
         }.getOrNull()
@@ -1606,22 +1606,22 @@ object SmoothTaskOrganizer {
      */
     fun isTaskSurfaceStable(taskId: Int): Boolean {
         val task = runCatching {
-            taskInfoById(taskId)?.let { resolveTaskByToken(XposedHelpers.getObjectField(it, "token")) }
+            taskInfoById(taskId)?.let { resolveTaskByToken(Reflect.getObjectField(it, "token")) }
         }.getOrNull() ?: FreeformBackend.taskById(taskId) ?: return false
         return runCatching {
-            val wm = XposedHelpers.getObjectField(task, "mWmService")
-            synchronized(XposedHelpers.getObjectField(wm, "mGlobalLock")) {
+            val wm = Reflect.getObjectField(task, "mWmService")
+            synchronized(Reflect.requireObjectField(wm, "mGlobalLock")) {
                 initialPresentations[taskId]?.let { stage ->
                     if (!stage.resizeCommitted) return@runCatching false
-                    val current = XposedHelpers.callMethod(task, "getSurfaceControl")
+                    val current = Reflect.callMethod(task, "getSurfaceControl")
                     if (current !== stage.surface) return@runCatching false
-                    val window = XposedHelpers.callMethod(task, "getTopVisibleAppMainWindow")
+                    val window = Reflect.callMethod(task, "getTopVisibleAppMainWindow")
                         ?: return@runCatching false
-                    if (XposedHelpers.callMethod(window, "isDrawn") != true) return@runCatching false
+                    if (Reflect.callMethod(window, "isDrawn") != true) return@runCatching false
                 }
-                if (XposedHelpers.callMethod(task, "isAnimating") == true) return@runCatching false
+                if (Reflect.callMethod(task, "isAnimating") == true) return@runCatching false
                 val controller = transitionController ?: return@runCatching true
-                XposedHelpers.callMethod(controller, "isParticipant", task) == false
+                Reflect.callMethod(controller, "isParticipant", task) == false
             }
         }.getOrDefault(false) // Unknown readiness never grants visual ownership.
     }
@@ -1635,13 +1635,13 @@ object SmoothTaskOrganizer {
         val leash = leashes[taskId] ?: return
         runCatching {
             SurfaceControl.Transaction().use { tx ->
-                XposedHelpers.callMethod(tx, "setMatrix", leash, 1f, 0f, 0f, 1f)
-                XposedHelpers.callMethod(tx, "setPosition", leash, physical.left.toFloat(), physical.top.toFloat())
-                XposedHelpers.callMethod(
+                Reflect.callMethod(tx, "setMatrix", leash, 1f, 0f, 0f, 1f)
+                Reflect.callMethod(tx, "setPosition", leash, physical.left.toFloat(), physical.top.toFloat())
+                Reflect.callMethodTyped(
                     tx, "setWindowCrop",
                     arrayOf<Class<*>>(SurfaceControl::class.java, Rect::class.java), leash, null
                 )
-                XposedHelpers.callMethod(tx, "setCornerRadius", leash, 0f)
+                Reflect.callMethod(tx, "setCornerRadius", leash, 0f)
                 tx.apply()
             }
         }.onFailure { log(TAG, "resetLeashToBounds failed task=$taskId", it) }
@@ -1685,12 +1685,12 @@ object SmoothTaskOrganizer {
         runCatching {
             val surface = runCatching {
                 FreeformBackend.taskById(taskId)?.let {
-                    XposedHelpers.callMethod(it, "getSurfaceControl") as? SurfaceControl
+                    Reflect.callMethod(it, "getSurfaceControl") as? SurfaceControl
                 }
             }.getOrNull() ?: leashes[taskId]
             if (surface != null) {
                 SurfaceControl.Transaction().use { tx ->
-                    XposedHelpers.callMethod(tx, "toggleClientDrawnRoundedCornersOpt", surface, false)
+                    Reflect.callMethod(tx, "toggleClientDrawnRoundedCornersOpt", surface, false)
                     tx.apply()
                 }
             }
@@ -1722,23 +1722,23 @@ object SmoothTaskOrganizer {
     fun createShellContainer(taskId: Int, name: String): SurfaceControl? = runCatching {
         val leash = leashes[taskId] ?: return null
         val task = runCatching {
-            taskInfoById(taskId)?.let { resolveTaskByToken(XposedHelpers.getObjectField(it, "token")) }
+            taskInfoById(taskId)?.let { resolveTaskByToken(Reflect.getObjectField(it, "token")) }
         }.getOrNull() ?: FreeformBackend.taskById(taskId) ?: return null
         val parentSc = runCatching {
-            val parent = XposedHelpers.callMethod(task, "getParent")
-            XposedHelpers.callMethod(parent, "getSurfaceControl") as? SurfaceControl
+            val parent = Reflect.callMethod(task, "getParent")
+            Reflect.callMethod(parent, "getSurfaceControl") as? SurfaceControl
         }.getOrNull() ?: return null
 
         val builder = SurfaceControl.Builder()
-        XposedHelpers.callMethod(builder, "setContainerLayer")
-        XposedHelpers.callMethod(builder, "setName", name)
-        XposedHelpers.callMethod(builder, "setCallsite", "reYAMF#createShellContainer")
-        XposedHelpers.callMethod(builder, "setParent", parentSc)
-        val container = XposedHelpers.callMethod(builder, "build") as? SurfaceControl ?: return null
+        Reflect.callMethod(builder, "setContainerLayer")
+        Reflect.callMethod(builder, "setName", name)
+        Reflect.callMethod(builder, "setCallsite", "reYAMF#createShellContainer")
+        Reflect.callMethod(builder, "setParent", parentSc)
+        val container = Reflect.callMethod(builder, "build") as? SurfaceControl ?: return null
         try {
             check(container.isValid) { "Shell container is invalid" }
             SurfaceControl.Transaction().use { tx ->
-                XposedHelpers.callMethod(tx, "setRelativeLayer", container, leash, 1)
+                Reflect.callMethod(tx, "setRelativeLayer", container, leash, 1)
                 tx.apply()
             }
         } catch (error: Throwable) {
@@ -1755,7 +1755,7 @@ object SmoothTaskOrganizer {
         runCatching {
             if (!container.isValid) return
             SurfaceControl.Transaction().use { tx ->
-                XposedHelpers.callMethod(tx, "setRelativeLayer", container, leash, 1)
+                Reflect.callMethod(tx, "setRelativeLayer", container, leash, 1)
                 tx.apply()
             }
         }.onFailure { log(TAG, "raiseShellContainer failed task=$taskId", it) }
@@ -1766,7 +1766,7 @@ object SmoothTaskOrganizer {
         try {
             runCatching {
                 SurfaceControl.Transaction().use { tx ->
-                    if (container.isValid) XposedHelpers.callMethod(tx, "remove", container)
+                    if (container.isValid) Reflect.callMethod(tx, "remove", container)
                     tx.apply()
                 }
             }.onFailure { log(TAG, "destroyShellContainer failed", it) }
@@ -1789,7 +1789,7 @@ object SmoothTaskOrganizer {
         val leash = leashes[taskId] ?: return
         runCatching {
             SurfaceControl.Transaction().use { tx ->
-                XposedHelpers.callMethod(tx, "show", leash)
+                Reflect.callMethod(tx, "show", leash)
                 tx.apply()
             }
         }
@@ -1811,29 +1811,29 @@ object SmoothTaskOrganizer {
         if (!isLeashManaged(taskId)) return null
         val task = FreeformBackend.taskById(taskId) ?: return null
         return runCatching {
-            val wm = XposedHelpers.getObjectField(task, "mWmService")
-            synchronized(XposedHelpers.getObjectField(wm, "mGlobalLock")) {
+            val wm = Reflect.getObjectField(task, "mWmService")
+            synchronized(Reflect.requireObjectField(wm, "mGlobalLock")) {
                 if (!isLeashManaged(taskId)) null
-                else (XposedHelpers.callMethod(task, "getTaskInfo") as ActivityManager.RunningTaskInfo).isVisible
+                else (Reflect.callMethod(task, "getTaskInfo") as ActivityManager.RunningTaskInfo).isVisible
             }
         }.onFailure { log(TAG, "visibility read failed task=$taskId", it) }.getOrNull()
     }
 
     private fun isCurrentlyOurTask(info: ActivityManager.RunningTaskInfo): Boolean = runCatching {
-        val task = resolveTaskByToken(XposedHelpers.getObjectField(info, "token")) ?: return@runCatching false
-        val wm = XposedHelpers.getObjectField(task, "mWmService")
-        synchronized(XposedHelpers.getObjectField(wm, "mGlobalLock")) {
+        val task = resolveTaskByToken(Reflect.getObjectField(info, "token")) ?: return@runCatching false
+        val wm = Reflect.getObjectField(task, "mWmService")
+        synchronized(Reflect.requireObjectField(wm, "mGlobalLock")) {
             val lease = overrideLeases[info.taskId]
             (lease != null && lease.task !== task) ||
-                XposedHelpers.callMethod(task, "isAttached") == true &&
-                XposedHelpers.getObjectField(task, "mTaskOrganizer") === organizer
+                Reflect.callMethod(task, "isAttached") == true &&
+                Reflect.getObjectField(task, "mTaskOrganizer") === organizer
         }
     }.onFailure { logWarning(TAG, "cannot read current vanished-task ownership task=${info.taskId}", it) }.getOrDefault(false)
 
     private fun matchesRootToken(info: ActivityManager.RunningTaskInfo): Boolean {
         val current = floatingRootToken ?: return true
-        val reported = XposedHelpers.getObjectField(info, "token") ?: return false
-        return XposedHelpers.callMethod(reported, "asBinder") == XposedHelpers.callMethod(current, "asBinder")
+        val reported = Reflect.getObjectField(info, "token") ?: return false
+        return Reflect.callMethod(reported, "asBinder") == Reflect.callMethod(current, "asBinder")
     }
 
     /** The old leash was revoked by WM. Reconcile only a still-matching session viewport under
@@ -1843,26 +1843,26 @@ object SmoothTaskOrganizer {
     internal fun reconcileLostOwnership(taskId: Int, lease: TaskOverrideLease?) {
         if (lease == null || isLeashManaged(taskId)) return
         val task = lease.task
-        val wm = XposedHelpers.getObjectField(task, "mWmService")
-        synchronized(XposedHelpers.getObjectField(wm, "mGlobalLock")) {
-            if (isLeashManaged(taskId) || XposedHelpers.callMethod(task, "isAttached") != true || isInOurSubtree(task)) return
+        val wm = Reflect.getObjectField(task, "mWmService")
+        synchronized(Reflect.requireObjectField(wm, "mGlobalLock")) {
+            if (isLeashManaged(taskId) || Reflect.callMethod(task, "isAttached") != true || isInOurSubtree(task)) return
             val info = taskInfoById(taskId) ?: return
-            val token = XposedHelpers.getObjectField(info, "token")
+            val token = Reflect.getObjectField(info, "token")
             val currentTask = resolveTaskByToken(token) ?: return
-            val bounds = XposedHelpers.callMethod(currentTask, "getRequestedOverrideBounds") as Rect
-            val configuration = XposedHelpers.callMethod(currentTask, "getRequestedOverrideConfiguration")
-            val wc = XposedHelpers.getObjectField(configuration, "windowConfiguration")
-            val mode = XposedHelpers.callMethod(wc, "getWindowingMode") as Int
+            val bounds = Reflect.callMethod(currentTask, "getRequestedOverrideBounds") as Rect
+            val configuration = Reflect.callMethod(currentTask, "getRequestedOverrideConfiguration")
+            val wc = Reflect.getObjectField(configuration, "windowConfiguration")
+            val mode = Reflect.callMethod(wc, "getWindowingMode") as Int
             val restore = lease.restoration(currentTask,
                 WindowRect(bounds.left, bounds.top, bounds.right, bounds.bottom), mode)
-            val restoreFocus = lease.canRestoreFocus(currentTask, XposedHelpers.getBooleanField(currentTask, "mIsFocusable"))
+            val restoreFocus = lease.canRestoreFocus(currentTask, Reflect.getBooleanField(currentTask, "mIsFocusable"))
             if (restore == null && !restoreFocus) return
             val wct = newWct()
             if (restore != null) {
-                XposedHelpers.callMethod(wct, "setBounds", token, Rect())
-                if (restore.clearFreeformMode) XposedHelpers.callMethod(wct, "setWindowingMode", token, 0)
+                Reflect.callMethod(wct, "setBounds", token, Rect())
+                if (restore.clearFreeformMode) Reflect.callMethod(wct, "setWindowingMode", token, 0)
             }
-            if (restoreFocus) XposedHelpers.callMethod(wct, "setFocusable", token, true)
+            if (restoreFocus) Reflect.callMethod(wct, "setFocusable", token, true)
             applyWct(wct)
             if (restoreFocus) lease.focusSuppressed = false
             log(TAG) { "retired viewport task=$taskId inheritedMode=${restore?.clearFreeformMode} focus=$restoreFocus" }
@@ -1871,7 +1871,7 @@ object SmoothTaskOrganizer {
 
     private fun newWct(): Any {
         val wctClass = Instances.systemContext.classLoader.loadClass("android.window.WindowContainerTransaction")
-        return XposedHelpers.newInstance(wctClass)
+        return Reflect.newInstance(wctClass)
     }
 
     /** AOSP 17 removed the public builder setter while retaining the Parcel field. */
@@ -1880,13 +1880,13 @@ object SmoothTaskOrganizer {
             builder.javaClass.getMethod("setLaunchCookie", android.os.IBinder::class.java)
         }.getOrNull()
         if (setter != null) setter.invoke(builder, cookie)
-        else XposedHelpers.setObjectField(builder, "mLaunchCookie", cookie)
+        else Reflect.setObjectField(builder, "mLaunchCookie", cookie)
     }
 
     private fun applyWct(wct: Any) {
-        val organizerController = XposedHelpers.callMethod(
+        val organizerController = Reflect.callMethod(
             Instances.activityTaskManager, "getWindowOrganizerController"
         )
-        XposedHelpers.callMethod(organizerController, "applyTransaction", wct)
+        Reflect.callMethod(organizerController, "applyTransaction", wct)
     }
 }

@@ -124,7 +124,7 @@ internal object ManagedTaskFilter {
             ids == null || ids.isEmpty() || ids.any { (id, hosted) -> !isManaged(id) || !hosted }
         }
         if (kept.size == groups.size) return
-        val component = groups.javaClass.componentType
+        val component = checkNotNull(groups.javaClass.componentType)
         val replacement = java.lang.reflect.Array.newInstance(component, kept.size)
         kept.forEachIndexed { index, group -> java.lang.reflect.Array.set(replacement, index, group) }
         param.args[0] = replacement

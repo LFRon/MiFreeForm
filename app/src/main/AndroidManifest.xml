@@ -15,6 +15,7 @@
     <application
         android:name=".Reyamf"
         android:allowBackup="true"
+        android:description="@string/xposeddescription"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="@xml/backup_rules"
         android:icon="@mipmap/ic_launcher"
@@ -52,6 +53,13 @@
         <provider
             android:name=".manager.providers.ServiceProvider"
             android:authorities="com.buildsession.betterYAMF.ServiceProvider"
+            android:exported="true"
+            tools:ignore="ExportedContentProvider" />
+
+        <!-- Merged from libxposed:service; the vendored jar carries no manifest. -->
+        <provider
+            android:name="io.github.libxposed.service.XposedProvider"
+            android:authorities="${applicationId}.XposedService"
             android:exported="true"
             tools:ignore="ExportedContentProvider" />
 
@@ -106,22 +114,6 @@
                 <action android:name="com.buildsession.betterYAMF.action.OPEN_APP_LIST" />
             </intent-filter>
         </receiver>
-
-        <meta-data
-            android:name="xposedmodule"
-            android:value="true" />
-        <meta-data
-            android:name="xposeddescription"
-            android:value="@string/xposeddescription" />
-        <meta-data
-            android:name="xposedminversion"
-            android:value="93" />
-        <meta-data
-            android:name="xposedscope"
-            android:resource="@array/xposed_scope" />
-        <meta-data
-            android:name="xposedrecommend"
-            android:resource="@array/xposed_scope" />
     </application>
 
 </manifest>

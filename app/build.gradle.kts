@@ -64,7 +64,12 @@ android {
     packaging {
         resources.excludes.addAll(
             arrayOf(
-                "META-INF/**",
+                // Keep META-INF/xposed/**: it is where the modern module entry, scope and
+                // module.prop live. Only the noisy per-library metadata is dropped.
+                "META-INF/*.kotlin_module",
+                "META-INF/MANIFEST.MF",
+                "META-INF/*.version",
+                "META-INF/DEPENDENCIES",
                 "kotlin/**"
             )
         )
@@ -114,6 +119,8 @@ dependencies {
     implementation(libs.androidx.constraintlayout)
     implementation(libs.androidx.wear)
     testImplementation(libs.junit)
+    // Unit tests exercise the hook bridge against the same API surface the module compiles to.
+    testImplementation(files("libs/libxposed-api-102.0.0.jar"))
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
     implementation(libs.androidx.preference.ktx)
@@ -122,10 +129,14 @@ dependencies {
     compileOnly(libs.rikka.hidden.stub)
     implementation(libs.rikka.hidden.compat)
 
-    //never upgrade until new extension function
-    //noinspection GradleDependency
-    implementation(libs.ezxhelper)
-    compileOnly(libs.xposed.api)
+    // Vendored because the published AARs declare minCompileSdk=37 while this project compiles
+    // against android-36 (no android-37 platform is installed). `api` and `interface` are the
+    // official 102.0.0 classes.jar payloads; the service AAR is that payload minus `HotReloadResult`,
+    // a Java record AGP cannot desugar below API 34 (see io.github.libxposed.service.HotReloadResult).
+    compileOnly(files("libs/libxposed-api-102.0.0.jar"))
+    // Framework status IPC (activation + scope completeness), packaged for the app process.
+    implementation(mapOf("name" to "libxposed-service-102.0.0", "ext" to "aar"))
+    implementation(files("libs/libxposed-interface-102.0.0.jar"))
 
     //lifecycle
     implementation(libs.androidx.lifecycle.viewmodel.ktx)

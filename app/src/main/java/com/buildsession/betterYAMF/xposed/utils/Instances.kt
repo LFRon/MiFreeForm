@@ -15,7 +15,7 @@ import android.view.WindowManager
 import android.widget.FrameLayout
 import androidx.constraintlayout.widget.ConstraintLayout
 import com.android.internal.statusbar.IStatusBarService
-import com.github.kyuubiran.ezxhelper.utils.getObjectAs
+import com.buildsession.betterYAMF.xposed.utils.getObjectAs
 
 @SuppressLint("StaticFieldLeak")
 object Instances {

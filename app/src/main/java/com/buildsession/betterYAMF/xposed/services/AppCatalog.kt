@@ -10,9 +10,9 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.drawable.AdaptiveIconDrawable
 import android.graphics.drawable.BitmapDrawable
-import com.github.kyuubiran.ezxhelper.utils.argTypes
-import com.github.kyuubiran.ezxhelper.utils.args
-import com.github.kyuubiran.ezxhelper.utils.invokeMethodAs
+import com.buildsession.betterYAMF.xposed.utils.argTypes
+import com.buildsession.betterYAMF.xposed.utils.args
+import com.buildsession.betterYAMF.xposed.utils.invokeMethodAs
 import com.buildsession.betterYAMF.common.model.AppInfo
 import com.buildsession.betterYAMF.common.runMain
 import com.buildsession.betterYAMF.ipc.IAppIconCallback

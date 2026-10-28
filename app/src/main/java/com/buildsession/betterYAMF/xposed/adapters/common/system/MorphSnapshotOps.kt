@@ -5,7 +5,7 @@ import android.hardware.HardwareBuffer
 import android.view.SurfaceControl
 import android.view.View
 import com.buildsession.betterYAMF.common.logging.AppLog
-import de.robv.android.xposed.XposedHelpers
+import com.buildsession.betterYAMF.xposed.utils.Reflect
 
 /**
  * 平台像素捕获适配器。最近任务入口用真实任务缓冲区承接源画面，宿主在公共场景中
@@ -74,12 +74,12 @@ object MorphSnapshotOps {
     ): Captured? = runCatching {
         val shot: Any? = if (legacy) {
             val builderClass = Class.forName("android.window.ScreenCapture\$LayerCaptureArgs\$Builder")
-            val builder = XposedHelpers.newInstance(builderClass, surface)
-            XposedHelpers.callMethod(builder, "setSourceCrop", crop)
-            val args = XposedHelpers.callMethod(builder, "build")
-            XposedHelpers.callStaticMethod(captureClass, "captureLayers", args)
+            val builder = Reflect.newInstance(builderClass, surface)
+            Reflect.callMethod(builder, "setSourceCrop", crop)
+            val args = Reflect.callMethod(builder, "build")
+            Reflect.callStaticMethod(captureClass, "captureLayers", args)
         } else {
-            XposedHelpers.callStaticMethod(
+            Reflect.callStaticMethod(
                 captureClass,
                 "captureLayers",
                 surface,
@@ -88,13 +88,13 @@ object MorphSnapshotOps {
                 android.graphics.PixelFormat.RGBA_8888
             )
         } ?: return null
-        val buffer = XposedHelpers.callMethod(shot, "getHardwareBuffer") as? HardwareBuffer
+        val buffer = Reflect.callMethod(shot, "getHardwareBuffer") as? HardwareBuffer
         if (buffer == null || buffer.isClosed) {
             AppLog.debug(TAG) { "capture: hardware buffer null/closed (legacy=$legacy)" }
             return null
         }
         val colorSpace = runCatching {
-            XposedHelpers.callMethod(shot, "getColorSpace") as? ColorSpace
+            Reflect.callMethod(shot, "getColorSpace") as? ColorSpace
         }.getOrNull()
         Captured(buffer, colorSpace, buffer.width, buffer.height)
     }.onFailure {
@@ -112,12 +112,12 @@ object MorphSnapshotOps {
         height: Int
     ): SurfaceControl? = runCatching {
         val builder = SurfaceControl.Builder()
-        XposedHelpers.callMethod(builder, "setName", name)
-        XposedHelpers.callMethod(builder, "setCallsite", "reYAMF#createSnapshotSurface")
-        XposedHelpers.callMethod(builder, "setParent", parent)
-        XposedHelpers.callMethod(builder, "setBufferSize", width, height)
-        XposedHelpers.callMethod(builder, "setFormat", android.graphics.PixelFormat.TRANSLUCENT)
-        XposedHelpers.callMethod(builder, "build") as? SurfaceControl
+        Reflect.callMethod(builder, "setName", name)
+        Reflect.callMethod(builder, "setCallsite", "reYAMF#createSnapshotSurface")
+        Reflect.callMethod(builder, "setParent", parent)
+        Reflect.callMethod(builder, "setBufferSize", width, height)
+        Reflect.callMethod(builder, "setFormat", android.graphics.PixelFormat.TRANSLUCENT)
+        Reflect.callMethod(builder, "build") as? SurfaceControl
     }.getOrNull()
 
     /** 把截图写进快照表面（一次事务内）。 */
@@ -127,12 +127,12 @@ object MorphSnapshotOps {
         captured: Captured,
         alpha: Float
     ): Boolean = runCatching {
-        XposedHelpers.callMethod(tx, "setBuffer", snapshot, captured.buffer)
+        Reflect.callMethod(tx, "setBuffer", snapshot, captured.buffer)
         captured.colorSpace?.let { cs ->
-            XposedHelpers.callMethod(tx, "setColorSpace", snapshot, cs)
+            Reflect.callMethod(tx, "setColorSpace", snapshot, cs)
         }
         tx.setAlpha(snapshot, alpha)
-        XposedHelpers.callMethod(tx, "show", snapshot)
+        Reflect.callMethod(tx, "show", snapshot)
         true
     }.getOrDefault(false)
 
@@ -142,7 +142,7 @@ object MorphSnapshotOps {
         try {
             runCatching {
                 SurfaceControl.Transaction().use { tx ->
-                    XposedHelpers.callMethod(tx, "remove", snapshot)
+                    Reflect.callMethod(tx, "remove", snapshot)
                     tx.apply()
                 }
             }.onFailure { AppLog.error(TAG, "snapshot surface removal failed", it) }

@@ -1,6 +1,6 @@
 [versions]
 activityCompose = "1.9.3"
-agp = "8.9.3"
+agp = "8.11.1"
 annotation = "1.9.1"
 dynamicanimationKtx = "1.1.0"
 flexbox = "3.0.0"
@@ -12,8 +12,6 @@ lifecycleService = "2.9.0"
 materialVersion = "1.7.6"
 ui = "1.7.6"
 uiToolingPreview = "1.7.6"
-xposed = "82"
-ezxhelper = "1.0.3"
 preferenceKtx = "1.2.1"
 rikkaDevTools = "4.4.0"
 kotlin = "2.0.21"
@@ -45,8 +43,6 @@ androidx-preference-ktx = { module = "androidx.preference:preference-ktx", versi
 flexbox = { module = "com.google.android.flexbox:flexbox", version.ref = "flexbox" }
 glide = { module = "com.github.bumptech.glide:glide", version.ref = "glide" }
 gson = { module = "com.google.code.gson:gson", version.ref = "gson" }
-xposed-api = { module = "de.robv.android.xposed:api", version.ref = "xposed" }
-ezxhelper = { module = "com.github.kyuubiran:EzXHelper", version.ref = "ezxhelper" }
 rikka-annotation = { module = "dev.rikka.tools.refine:annotation", version.ref = "rikkaDevTools" }
 rikka-annotation-processor = { module = "dev.rikka.tools.refine:annotation-processor", version.ref = "rikkaDevTools" }
 junit = { group = "junit", name = "junit", version.ref = "junit" }

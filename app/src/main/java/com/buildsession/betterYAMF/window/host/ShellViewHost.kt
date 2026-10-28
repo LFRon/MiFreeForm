@@ -8,7 +8,7 @@ import android.view.Display
 import android.view.SurfaceControl
 import android.view.View
 import android.view.WindowManager
-import de.robv.android.xposed.XposedHelpers
+import com.buildsession.betterYAMF.xposed.utils.Reflect
 
 /**
  * 外壳自持表面托管器（对齐 ColorOS `SurfaceControlViewHost + WindowlessWindowManager` 模型）。
@@ -51,15 +51,15 @@ internal class ShellViewHost(
         return runCatching {
             val cl = context.classLoader
             val wlmClass = cl.loadClass("android.view.WindowlessWindowManager")
-            val wlm = XposedHelpers.newInstance(
+            val wlm = Reflect.newInstance(
                 wlmClass,
                 context.resources.configuration,
                 container,
                 null // hostInputTransferToken：与 ColorOS 同样传 null（触区路径不依赖宿主令牌）
             )
             val hostClass = cl.loadClass("android.view.SurfaceControlViewHost")
-            val host = XposedHelpers.newInstance(hostClass, context, display, wlm, callsite)
-            XposedHelpers.callMethod(host, "setView", view, lp)
+            val host = Reflect.newInstance(hostClass, context, display, wlm, callsite)
+            Reflect.callMethod(host, "setView", view, lp)
             windowlessWm = wlm
             viewHost = host
             attached = true
@@ -78,9 +78,9 @@ internal class ShellViewHost(
         runCatching {
             val host = viewHost ?: return
             val wlm = windowlessWm ?: return
-            val token = XposedHelpers.callMethod(host, "getWindowToken") ?: return
-            val binder = XposedHelpers.callMethod(token, "asBinder") as? IBinder ?: return
-            XposedHelpers.callMethod(wlm, "setTouchRegion", binder, region)
+            val token = Reflect.callMethod(host, "getWindowToken") ?: return
+            val binder = Reflect.callMethod(token, "asBinder") as? IBinder ?: return
+            Reflect.callMethod(wlm, "setTouchRegion", binder, region)
             lastRegionKey = regionKey
         }.onFailure { AppLog.error(TAG, "setTouchRegion failed", it) }
     }
@@ -95,7 +95,7 @@ internal class ShellViewHost(
     }
 
     fun release() {
-        runCatching { viewHost?.let { XposedHelpers.callMethod(it, "release") } }
+        runCatching { viewHost?.let { Reflect.callMethod(it, "release") } }
             .onFailure { AppLog.error(TAG, "shell host release failed", it) }
         viewHost = null
         windowlessWm = null

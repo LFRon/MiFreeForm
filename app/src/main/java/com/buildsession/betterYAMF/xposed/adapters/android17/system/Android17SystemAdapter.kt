@@ -6,7 +6,7 @@ import com.buildsession.betterYAMF.xposed.adapters.SurfacePolicies
 import com.buildsession.betterYAMF.xposed.adapters.common.organizer.SmoothWindowBackend
 import com.buildsession.betterYAMF.xposed.adapters.common.system.SystemHookInstaller
 import com.buildsession.betterYAMF.xposed.hook.bridge.NativeHooks
-import de.robv.android.xposed.XposedHelpers
+import com.buildsession.betterYAMF.xposed.utils.Reflect
 
 /** LoS 24.0 and PixelOS seventeen use this reviewed organizer/draw-sync mechanism.
  * Resolve signatures before installing global task hooks; structure alone is not device proof.
@@ -27,9 +27,9 @@ internal object Android17SystemAdapter : AndroidSystemAdapter {
         // These layout-readiness members are inherited. Resolve and warm the same native-call
         // cache used by the frame waiter before any task Hook or window is installed.
         val activity = classLoader.loadClass("com.android.server.wm.ActivityRecord")
-        check(XposedHelpers.findMethodBestMatch(task, "getTopNonFinishingActivity",
+        check(Reflect.findMethodBestMatch(task, "getTopNonFinishingActivity",
             *emptyArray<Class<*>>()).returnType == activity)
-        check(XposedHelpers.findMethodBestMatch(activity, "getConfiguration",
+        check(Reflect.findMethodBestMatch(activity, "getConfiguration",
             *emptyArray<Class<*>>()).returnType == android.content.res.Configuration::class.java)
         android.app.TaskInfo::class.java.getField("launchCookies")
         classLoader.loadClass("com.android.server.wm.WindowOrganizerController").getDeclaredMethod("getTaskOrganizerController")

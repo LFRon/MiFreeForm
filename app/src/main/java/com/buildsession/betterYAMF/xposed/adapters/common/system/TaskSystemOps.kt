@@ -5,13 +5,13 @@ import android.content.pm.PackageManager
 import android.os.SystemClock
 import android.view.InputDevice
 import android.view.KeyEvent
-import com.github.kyuubiran.ezxhelper.utils.argTypes
-import com.github.kyuubiran.ezxhelper.utils.args
-import com.github.kyuubiran.ezxhelper.utils.getObject
-import com.github.kyuubiran.ezxhelper.utils.invokeMethod
+import com.buildsession.betterYAMF.xposed.utils.argTypes
+import com.buildsession.betterYAMF.xposed.utils.args
+import com.buildsession.betterYAMF.xposed.utils.getObject
+import com.buildsession.betterYAMF.xposed.utils.invokeMethod
 import com.buildsession.betterYAMF.xposed.utils.Instances
 import com.buildsession.betterYAMF.xposed.utils.log
-import de.robv.android.xposed.XposedHelpers
+import com.buildsession.betterYAMF.xposed.utils.Reflect
 
 /**
  * 系统操作实现（反射细节收口点）：
@@ -31,11 +31,11 @@ object TaskSystemOps {
 
     /** 任务当前窗口模式（解析失败返回 0）。 */
     fun windowingMode(taskInfo: Any): Int = runCatching {
-        val windowConfig = XposedHelpers.getObjectField(
-            XposedHelpers.getObjectField(taskInfo, "configuration"),
+        val windowConfig = Reflect.getObjectField(
+            Reflect.getObjectField(taskInfo, "configuration"),
             "windowConfiguration"
         )
-        XposedHelpers.callMethod(windowConfig, "getWindowingMode") as Int
+        Reflect.callMethod(windowConfig, "getWindowingMode") as Int
     }.getOrDefault(0)
 
     /** 任务是否 Home（主路径 = windowConfiguration.getActivityType；兜底 = 包名启发式）。 */
@@ -71,26 +71,26 @@ object TaskSystemOps {
     fun refreshTaskSnapshot(taskId: Int) {
         runCatching {
             val atm = Instances.activityTaskManager
-            val wm = XposedHelpers.getObjectField(atm, "mWindowManager") ?: return
+            val wm = Reflect.getObjectField(atm, "mWindowManager") ?: return
             val controller = runCatching {
-                val sc = XposedHelpers.getObjectField(wm, "mSnapshotController")
-                XposedHelpers.getObjectField(sc, "mTaskSnapshotController")
+                val sc = Reflect.getObjectField(wm, "mSnapshotController")
+                Reflect.getObjectField(sc, "mTaskSnapshotController")
             }.getOrNull()
-                ?: runCatching { XposedHelpers.getObjectField(wm, "mTaskSnapshotController") }.getOrNull()
+                ?: runCatching { Reflect.getObjectField(wm, "mTaskSnapshotController") }.getOrNull()
                 ?: return
-            val runningTasks = XposedHelpers.callMethod(
+            val runningTasks = Reflect.callMethod(
                 atm, "getTasks", Int.MAX_VALUE, false, false, -1
             ) as? List<*> ?: return
-            val info = runningTasks.find { XposedHelpers.getIntField(it, "taskId") == taskId } ?: return
-            val token = XposedHelpers.getObjectField(info, "token")
-            val binder = XposedHelpers.callMethod(token, "asBinder") as? android.os.IBinder ?: return
+            val info = runningTasks.find { Reflect.getIntField(it, "taskId") == taskId } ?: return
+            val token = Reflect.getObjectField(info, "token")
+            val binder = Reflect.callMethod(token, "asBinder") as? android.os.IBinder ?: return
             val wcClass = Instances.systemContext.classLoader
                 .loadClass("com.android.server.wm.WindowContainer")
-            val wc = XposedHelpers.callStaticMethod(wcClass, "fromBinder", binder) ?: return
-            val task = XposedHelpers.callMethod(wc, "asTask") ?: return
+            val wc = Reflect.callStaticMethod(wcClass, "fromBinder", binder) ?: return
+            val task = Reflect.callMethod(wc, "asTask") ?: return
             val set = android.util.ArraySet<Any>()
             set.add(task)
-            XposedHelpers.callMethod(controller, "snapshotTasks", set)
+            Reflect.callMethod(controller, "snapshotTasks", set)
             log("reYAMF_debug") { "refreshTaskSnapshot task=$taskId ok" }
         }.onFailure {
             log("reYAMF_debug", "refreshTaskSnapshot failed task=$taskId", it)

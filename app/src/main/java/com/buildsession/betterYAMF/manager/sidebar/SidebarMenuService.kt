@@ -23,7 +23,7 @@ import androidx.lifecycle.LiveData
 import androidx.lifecycle.MutableLiveData
 import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.LinearLayoutManager
-import com.github.kyuubiran.ezxhelper.utils.runOnMainThread
+import kotlinx.coroutines.withContext
 import com.buildsession.betterYAMF.R
 import com.buildsession.betterYAMF.common.model.AppInfo
 import com.buildsession.betterYAMF.common.runMain
@@ -226,7 +226,7 @@ class SidebarMenuService() : LifecycleService() {
             lifecycleScope.launch(Dispatchers.IO) {
                 iReyamfRepository.deleteAppInfo(it)
 
-                runOnMainThread {
+                withContext(Dispatchers.Main) {
                     getSidebarApp()
                 }
             }

@@ -1,6 +1,11 @@
 <resources>
-    <string name="module_detection_unsupported">Detection not supported yet</string>
-    <string name="module_detection_deferred_message">Activation and scope detection will be added after migrating to libxposed 102. This message does not mean the module is inactive.</string>
+    <string name="module_detection_connecting">Reading framework status…</string>
+    <string name="module_detection_connecting_hint">Waiting for the Xposed framework service.</string>
+    <string name="module_detection_framework_absent">No Xposed framework service</string>
+    <string name="module_detection_framework_absent_hint">The framework did not answer. Check that the module is enabled and rebooted.</string>
+    <string name="module_detection_framework">%1$s %2$s · API %3$d</string>
+    <string name="module_detection_scope_heading">Recommended scope:</string>
+    <string name="module_detection_running_targets">Injected: %1$s</string>
     <string name="sidebar_overlay_permission_message">Allow display over other apps to use the sidebar.</string>
     <string name="app_name">BetterYAMF</string>
     <string name="details">Details</string>

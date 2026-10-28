@@ -46,7 +46,7 @@ import com.buildsession.betterYAMF.xposed.utils.logWarning
 import com.buildsession.betterYAMF.xposed.utils.logError
 import com.buildsession.betterYAMF.xposed.utils.registerReceiver
 import com.qauxv.ui.CommonContextWrapper
-import de.robv.android.xposed.XposedHelpers
+import com.buildsession.betterYAMF.xposed.utils.Reflect
 import kotlinx.coroutines.delay
 import rikka.hidden.compat.ActivityManagerApis
 import java.io.File
@@ -150,7 +150,7 @@ object YAMFManager : IYAMFManager.Stub() {
                     }
                     "onTaskRemovalStarted" -> {
                         val arg = args[0]
-                        val taskId = if (arg is Int) arg else XposedHelpers.getIntField(arg, "taskId")
+                        val taskId = if (arg is Int) arg else Reflect.getIntField(arg, "taskId")
                         WindowSessions.hostedTasks.remove(taskId)
                         WindowSessions.taskActivities.remove(taskId)
                         windowBackend.forgetTask(taskId)
@@ -177,21 +177,21 @@ object YAMFManager : IYAMFManager.Stub() {
         if (now - lastStackRecheckAt < 700) return
         lastStackRecheckAt = now
         val tasks = runCatching {
-            XposedHelpers.callMethod(Instances.activityTaskManager, "getTasks", Int.MAX_VALUE, false, false, -1) as List<*>
+            Reflect.callMethod(Instances.activityTaskManager, "getTasks", Int.MAX_VALUE, false, false, -1) as List<*>
         }.getOrNull() ?: return
         val topTask = tasks.firstOrNull() ?: return
-        val topTaskId = XposedHelpers.getIntField(topTask, "taskId")
+        val topTaskId = Reflect.getIntField(topTask, "taskId")
         val topPkg = runCatching {
-            XposedHelpers.getObjectField(topTask, "topActivity")?.let {
-                XposedHelpers.callMethod(it, "getPackageName") as String
+            Reflect.getObjectField(topTask, "topActivity")?.let {
+                Reflect.callMethod(it, "getPackageName") as String
             }
         }.getOrNull()
         val topIsHome = runCatching {
-            val windowConfig = XposedHelpers.getObjectField(
-                XposedHelpers.getObjectField(topTask, "configuration"),
+            val windowConfig = Reflect.getObjectField(
+                Reflect.getObjectField(topTask, "configuration"),
                 "windowConfiguration"
             )
-            (XposedHelpers.callMethod(windowConfig, "getActivityType") as Int) == 2
+            (Reflect.callMethod(windowConfig, "getActivityType") as Int) == 2
         }.getOrDefault(false)
         if (BuildConfig.DEBUG) {
             log("reYAMF_debug") { "stackChanged topId=$topTaskId pkg=$topPkg isHome=$topIsHome windows=${activeWindows.size}" }
@@ -204,7 +204,7 @@ object YAMFManager : IYAMFManager.Stub() {
             windows.forEach { w ->
                 if (windowBackend.isTaskManaged(w.currentTaskId)) return@forEach
                 val info = tasks.find {
-                    XposedHelpers.getIntField(it, "taskId") == w.currentTaskId
+                    Reflect.getIntField(it, "taskId") == w.currentTaskId
                 }
                 if (info == null) {
                     // 承载任务已不存在：任务被系统内部移除（如 top-resumed 超时强停）不会回调
@@ -226,7 +226,7 @@ object YAMFManager : IYAMFManager.Stub() {
                     return@forEach
                 }
                 missingTaskChecks.remove(w.windowId)
-                val visible = XposedHelpers.getBooleanField(info, "isVisible")
+                val visible = Reflect.getBooleanField(info, "isVisible")
                 if (BuildConfig.DEBUG) {
                     log("reYAMF_debug") { "visibility task=${w.currentTaskId} found=true visible=$visible" }
                 }
@@ -264,14 +264,14 @@ object YAMFManager : IYAMFManager.Stub() {
             if (w.currentTaskId <= 0) return@runMain
             if (windowBackend.isTaskManaged(w.currentTaskId)) return@runMain
             val tasks = runCatching {
-                XposedHelpers.callMethod(
+                Reflect.callMethod(
                     Instances.activityTaskManager, "getTasks", Int.MAX_VALUE, false, false, -1
                 ) as List<*>
             }.getOrNull() ?: return@runMain
             val info = tasks.find {
-                XposedHelpers.getIntField(it, "taskId") == w.currentTaskId
+                Reflect.getIntField(it, "taskId") == w.currentTaskId
             } ?: return@runMain
-            val visible = XposedHelpers.getBooleanField(info, "isVisible")
+            val visible = Reflect.getBooleanField(info, "isVisible")
             if (BuildConfig.DEBUG) {
                 log("reYAMF_debug") { "visibility recheck window=$windowId task=${w.currentTaskId} visible=$visible" }
             }
@@ -621,15 +621,15 @@ object YAMFManager : IYAMFManager.Stub() {
         log("reYAMF_debug") { "switchToSmoothFreeform task=$taskId" }
         WindowSessions.hostedTasks.add(taskId)
 
-        val runningTasks = XposedHelpers.callMethod(Instances.activityTaskManager, "getTasks", Int.MAX_VALUE, false, false, -1) as List<*>
+        val runningTasks = Reflect.callMethod(Instances.activityTaskManager, "getTasks", Int.MAX_VALUE, false, false, -1) as List<*>
         val taskInfo = runningTasks.find {
-            XposedHelpers.getIntField(it, "taskId") == taskId
+            Reflect.getIntField(it, "taskId") == taskId
         } ?: run {
             logWarning("reYAMF_debug", "switchToSmoothFreeform task=$taskId NOT FOUND in tasks")
             return false
         }
         runCatching {
-            XposedHelpers.getObjectField(taskInfo, "topActivity") as? ComponentName
+            Reflect.getObjectField(taskInfo, "topActivity") as? ComponentName
         }.getOrNull()?.let { WindowSessions.taskActivities[taskId] = it }
 
         // 系统窗口后端：认领（organizer/leash）+ 置前 + 恢复可聚焦；小窗不改应用 DPI，

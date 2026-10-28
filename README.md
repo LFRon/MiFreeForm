@@ -15,13 +15,13 @@
 
 工程声明的最低版本是 Android 13（API 33），当前原生交接与绘制同步的验证基线是 **LineageOS 24.0 的 Quickstep / Launcher3 与系统窗口后端**。最低 API、作用域中的包名或可找到的类名，都不能单独证明设备兼容。当前 Android 17 / Pixel Launcher 17、907 仅为源码核对候选，尚未完成 PixelOS 真机验证；Android 15/16 的组合保留待适配入口。
 
-安装需要支持本工程 Xposed 接口的框架，例如 LSPosed。当前 Android 17 实现需要同时启用 **`android`、`com.android.systemui` 和实际承担最近任务手势的 Launcher**。SystemUI 承载 Shell，小窗后端会等待同一构建的 Shell 隔离确认；缺少其作用域或仍驻留旧代码时，后端不宣告入口可用。侧边栏等应用侧浮层按界面提示授予悬浮窗权限。
+安装需要支持 **libxposed API 102** 的框架（本工程在 Vector 上验证）。模块以 `META-INF/xposed/module.prop` 声明 `targetApiVersion=102`，框架因此只走现代入口，不再经过 legacy `de.robv` 兼容层；作用域清单是 **`system`（system_server 的虚拟包名，不是 `android`）、`com.android.systemui` 和实际承担最近任务手势的 Launcher**。SystemUI 承载 Shell，小窗后端会等待同一构建的 Shell 隔离确认；缺少其作用域或仍驻留旧代码时，后端不宣告入口可用。侧边栏等应用侧浮层按界面提示授予悬浮窗权限。
 
 Google 原生 Android 17 默认可能未开启 freeform。使用该镜像时，请在开发者选项中启用 freeform（或写入 `enable_freeform_support=1`、`force_resizable_activities=1`）并重启，否则系统会拒绝创建 freeform 悬浮根；这不是模块的窗口策略。AVD 基线使用 Pixel Launcher 17/907，真机仍需按同一组合复验。
 
 安装或更新 APK 后，应在 Hook 框架中检查模块及所需作用域。APK 更新成功不等于 Launcher / `system_server` 已加载新代码；驻留版本的生效方式由所用框架决定。
 
-顶栏及状态卡片目前显示“暂不支持检测”，模块激活及作用域完整性检测将在迁移至 **libxposed 102** 后补充。这一提示不代表模块未激活，也不根据服务连接或后端就绪状态推断作用域是否完整。
+顶栏及状态卡片直接读取框架状态：通过 `io.github.libxposed:service` 的 `getRunningTargets()` 判断是否已有注入进程，通过 `getScope()` 与必需作用域比对得出缺失项。两种事实分开呈现——连接上应用服务只说明配置通道可用，不代表已注入；注入进程存在也不代表作用域完整。
 
 当前没有额外的进程完整性探测、回报或检测定时器。设置、窗口命令所需的应用服务连接按启动、前台及 UID 活跃事件建立，不进行周期轮询。悬浮窗权限仅在用户主动启动侧边栏时申请，不影响查看应用界面。
 
@@ -60,6 +60,23 @@ app
 | [`android-stub`](android-stub) | 供 Android 编译使用的内部接口声明 |
 
 `app` 的编译依赖不包含 CORE，适配器只使用 API 和运行时工厂。前三个模块不依赖 Android、Hook 框架、反射或系统时钟；帧时间由平台调度器传入。架构边界由自动化测试检查。
+
+### Hook 框架接入
+
+| 关注点 | 位置 |
+| --- | --- |
+| 唯一的现代入口（`XposedModule`） | [`ModuleEntry`](app/src/main/java/com/buildsession/betterYAMF/xposed/hook/bridge/ModuleEntry.kt) |
+| 注册、回调、原始方法调用 | [`NativeHooks`](app/src/main/java/com/buildsession/betterYAMF/xposed/hook/bridge/NativeHooks.kt) |
+| 反射工具（同名替代 classic `XposedHelpers`） | [`Reflect`](app/src/main/java/com/buildsession/betterYAMF/xposed/utils/Reflect.kt) |
+| 运行期元数据 | `app/src/main/resources/META-INF/xposed/{java_init.list,module.prop,scope.list}` |
+
+AVD 证据：Vector 2.2 (3080) 在 `system` / `com.android.systemui` / `com.google.android.apps.nexuslauncher` 作用域下报告 `api=102`，模块以现代入口加载；`selected system adapter: SDK 37`、`entry backend ready ... shell=true`、`task menu entry installed producers=1`、`end gates installed=2 normal=1` 与通知点击能力均安装成功。
+
+框架 API 只允许出现在 `xposed/hook/bridge/`，由 `ArchitectureBoundaryTest` 检查。`system_server` 在 `onSystemServerStarting` 安装——框架在 `SystemServer.startBootstrapServices` 入口分发该回调，因此不再需要 zygote 注入或进程 UID 早注入探测；SystemUI 与 Launcher 在 `onPackageReady` 安装，传入的就是可直接解析包内类的 classloader。
+
+`NativeHooks` 在拦截链上复刻 classic 回调契约：`before` 写回的可变实参随 `proceed` 传给原方法，`result` 可短路原方法且 `after` 仍会执行，`after` 读到的是真实返回值，`throwable` 在 `after` 可见，`setObjectExtra` 在同一个 `Call` 内共享。
+
+`libxposed:api:102.0.0` 只作编译期依赖。`api` / `service` / `interface` 三个 102.0.0 产物存放在 [`app/libs`](app/libs)（官方 `classes.jar` 与去掉 AAR 元数据的 service 包）：发布的 AAR 声明 `minCompileSdk=37`，而本工程编译于 android-36。`service` 的 `HotReloadResult` 是 Java record，低于 API 34 时 AGP 无法为其生成脱糖用的 global synthetic，因此该 record 从产物中移除，由同包的普通类复刻其公开面（本模块不使用热重载）。
 
 ### Hook 如何接入事件层
 
@@ -199,7 +216,7 @@ gradle :app:lintDebug :app:lintRelease :app:compileDebugAndroidTestKotlin
 同时感谢以下项目、工具及其作者提供的代码、基础设施或参考：
 
 - [reYAMF](https://github.com/JuanArton/reYAMF)、[Mi-FreeForm](https://github.com/sunshine0523/Mi-FreeForm)、[AOSP](https://source.android.com/)、[LineageOS](https://github.com/LineageOS)
-- [Xposed](https://forum.xda-developers.com/xposed)、[LSPosed](https://github.com/LSPosed/LSPosed)、[EzXHelper](https://github.com/KyuubiRan/EzXHelper)
+- [Xposed](https://forum.xda-developers.com/xposed)、[LSPosed](https://github.com/LSPosed/LSPosed)、[Vector](https://github.com/JingMatrix/Vector)、[libxposed](https://github.com/libxposed/api)
 - [Hide-My-Applist](https://github.com/Dr-TSNG/Hide-My-Applist)、[QAuxiliary](https://github.com/cinit/QAuxiliary)
 - [Material](https://material.io/)、[FlexboxLayout](https://github.com/google/flexbox-layout)、[ViewBindingUtil](https://github.com/matsudamper/ViewBindingUtil)、[Gson](https://github.com/google/gson)
 

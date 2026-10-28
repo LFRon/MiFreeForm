@@ -3,7 +3,7 @@ package com.buildsession.betterYAMF.xposed.adapters.common.system
 import android.graphics.Rect
 import android.view.Display
 import com.buildsession.betterYAMF.xposed.utils.Instances
-import de.robv.android.xposed.XposedHelpers
+import com.buildsession.betterYAMF.xposed.utils.Reflect
 
 /**
  * 系统栏度量适配器（系统内部细节收口点）：
@@ -30,12 +30,12 @@ object SystemBarMetrics {
             .getDisplay(Display.DEFAULT_DISPLAY))
         val dm = android.util.DisplayMetrics().also(display::getRealMetrics)
         val safe = runCatching {
-            val wms = XposedHelpers.getObjectField(Instances.activityTaskManager, "mWindowManager")
-            synchronized(XposedHelpers.getObjectField(wms, "mGlobalLock")) {
-                val dc = XposedHelpers.callMethod(XposedHelpers.getObjectField(wms, "mRoot"), "getDisplayContent", 0)
-                val controller = XposedHelpers.callMethod(dc, "getInsetsStateController")
-                val state = XposedHelpers.callMethod(controller, "getRawInsetsState")
-                XposedHelpers.callMethod(state, "calculateInsets", Rect(0, 0, dm.widthPixels, dm.heightPixels),
+            val wms = Reflect.getObjectField(Instances.activityTaskManager, "mWindowManager")
+            synchronized(Reflect.requireObjectField(wms, "mGlobalLock")) {
+                val dc = Reflect.callMethod(Reflect.getObjectField(wms, "mRoot"), "getDisplayContent", 0)
+                val controller = Reflect.callMethod(dc, "getInsetsStateController")
+                val state = Reflect.callMethod(controller, "getRawInsetsState")
+                Reflect.callMethod(state, "calculateInsets", Rect(0, 0, dm.widthPixels, dm.heightPixels),
                     android.view.WindowInsets.Type.systemBars() or android.view.WindowInsets.Type.displayCutout(), true) as android.graphics.Insets
             }
         }.getOrNull()
@@ -55,18 +55,18 @@ object SystemBarMetrics {
     /** 取 DisplayPolicy 并读系统栏窗口（getStatusBar / getNavigationBar）的 frame 高度。 */
     private fun windowHeight(accessor: String): Int? = runCatching {
         val policy = displayPolicy() ?: return null
-        val window = XposedHelpers.callMethod(policy, accessor) ?: return null
-        val frame = XposedHelpers.callMethod(window, "getFrame") as? Rect ?: return null
+        val window = Reflect.callMethod(policy, accessor) ?: return null
+        val frame = Reflect.callMethod(window, "getFrame") as? Rect ?: return null
         frame.height().takeIf { it > 0 }
     }.getOrNull()
 
     private fun displayPolicy(): Any? = runCatching {
-        val wms = XposedHelpers.getObjectField(Instances.activityTaskManager, "mWindowManager")
+        val wms = Reflect.getObjectField(Instances.activityTaskManager, "mWindowManager")
             ?: return null
-        val root = XposedHelpers.getObjectField(wms, "mRoot") ?: return null
-        val displayContent = XposedHelpers.callMethod(root, "getDisplayContent", Display.DEFAULT_DISPLAY)
+        val root = Reflect.getObjectField(wms, "mRoot") ?: return null
+        val displayContent = Reflect.callMethod(root, "getDisplayContent", Display.DEFAULT_DISPLAY)
             ?: return null
-        XposedHelpers.callMethod(displayContent, "getDisplayPolicy")
+        Reflect.callMethod(displayContent, "getDisplayPolicy")
     }.getOrNull()
 
     private fun resourceHeight(name: String): Int? = runCatching {

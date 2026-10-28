@@ -2,7 +2,7 @@ package com.buildsession.betterYAMF.xposed.adapters.common.system
 
 import android.view.Surface
 import android.view.View
-import de.robv.android.xposed.XposedHelpers
+import com.buildsession.betterYAMF.xposed.utils.Reflect
 
 /**
  * 视图表面控制适配器（反射细节收口点）：
@@ -43,8 +43,8 @@ object ViewSurfaceOps {
      * **只读语义**：调用方不得 release（生命周期归 ViewRootImpl）。
      */
     fun windowSurface(view: View): android.view.SurfaceControl? = runCatching {
-        val viewRootImpl = XposedHelpers.callMethod(view, "getViewRootImpl")
-        (XposedHelpers.callMethod(viewRootImpl, "getSurfaceControl") as? android.view.SurfaceControl)
+        val viewRootImpl = Reflect.callMethod(view, "getViewRootImpl")
+        (Reflect.callMethod(viewRootImpl, "getSurfaceControl") as? android.view.SurfaceControl)
             ?.takeIf { it.isValid }
     }.getOrNull()
 }

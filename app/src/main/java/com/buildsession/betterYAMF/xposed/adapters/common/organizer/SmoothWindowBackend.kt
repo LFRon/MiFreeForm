@@ -20,7 +20,7 @@ import com.buildsession.betterYAMF.xposed.utils.Instances
 import com.buildsession.betterYAMF.xposed.utils.log
 import com.buildsession.betterYAMF.xposed.utils.logError
 import com.buildsession.betterYAMF.xposed.utils.logWarning
-import de.robv.android.xposed.XposedHelpers
+import com.buildsession.betterYAMF.xposed.utils.Reflect
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -168,11 +168,11 @@ object SmoothWindowBackend : WindowBackend {
 
         // 旧路径兜底（未被 leash 接管的平滑任务）：清表面变换 + WCT 回全屏
         return runCatching {
-            val runningTasks = XposedHelpers.callMethod(
+            val runningTasks = Reflect.callMethod(
                 Instances.activityTaskManager, "getTasks", Int.MAX_VALUE, false, false, -1
             ) as? List<*> ?: return false
             val taskInfo = runningTasks.find {
-                XposedHelpers.getIntField(it, "taskId") == taskId
+                Reflect.getIntField(it, "taskId") == taskId
             } ?: return false
 
             // 清掉我们曾施加的表面变换/裁剪/圆角（用缓存的 Task 对象；传 RunningTaskInfo 会静默失败）
@@ -182,15 +182,15 @@ object SmoothWindowBackend : WindowBackend {
 
             val classLoader = Instances.systemContext.classLoader
             val wctClass = classLoader.loadClass("android.window.WindowContainerTransaction")
-            val wct = XposedHelpers.newInstance(wctClass)
-            val token = XposedHelpers.getObjectField(taskInfo, "token")
-            XposedHelpers.callMethod(wct, "setWindowingMode", token, WINDOWING_MODE_FULLSCREEN)
+            val wct = Reflect.newInstance(wctClass)
+            val token = Reflect.getObjectField(taskInfo, "token")
+            Reflect.callMethod(wct, "setWindowingMode", token, WINDOWING_MODE_FULLSCREEN)
             // Clear the session override even if an external launch already selected fullscreen.
-            XposedHelpers.callMethod(wct, "setBounds", token, Rect())
+            Reflect.callMethod(wct, "setBounds", token, Rect())
 
             val windowOrganizerController =
-                XposedHelpers.callMethod(Instances.activityTaskManager, "getWindowOrganizerController")
-            XposedHelpers.callMethod(windowOrganizerController, "applyTransaction", wct)
+                Reflect.callMethod(Instances.activityTaskManager, "getWindowOrganizerController")
+            Reflect.callMethod(windowOrganizerController, "applyTransaction", wct)
             true
         }.onFailure {
             log(TAG, "releaseTask failed task=$taskId", it)
@@ -394,17 +394,17 @@ object SmoothWindowBackend : WindowBackend {
             // 缓存可能已被释放路径清空（releaseTaskTransforms 会移除弱引用）→ 现场解析兜底，
             // 否则焦点恢复会静默跳过（曾导致"回全屏后 launcher 抢前台"）。
             val task = FreeformBackend.taskById(taskId) ?: resolveTaskObject(taskId) ?: return
-            val wm = XposedHelpers.getObjectField(task, "mWmService")
-            synchronized(XposedHelpers.getObjectField(wm, "mGlobalLock")) {
+            val wm = Reflect.getObjectField(task, "mWmService")
+            synchronized(Reflect.requireObjectField(wm, "mGlobalLock")) {
                 if (focusable) {
-                    XposedHelpers.callMethod(task, "setFocusable", true)
+                    Reflect.callMethod(task, "setFocusable", true)
                 } else {
-                    val wasFocused = runCatching { XposedHelpers.callMethod(task, "isFocused") as? Boolean }
+                    val wasFocused = runCatching { Reflect.callMethod(task, "isFocused") as? Boolean }
                         .getOrNull() ?: false
-                    XposedHelpers.callMethod(task, "setFocusable", false)
+                    Reflect.callMethod(task, "setFocusable", false)
                     if (wasFocused) {
                         runCatching {
-                            XposedHelpers.callMethod(task, "adjustFocusToNextFocusableTask", "betterYAMF-float")
+                            Reflect.callMethod(task, "adjustFocusToNextFocusableTask", "betterYAMF-float")
                         }
                         log(TAG) { "task=$taskId demoted focus (float on top)" }
                     }
@@ -417,19 +417,19 @@ object SmoothWindowBackend : WindowBackend {
 
     /** 现场按 taskId 解析 Task 对象（缓存失效时的兜底路径）。 */
     private fun resolveTaskObject(taskId: Int): Any? = runCatching {
-        val runningTasks = XposedHelpers.callMethod(
+        val runningTasks = Reflect.callMethod(
             Instances.activityTaskManager, "getTasks", Int.MAX_VALUE, false, false, -1
         ) as? List<*> ?: return null
         val info = runningTasks.find {
-            XposedHelpers.getIntField(it, "taskId") == taskId
+            Reflect.getIntField(it, "taskId") == taskId
         } ?: return null
-        val token = XposedHelpers.getObjectField(info, "token")
-        val binder = XposedHelpers.callMethod(token, "asBinder") as? android.os.IBinder
+        val token = Reflect.getObjectField(info, "token")
+        val binder = Reflect.callMethod(token, "asBinder") as? android.os.IBinder
             ?: return null
         val cls = Instances.systemContext.classLoader
             .loadClass("com.android.server.wm.WindowContainer")
-        val wc = XposedHelpers.callStaticMethod(cls, "fromBinder", binder) ?: return null
-        XposedHelpers.callMethod(wc, "asTask")
+        val wc = Reflect.callStaticMethod(cls, "fromBinder", binder) ?: return null
+        Reflect.callMethod(wc, "asTask")
     }.getOrNull()
 
     @SuppressLint("MissingPermission") // Same system_server-only execution boundary as openTask.
@@ -472,9 +472,9 @@ object SmoothWindowBackend : WindowBackend {
         // freeform 启动入承载根；不施加任何密度覆盖——小窗不改应用 DPI，
         // 应用按默认显示器密度与窗口尺寸自行布局。
         val options = android.app.ActivityOptions.makeBasic()
-        XposedHelpers.callMethod(options, "setLaunchWindowingMode", WINDOWING_MODE_FREEFORM)
+        Reflect.callMethod(options, "setLaunchWindowingMode", WINDOWING_MODE_FREEFORM)
         SmoothTaskOrganizer.launchRootToken()?.let { rootToken ->
-            XposedHelpers.callMethod(options, "setLaunchRootTask", rootToken)
+            Reflect.callMethod(options, "setLaunchRootTask", rootToken)
         }
 
         val intent = Intent().apply {
@@ -484,12 +484,12 @@ object SmoothWindowBackend : WindowBackend {
             addFlags(Intent.FLAG_ACTIVITY_MULTIPLE_TASK)
         }
 
-        val userHandle = XposedHelpers.callStaticMethod(
+        val userHandle = Reflect.callStaticMethod(
             android.os.UserHandle::class.java,
             "of",
             userId
         )
-        XposedHelpers.callMethod(
+        Reflect.callMethod(
             Instances.systemContext,
             "startActivityAsUser",
             intent,

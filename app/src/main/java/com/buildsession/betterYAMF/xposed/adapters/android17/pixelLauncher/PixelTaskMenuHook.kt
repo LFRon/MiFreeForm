@@ -14,8 +14,8 @@ import com.buildsession.betterYAMF.xposed.adapters.common.launcher.RecentsDropHa
 import com.buildsession.betterYAMF.xposed.hook.bridge.NativeHooks.hookAfter
 import com.buildsession.betterYAMF.xposed.utils.log
 import com.buildsession.betterYAMF.xposed.utils.logWarning
-import com.github.kyuubiran.ezxhelper.init.InitFields.moduleRes
-import de.robv.android.xposed.XposedHelpers
+import com.buildsession.betterYAMF.xposed.hook.bridge.moduleRes
+import com.buildsession.betterYAMF.xposed.utils.Reflect
 import java.lang.reflect.Field
 
 /**
@@ -54,12 +54,12 @@ internal object PixelTaskMenuHook {
     }
 
     private fun buildShortcut(loader: ClassLoader, view: View, container: Any): Any? {
-        val task = runCatching { XposedHelpers.callMethod(container, "getTask") }.getOrNull() ?: return null
-        val key = runCatching { XposedHelpers.getObjectField(task, "key") }.getOrNull() ?: return null
-        val taskId = runCatching { XposedHelpers.getIntField(key, "id") }.getOrDefault(-1)
-        val userId = runCatching { XposedHelpers.getIntField(key, "userId") }.getOrDefault(0)
+        val task = runCatching { Reflect.callMethod(container, "getTask") }.getOrNull() ?: return null
+        val key = runCatching { Reflect.getObjectField(task, "key") }.getOrNull() ?: return null
+        val taskId = runCatching { Reflect.getIntField(key, "id") }.getOrDefault(-1)
+        val userId = runCatching { Reflect.getIntField(key, "userId") }.getOrDefault(0)
         if (taskId <= 0) return null
-        val itemInfo = runCatching { XposedHelpers.callMethod(container, "getItemInfo") }.getOrNull() ?: return null
+        val itemInfo = runCatching { Reflect.callMethod(container, "getItemInfo") }.getOrNull() ?: return null
         val activityContext = runCatching {
             val type = loader.loadClass("com.android.quickstep.views.RecentsViewContainer")
             type.getMethod("containerFromContext", Context::class.java).invoke(null, view.context)

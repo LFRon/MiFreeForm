@@ -1,6 +1,11 @@
 <resources>
-    <string name="module_detection_unsupported">暂不支持检测</string>
-    <string name="module_detection_deferred_message">模块激活及作用域完整性检测将在迁移至 libxposed 102 后补充。当前提示不代表模块未激活。</string>
+    <string name="module_detection_connecting">正在读取框架状态…</string>
+    <string name="module_detection_connecting_hint">等待 Xposed 框架服务应答。</string>
+    <string name="module_detection_framework_absent">未连接到 Xposed 框架</string>
+    <string name="module_detection_framework_absent_hint">框架未应答。请确认模块已启用并已重启。</string>
+    <string name="module_detection_framework">%1$s %2$s · API %3$d</string>
+    <string name="module_detection_scope_heading">推荐作用域：</string>
+    <string name="module_detection_running_targets">已注入：%1$s</string>
     <string name="sidebar_overlay_permission_message">使用侧边栏需要允许显示在其他应用上层。</string>
     <string name="app_name">BetterYAMF</string>
     <string name="details">详情</string>

@@ -15,8 +15,8 @@ import com.buildsession.betterYAMF.xposed.hook.bridge.NativeHooks.hookAfter
 import com.buildsession.betterYAMF.xposed.hook.bridge.NativeHooks.hookBefore
 import com.buildsession.betterYAMF.xposed.utils.logWarning
 import com.buildsession.betterYAMF.xposed.utils.registerReceiver
-import com.github.kyuubiran.ezxhelper.init.InitFields.moduleRes
-import de.robv.android.xposed.XposedHelpers
+import com.buildsession.betterYAMF.xposed.hook.bridge.moduleRes
+import com.buildsession.betterYAMF.xposed.utils.Reflect
 
 /** Optional menu/taskbar hooks cannot abort the gesture installer. This shared implementation is
  * the LoS Launcher3 ABI; the Pixel unit deliberately does not select it.
@@ -68,15 +68,15 @@ internal class QuickstepOptionalHooks(private val loader: ClassLoader,
                     val view = call.args[0] as View
                     val shortcuts = call.result as? List<*> ?: return@runCatching
                     val first = shortcuts.firstOrNull() ?: return@runCatching
-                    val item = XposedHelpers.getObjectField(first, "mItemInfo") ?: return@runCatching
-                    val task = runCatching { XposedHelpers.callMethod(view, "getTask") }.getOrNull()
+                    val item = Reflect.getObjectField(first, "mItemInfo") ?: return@runCatching
+                    val task = runCatching { Reflect.callMethod(view, "getTask") }.getOrNull()
                         ?: run {
-                            val containers = XposedHelpers.getObjectField(view, "taskContainers") as? List<*>
-                            containers?.firstOrNull()?.let { XposedHelpers.getObjectField(it, "task") }
+                            val containers = Reflect.getObjectField(view, "taskContainers") as? List<*>
+                            containers?.firstOrNull()?.let { Reflect.getObjectField(it, "task") }
                         } ?: return@runCatching
-                    val key = XposedHelpers.getObjectField(task, "key")
-                    val id = XposedHelpers.getIntField(key, "id")
-                    val user = XposedHelpers.getIntField(key, "userId")
+                    val key = Reflect.getObjectField(task, "key")
+                    val id = Reflect.getIntField(key, "id")
+                    val user = Reflect.getIntField(key, "userId")
                     if (id <= 0) return@runCatching
                     val intent = Intent(Protocol.ACTION_OPEN_IN_YAMF).setPackage("android")
                         .putExtra(Protocol.EXTRA_TASK_ID, id).putExtra(Protocol.EXTRA_USER_ID, user)
@@ -113,14 +113,14 @@ internal class QuickstepOptionalHooks(private val loader: ClassLoader,
             if (!isCurrentLauncher()) return@hookBefore
             runCatching {
                 val item = call.args.firstOrNull()?.takeIf(workspaceType::isInstance) ?: return@runCatching
-                val component = (XposedHelpers.callMethod(item, "getIntent") as? Intent)?.component ?: return@runCatching
+                val component = (Reflect.callMethod(item, "getIntent") as? Intent)?.component ?: return@runCatching
                 val context = call.thisObject as Context
                 val intent = Intent(Protocol.ACTION_OPEN_IN_YAMF).setPackage("android")
                     .putExtra(Protocol.EXTRA_COMPONENT_NAME, component)
                     .putExtra(Protocol.EXTRA_SOURCE, Protocol.SOURCE_TASKBAR)
-                val user = XposedHelpers.getObjectField(item, "user") as? UserHandle
+                val user = Reflect.getObjectField(item, "user") as? UserHandle
                 if (user != null) intent.putExtra(Protocol.EXTRA_USER_ID,
-                    XposedHelpers.callMethod(user, "getIdentifier") as Int)
+                    Reflect.callMethod(user, "getIdentifier") as Int)
                 context.sendBroadcast(intent)
                 call.result = null
             }.onFailure { logWarning(TAG, "Taskbar entry failed; preserve native launch", it) }

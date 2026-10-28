@@ -1,6 +1,8 @@
 package com.buildsession.betterYAMF.xposed.adapters.common.freeform
 
 import com.buildsession.betterYAMF.xposed.hook.bridge.NativeHooks
+import com.buildsession.betterYAMF.xposed.hook.bridge.NativeHooks.hookAfter
+import com.buildsession.betterYAMF.xposed.hook.bridge.NativeHooks.hookBefore
 
 import android.content.res.Configuration
 import android.graphics.Rect
@@ -16,8 +18,9 @@ import com.buildsession.betterYAMF.xposed.utils.Instances
 import com.buildsession.betterYAMF.xposed.utils.log
 import com.buildsession.betterYAMF.xposed.utils.logWarning
 import com.buildsession.betterYAMF.window.session.WindowSessions
-import com.github.kyuubiran.ezxhelper.utils.*
-import de.robv.android.xposed.XposedHelpers
+import com.buildsession.betterYAMF.xposed.utils.findMethod
+import com.buildsession.betterYAMF.xposed.utils.paramCount
+import com.buildsession.betterYAMF.xposed.utils.Reflect
 import java.util.concurrent.ConcurrentHashMap
 
 object FreeformBackend {
@@ -56,21 +59,21 @@ object FreeformBackend {
     fun releaseTaskTransforms(taskId: Int) {
         val task = taskRefs.remove(taskId)?.get() ?: return
         runCatching {
-            val surfaceControl = XposedHelpers.getObjectField(task, "mSurfaceControl") as? SurfaceControl ?: return
-            val transaction = XposedHelpers.callMethod(task, "getSyncTransaction") as SurfaceControl.Transaction
-            XposedHelpers.callMethod(transaction, "setMatrix", surfaceControl, 1f, 0f, 0f, 1f)
-            XposedHelpers.callMethod(transaction, "setPosition", surfaceControl, 0f, 0f)
-            XposedHelpers.callMethod(
+            val surfaceControl = Reflect.getObjectField(task, "mSurfaceControl") as? SurfaceControl ?: return
+            val transaction = Reflect.callMethod(task, "getSyncTransaction") as SurfaceControl.Transaction
+            Reflect.callMethod(transaction, "setMatrix", surfaceControl, 1f, 0f, 0f, 1f)
+            Reflect.callMethod(transaction, "setPosition", surfaceControl, 0f, 0f)
+            Reflect.callMethodTyped(
                 transaction,
                 "setWindowCrop",
                 arrayOf<Class<*>>(SurfaceControl::class.java, Rect::class.java),
                 surfaceControl,
                 null
             )
-            XposedHelpers.callMethod(transaction, "setCornerRadius", surfaceControl, 0f)
+            Reflect.callMethod(transaction, "setCornerRadius", surfaceControl, 0f)
             // 恢复系统默认的客户端自绘圆角开关（与 TransitionController 转场收尾语义一致；
             // 不恢复的话应用在回归全屏后仍保持"不自绘"状态，属我们不应留的全局副作用）
-            XposedHelpers.callMethod(
+            Reflect.callMethod(
                 transaction, "toggleClientDrawnRoundedCornersOpt", surfaceControl, true
             )
         }.onFailure {
@@ -90,7 +93,7 @@ object FreeformBackend {
     private const val REASSERT_MAX_ATTEMPTS = 12
 
     private fun schedulePendingReassert(task: Any) {
-        val taskId = runCatching { XposedHelpers.getIntField(task, "mTaskId") }.getOrDefault(-1)
+        val taskId = runCatching { Reflect.getIntField(task, "mTaskId") }.getOrDefault(-1)
         if (taskId < 0) return
         if (pendingReassertTasks.putIfAbsent(taskId, task) != null) return
         pendingReassertAttempts[taskId] = 0
@@ -148,16 +151,16 @@ object FreeformBackend {
 
     private inline fun logOnceTask(task: Any, message: () -> String) {
         if (BuildConfig.DEBUG) {
-            val taskId = runCatching { XposedHelpers.getIntField(task, "mTaskId") }.getOrDefault(-1)
+            val taskId = runCatching { Reflect.getIntField(task, "mTaskId") }.getOrDefault(-1)
             logOnce(taskId, message)
         }
     }
 
     private fun isTaskAnimating(task: Any): Boolean =
-        runCatching { XposedHelpers.callMethod(task, "isAnimating") as Boolean }.getOrDefault(false)
+        runCatching { Reflect.callMethod(task, "isAnimating") as Boolean }.getOrDefault(false)
 
     private fun reassertTaskTransform(task: Any, clearCrop: Boolean, source: String) {
-        val taskId = runCatching { XposedHelpers.getIntField(task, "mTaskId") }.getOrDefault(-1)
+        val taskId = runCatching { Reflect.getIntField(task, "mTaskId") }.getOrDefault(-1)
         if (SmoothWindowBackend.hasSynchronizedPresentation(taskId)) {
             // prepareSurfaces is called for every traversal. It must neither write ahead of the
             // shell buffer nor create an endless invalidate -> draw -> prepareSurfaces loop.
@@ -248,7 +251,7 @@ object FreeformBackend {
         }
         val notTouchable = runCatching {
             val inputConfigClass = classLoader.loadClass("android.os.InputConfig")
-            XposedHelpers.getStaticIntField(inputConfigClass, "NOT_TOUCHABLE")
+            Reflect.getStaticIntField(inputConfigClass, "NOT_TOUCHABLE")
         }.getOrDefault(2)
 
         findMethod(sinkClass) {
@@ -256,18 +259,18 @@ object FreeformBackend {
         }.hookAfter { param ->
             runCatching {
                 val sink = param.thisObject
-                val activityRecord = XposedHelpers.getObjectField(sink, "mActivityRecord") ?: return@runCatching
-                val task = runCatching { XposedHelpers.callMethod(activityRecord, "getTask") }.getOrNull()
+                val activityRecord = Reflect.getObjectField(sink, "mActivityRecord") ?: return@runCatching
+                val task = runCatching { Reflect.callMethod(activityRecord, "getTask") }.getOrNull()
                     ?: return@runCatching
-                val taskId = XposedHelpers.getIntField(task, "mTaskId")
+                val taskId = Reflect.getIntField(task, "mTaskId")
                 if (!WindowSessions.hostedTasks.contains(taskId)) return@runCatching
 
                 // 官方开关：永久停用该 Activity 的输入吞噬
-                runCatching { XposedHelpers.setBooleanField(activityRecord, "mActivityRecordInputSinkEnabled", false) }
+                runCatching { Reflect.setBooleanField(activityRecord, "mActivityRecordInputSinkEnabled", false) }
                 // 当次立即生效（穿透）
                 val wrapper = param.result ?: return@runCatching
                 runCatching {
-                    XposedHelpers.callMethod(wrapper, "setInputConfigMasked", notTouchable, notTouchable)
+                    Reflect.callMethod(wrapper, "setInputConfigMasked", notTouchable, notTouchable)
                 }
             }.onFailure {
                 log(TAG, "sink defang failed", it)
@@ -294,12 +297,12 @@ object FreeformBackend {
         }.hookAfter { param ->
             runCatching {
                 val transaction = param.args[1] as? SurfaceControl.Transaction ?: return@runCatching
-                val participants = XposedHelpers.getObjectField(param.thisObject, "mParticipants") as? Collection<*> ?: return@runCatching
+                val participants = Reflect.getObjectField(param.thisObject, "mParticipants") as? Collection<*> ?: return@runCatching
                 val policy = platformPolicy
                 participants.forEach { wc ->
                     if (wc == null) return@forEach
-                    val task = runCatching { XposedHelpers.callMethod(wc, "asTask") }.getOrNull() ?: return@forEach
-                    val taskId = runCatching { XposedHelpers.getIntField(task, "mTaskId") }.getOrDefault(-1)
+                    val task = runCatching { Reflect.callMethod(wc, "asTask") }.getOrNull() ?: return@forEach
+                    val taskId = runCatching { Reflect.getIntField(task, "mTaskId") }.getOrDefault(-1)
                     if (taskId < 0) return@forEach
                     if (com.buildsession.betterYAMF.xposed.adapters.common.organizer.SmoothTaskOrganizer.isLeashManaged(taskId)) {
                         // leash 任务：把稳态变换并入过渡事务（本地播放/兜底路径生效；
@@ -328,14 +331,14 @@ object FreeformBackend {
             runCatching {
                 val transaction = param.args[0] as? SurfaceControl.Transaction ?: return@runCatching
                 val info = param.args[1] ?: return@runCatching
-                val changes = runCatching { XposedHelpers.callMethod(info, "getChanges") as? List<*> }
+                val changes = runCatching { Reflect.callMethod(info, "getChanges") as? List<*> }
                     .getOrNull() ?: return@runCatching
                 changes.forEach { change ->
                     if (change == null) return@forEach
-                    val container = runCatching { XposedHelpers.callMethod(change, "getContainer") }.getOrNull()
+                    val container = runCatching { Reflect.callMethod(change, "getContainer") }.getOrNull()
                     val wc = wcFromToken(container) ?: return@forEach
-                    val task = runCatching { XposedHelpers.callMethod(wc, "asTask") }.getOrNull() ?: return@forEach
-                    val taskId = runCatching { XposedHelpers.getIntField(task, "mTaskId") }.getOrDefault(-1)
+                    val task = runCatching { Reflect.callMethod(wc, "asTask") }.getOrNull() ?: return@forEach
+                    val taskId = runCatching { Reflect.getIntField(task, "mTaskId") }.getOrDefault(-1)
                     if (taskId < 0 ||
                         !com.buildsession.betterYAMF.xposed.adapters.common.organizer.SmoothTaskOrganizer.isLeashManaged(taskId)
                     ) return@forEach
@@ -351,13 +354,13 @@ object FreeformBackend {
             name == "finishTransition" && paramCount == 1
         }.hookAfter { param ->
             runCatching {
-                val participants = XposedHelpers.getObjectField(param.thisObject, "mParticipants") as? Collection<*> ?: return@runCatching
+                val participants = Reflect.getObjectField(param.thisObject, "mParticipants") as? Collection<*> ?: return@runCatching
                 participants.forEach { wc ->
                     if (wc == null) return@forEach
-                    val task = runCatching { XposedHelpers.callMethod(wc, "asTask") }.getOrNull()
-                        ?: runCatching { XposedHelpers.callMethod(wc, "getTask") }.getOrNull()
+                    val task = runCatching { Reflect.callMethod(wc, "asTask") }.getOrNull()
+                        ?: runCatching { Reflect.callMethod(wc, "getTask") }.getOrNull()
                         ?: return@forEach
-                    val taskId = runCatching { XposedHelpers.getIntField(task, "mTaskId") }.getOrDefault(-1)
+                    val taskId = runCatching { Reflect.getIntField(task, "mTaskId") }.getOrDefault(-1)
                     if (taskId >= 0 &&
                         com.buildsession.betterYAMF.xposed.adapters.common.organizer.SmoothTaskOrganizer.isLeashManaged(taskId)
                     ) {
@@ -377,11 +380,11 @@ object FreeformBackend {
     private fun wcFromToken(token: Any?): Any? {
         if (token == null) return null
         return runCatching {
-            val binder = XposedHelpers.callMethod(token, "asBinder") as? android.os.IBinder
+            val binder = Reflect.callMethod(token, "asBinder") as? android.os.IBinder
                 ?: return null
             val cls = Instances.systemContext.classLoader
                 .loadClass("com.android.server.wm.WindowContainer")
-            XposedHelpers.callStaticMethod(cls, "fromBinder", binder)
+            Reflect.callStaticMethod(cls, "fromBinder", binder)
         }.getOrNull()
     }
 
@@ -406,8 +409,8 @@ object FreeformBackend {
      */
     private fun shouldForcePreventRelaunch(activityRecord: Any): Boolean {
         return runCatching {
-            val task = XposedHelpers.callMethod(activityRecord, "getTask") ?: return false
-            val taskId = XposedHelpers.getIntField(task, "mTaskId")
+            val task = Reflect.callMethod(activityRecord, "getTask") ?: return false
+            val taskId = Reflect.getIntField(task, "mTaskId")
 
             // 宿主小窗任务：一律放行系统标准重启语义（见上方铁律说明）。
             if (WindowSessions.hostedTasks.contains(taskId)) return false
@@ -417,7 +420,7 @@ object FreeformBackend {
 
             val isForcePrevent = runCatching { YAMFManager.config.forcePreventRelaunch }.getOrDefault(false)
             if (isForcePrevent) {
-                val windowingMode = XposedHelpers.callMethod(task, "getWindowingMode") as Int
+                val windowingMode = Reflect.callMethod(task, "getWindowingMode") as Int
 
                 if (windowingMode == WINDOWING_MODE_FREEFORM) {
                     return true
@@ -527,7 +530,7 @@ object FreeformBackend {
     }
 
     private fun applyTaskTransform(task: Any, clearCrop: Boolean) {
-        val taskId = runCatching { XposedHelpers.getIntField(task, "mTaskId") }.getOrDefault(-1)
+        val taskId = runCatching { Reflect.getIntField(task, "mTaskId") }.getOrDefault(-1)
         if (taskId >= 0 &&
             com.buildsession.betterYAMF.xposed.adapters.common.organizer.SmoothTaskOrganizer.isLeashManaged(taskId)
         ) {
@@ -540,7 +543,7 @@ object FreeformBackend {
             return
         }
         val transaction = runCatching {
-            XposedHelpers.callMethod(task, "getSyncTransaction") as SurfaceControl.Transaction
+            Reflect.callMethod(task, "getSyncTransaction") as SurfaceControl.Transaction
         }.getOrNull() ?: return
         applyTaskTransformOnTransaction(task, transaction, clearCrop)
     }
@@ -550,7 +553,7 @@ object FreeformBackend {
         transaction: SurfaceControl.Transaction,
         clearCrop: Boolean
     ) {
-        val taskId = runCatching { XposedHelpers.getIntField(task, "mTaskId") }.getOrDefault(-1)
+        val taskId = runCatching { Reflect.getIntField(task, "mTaskId") }.getOrDefault(-1)
         if (taskId >= 0) {
             taskRefs[taskId] = java.lang.ref.WeakReference(task)
         }
@@ -568,9 +571,9 @@ object FreeformBackend {
             return
         }
 
-        val config = XposedHelpers.callMethod(task, "getConfiguration") as Configuration
-        val windowConfig = XposedHelpers.getObjectField(config, "windowConfiguration")
-        val spoofedBounds = XposedHelpers.callMethod(windowConfig, "getBounds") as Rect
+        val config = Reflect.callMethod(task, "getConfiguration") as Configuration
+        val windowConfig = Reflect.getObjectField(config, "windowConfiguration")
+        val spoofedBounds = Reflect.callMethod(windowConfig, "getBounds") as Rect
 
         // 缩放把"应用实际布局尺寸（spoofed，可能被应用自身的 min 尺寸兼容放大）"
         // 映射回目标矩形（physical）：scale = physical/spoofed + 居中 + crop=spoofed。
@@ -588,7 +591,7 @@ object FreeformBackend {
             return
         }
 
-        val surfaceControl = XposedHelpers.getObjectField(task, "mSurfaceControl") as? SurfaceControl
+        val surfaceControl = Reflect.getObjectField(task, "mSurfaceControl") as? SurfaceControl
         if (surfaceControl == null) {
             logOnce(taskId) { "transform skip task=$taskId reason=no-surface" }
             return
@@ -596,18 +599,18 @@ object FreeformBackend {
 
         if (BuildConfig.DEBUG && Diagnostics.snapshotLogged.add(taskId)) {
             val requested = runCatching {
-                XposedHelpers.callMethod(task, "getRequestedOverrideBounds") as Rect
+                Reflect.callMethod(task, "getRequestedOverrideBounds") as Rect
             }.getOrNull()
             log(TAG) { "transform context task=$taskId configBounds=$spoofedBounds requested=$requested physical=$physicalBounds" }
         }
         logOnce(taskId) { "transform task=$taskId scale=(${transform.scaleX},${transform.scaleY}) spoofed=$spoofedBounds physical=$physicalBounds" }
 
-        XposedHelpers.callMethod(transaction, "setMatrix", surfaceControl, transform.scaleX, 0f, 0f, transform.scaleY)
-        XposedHelpers.callMethod(transaction, "setPosition", surfaceControl, transform.positionX, transform.positionY)
+        Reflect.callMethod(transaction, "setMatrix", surfaceControl, transform.scaleX, 0f, 0f, transform.scaleY)
+        Reflect.callMethod(transaction, "setPosition", surfaceControl, transform.positionX, transform.positionY)
 
         if (clearCrop) {
             runCatching {
-                XposedHelpers.callMethod(
+                Reflect.callMethodTyped(
                     transaction,
                     "setWindowCrop",
                     arrayOf<Class<*>>(SurfaceControl::class.java, Rect::class.java),
@@ -625,25 +628,27 @@ object FreeformBackend {
         val inputMonitorClass = classLoader.loadClass("com.android.server.wm.InputMonitor")
         
         // populateInputWindowHandle(InputWindowHandleWrapper inputWindowHandle, WindowState w)
-        NativeHooks.findAndHookMethod(inputMonitorClass, "populateInputWindowHandle",
-            "com.android.server.wm.InputWindowHandleWrapper",
-            "com.android.server.wm.WindowState",
-            object : NativeHooks.Callback() {
+        val populate = inputMonitorClass.getDeclaredMethod(
+            "populateInputWindowHandle",
+            classLoader.loadClass("com.android.server.wm.InputWindowHandleWrapper"),
+            classLoader.loadClass("com.android.server.wm.WindowState"),
+        ).apply { isAccessible = true }
+        NativeHooks.hookMethod(populate, object : NativeHooks.Callback() {
                 override fun afterHookedMethod(param: NativeHooks.Call) {
                     val windowState = param.args[1]
                     applyChromeTouchRegion(param.args[0], windowState)
                     if (defangSmoothInputSink(param.args[0], windowState)) return
 
-                    val task = XposedHelpers.callMethod(windowState, "getTask") ?: return
-                    val taskId = XposedHelpers.getIntField(task, "mTaskId")
+                    val task = Reflect.callMethod(windowState, "getTask") ?: return
+                    val taskId = Reflect.getIntField(task, "mTaskId")
                     
                     if (WindowSessions.hostedTasks.contains(taskId) &&
                         !com.buildsession.betterYAMF.xposed.adapters.common.organizer.SmoothTaskOrganizer.isLeashManaged(taskId)
                     ) {
                         val physicalBounds = SmoothWindowBackend.geometryOf(taskId) ?: return
-                        val config = XposedHelpers.callMethod(task, "getConfiguration") as Configuration
-                        val windowConfig = XposedHelpers.getObjectField(config, "windowConfiguration")
-                        val spoofedBounds = XposedHelpers.callMethod(windowConfig, "getBounds") as Rect
+                        val config = Reflect.callMethod(task, "getConfiguration") as Configuration
+                        val windowConfig = Reflect.getObjectField(config, "windowConfiguration")
+                        val spoofedBounds = Reflect.callMethod(windowConfig, "getBounds") as Rect
                         
                         val transform = FreeformSurfaceMath.compute(
                             physicalLeft = physicalBounds.left,
@@ -656,12 +661,12 @@ object FreeformBackend {
                         
                         val inputWindowHandleWrapper = param.args[0]
                         runCatching {
-                            XposedHelpers.callMethod(
+                            Reflect.callMethod(
                                 inputWindowHandleWrapper,
                                 "setReplaceTouchableRegionWithCrop",
                                 false
                             )
-                            XposedHelpers.callMethod(
+                            Reflect.callMethodTyped(
                                 inputWindowHandleWrapper,
                                 "setTouchableRegionCrop",
                                 arrayOf<Class<*>>(SurfaceControl::class.java),
@@ -675,13 +680,13 @@ object FreeformBackend {
                             // 区域是"表面（逻辑尺寸）坐标"，按逻辑尺寸裁剪（不是屏幕坐标的 frame）
                             region.op(0, 0, spoofedBounds.width(), spoofedBounds.height(), Region.Op.INTERSECT)
                         }
-                        XposedHelpers.callMethod(
+                        Reflect.callMethod(
                             inputWindowHandleWrapper,
                             "setTouchableRegion",
                             region
                         )
                         // 输入坐标系跟随表面缩放（应用按 spoofed 布局，触摸需按 1/scale 映射回去）
-                        XposedHelpers.callMethod(
+                        Reflect.callMethod(
                             inputWindowHandleWrapper,
                             "setScaleFactor",
                             FreeformSurfaceMath.inputScale(transform.scaleX)
@@ -690,9 +695,9 @@ object FreeformBackend {
                         // 导致卡片外（其他应用上）的滑动被命中到本应用。把 frame 覆写为
                         // “卡片原点 + 本窗口逻辑矩形×scale”，命中区与坐标映射即精确对齐可见区域。
                         runCatching {
-                            val handle = XposedHelpers.getObjectField(inputWindowHandleWrapper, "mHandle")
-                            val frameRect = XposedHelpers.getObjectField(handle, "frame") as Rect
-                            val wmFrame = XposedHelpers.callMethod(windowState, "getFrame") as Rect
+                            val handle = Reflect.getObjectField(inputWindowHandleWrapper, "mHandle")
+                            val frameRect = Reflect.getObjectField(handle, "frame") as Rect
+                            val wmFrame = Reflect.callMethod(windowState, "getFrame") as Rect
                             val scale = transform.scaleX
                             val newLeft = physicalBounds.left + (wmFrame.left * scale).toInt()
                             val newTop = physicalBounds.top + (wmFrame.top * scale).toInt()
@@ -702,7 +707,7 @@ object FreeformBackend {
                                 frameRect.right != newRight || frameRect.bottom != newBottom
                             ) {
                                 frameRect.set(newLeft, newTop, newRight, newBottom)
-                                XposedHelpers.callMethod(inputWindowHandleWrapper, "forceChange")
+                                Reflect.callMethod(inputWindowHandleWrapper, "forceChange")
                             }
                         }
                     }
@@ -713,8 +718,8 @@ object FreeformBackend {
 
     private fun defangSmoothInputSink(inputWindowHandleWrapper: Any, windowState: Any): Boolean {
         val title = runCatching {
-            val attrs = XposedHelpers.getObjectField(windowState, "mAttrs")
-            XposedHelpers.callMethod(attrs, "getTitle") as? CharSequence
+            val attrs = Reflect.getObjectField(windowState, "mAttrs")
+            Reflect.callMethod(attrs, "getTitle") as? CharSequence
         }.getOrNull()?.toString() ?: return false
         if (!title.startsWith("ActivityRecordInputSink")) return false
         val component = title.substringAfter(' ', "").trim()
@@ -724,14 +729,14 @@ object FreeformBackend {
         }
         if (!isSmooth) return false
         runCatching {
-            XposedHelpers.callMethod(inputWindowHandleWrapper, "setReplaceTouchableRegionWithCrop", false)
-            XposedHelpers.callMethod(
+            Reflect.callMethod(inputWindowHandleWrapper, "setReplaceTouchableRegionWithCrop", false)
+            Reflect.callMethodTyped(
                 inputWindowHandleWrapper,
                 "setTouchableRegionCrop",
                 arrayOf<Class<*>>(SurfaceControl::class.java),
                 null
             )
-            XposedHelpers.callMethod(inputWindowHandleWrapper, "setTouchableRegion", Region())
+            Reflect.callMethod(inputWindowHandleWrapper, "setTouchableRegion", Region())
         }.onFailure {
             log(TAG, "defang input sink failed for $component", it)
         }
@@ -744,13 +749,13 @@ object FreeformBackend {
     private fun applyChromeTouchRegion(inputWindowHandleWrapper: Any, windowState: Any) {
         if (WindowSessions.chromeTouchHoles.isEmpty()) return
         val title = runCatching {
-            val attrs = XposedHelpers.getObjectField(windowState, "mAttrs")
-            XposedHelpers.callMethod(attrs, "getTitle") as? CharSequence
+            val attrs = Reflect.getObjectField(windowState, "mAttrs")
+            Reflect.callMethod(attrs, "getTitle") as? CharSequence
         }.getOrNull()?.toString() ?: return
         if (title != Protocol.CHROME_WINDOW_TITLE) return
         
         val frame = runCatching {
-            XposedHelpers.callMethod(windowState, "getFrame") as Rect
+            Reflect.callMethod(windowState, "getFrame") as Rect
         }.getOrNull() ?: return
         
         val region = surfaceTouchableRegion(windowState)
@@ -771,19 +776,19 @@ object FreeformBackend {
         }
         if (!changed) return
         runCatching {
-            XposedHelpers.callMethod(inputWindowHandleWrapper, "setTouchableRegion", region)
+            Reflect.callMethod(inputWindowHandleWrapper, "setTouchableRegion", region)
         }
     }
 
     private fun surfaceTouchableRegion(windowState: Any): Region? = runCatching {
         val region = Region()
-        val attrs = XposedHelpers.getObjectField(windowState, "mAttrs")
-        XposedHelpers.callMethod(windowState, "getSurfaceTouchableRegion", region, attrs)
+        val attrs = Reflect.getObjectField(windowState, "mAttrs")
+        Reflect.callMethod(windowState, "getSurfaceTouchableRegion", region, attrs)
         region.takeIf { !it.isEmpty }
     }.getOrNull()
 
     private fun frameBasedSurfaceRegion(windowState: Any): Region? = runCatching {
-        val frame = XposedHelpers.callMethod(windowState, "getFrame") as Rect
+        val frame = Reflect.callMethod(windowState, "getFrame") as Rect
         Region(frame).also { it.translate(-frame.left, -frame.top) }
     }.getOrNull()
 }

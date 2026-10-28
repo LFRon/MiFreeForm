@@ -47,7 +47,7 @@
                         android:layout_height="wrap_content"
                         android:textSize="14sp"
                         android:textColor="?android:textColor"
-                        android:text="@string/module_detection_unsupported"
+                        android:text="@string/module_detection_connecting"
                         android:gravity="start"/>
                 </LinearLayout>
             </com.google.android.material.appbar.MaterialToolbar>
@@ -99,7 +99,7 @@
                         android:textAppearance="?textAppearanceTitleMedium"
                         android:textColor="?colorOnPrimary"
                         android:textSize="16sp"
-                        tools:text="@string/module_detection_unsupported" />
+                        tools:text="@string/not_activated" />
 
                     <com.google.android.material.textview.MaterialTextView
                         android:id="@+id/tvVersion"

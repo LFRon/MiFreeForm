@@ -10,7 +10,7 @@ import android.view.WindowManager
 import com.buildsession.betterYAMF.window.api.CommandStatus
 import com.buildsession.betterYAMF.xposed.utils.log
 import com.buildsession.betterYAMF.xposed.utils.logError
-import de.robv.android.xposed.XposedHelpers
+import com.buildsession.betterYAMF.xposed.utils.Reflect
 import java.lang.reflect.Proxy
 import java.util.concurrent.Executor
 
@@ -46,21 +46,21 @@ internal class SurfaceFrameSynchronizer(private val view: View, private val touc
     }
 
     private fun hardwareReady(): Boolean = view.isHardwareAccelerated && runCatching {
-        val root = XposedHelpers.callMethod(view, "getViewRootImpl") ?: return@runCatching false
-        XposedHelpers.callMethod(root, "isHardwareEnabled") == true
+        val root = Reflect.callMethod(view, "getViewRootImpl") ?: return@runCatching false
+        Reflect.callMethod(root, "isHardwareEnabled") == true
     }.getOrDefault(false)
 
     fun attach(): Boolean = runCatching {
         drawApi // Select the HWUI completion interface once, before accepting scene submissions.
         val listenerClass = Class.forName("android.view.ViewTreeObserver\$OnComputeInternalInsetsListener")
         val infoClass = Class.forName("android.view.ViewTreeObserver\$InternalInsetsInfo")
-        val regionMode = XposedHelpers.getStaticIntField(infoClass, "TOUCHABLE_INSETS_REGION")
+        val regionMode = Reflect.getStaticIntField(infoClass, "TOUCHABLE_INSETS_REGION")
         val listener = Proxy.newProxyInstance(listenerClass.classLoader, arrayOf(listenerClass)) { proxy, method, args ->
             when (method.name) {
                 "onComputeInternalInsets" -> {
                     val info = args!![0]
-                    XposedHelpers.callMethod(info, "setTouchableInsets", regionMode)
-                    (XposedHelpers.getObjectField(info, "touchableRegion") as Region).set(touchRegion())
+                    Reflect.callMethod(info, "setTouchableInsets", regionMode)
+                    (Reflect.getObjectField(info, "touchableRegion") as Region).set(touchRegion())
                     null
                 }
                 "hashCode" -> System.identityHashCode(proxy)
@@ -69,7 +69,7 @@ internal class SurfaceFrameSynchronizer(private val view: View, private val touc
                 else -> null
             }
         }
-        XposedHelpers.callMethod(view.viewTreeObserver, "addOnComputeInternalInsetsListener", listener)
+        Reflect.callMethod(view.viewTreeObserver, "addOnComputeInternalInsetsListener", listener)
         insetsListener = listener
         view.viewTreeObserver.addOnPreDrawListener(preDraw)
         true
@@ -101,15 +101,15 @@ internal class SurfaceFrameSynchronizer(private val view: View, private val touc
         submitted[submission.id] = submission
         runCatching {
             check(submission.write(tx)) { "Task viewport is unavailable" }
-            val root = XposedHelpers.callMethod(view, "getViewRootImpl") ?: error("ViewRoot is unavailable")
-            check(XposedHelpers.callMethod(root, "isHardwareEnabled") == true) { "HWUI frame is unavailable" }
+            val root = Reflect.callMethod(view, "getViewRootImpl") ?: error("ViewRoot is unavailable")
+            check(Reflect.callMethod(root, "isHardwareEnabled") == true) { "HWUI frame is unavailable" }
             drawApi.observe(view) { produced -> handler.post {
                 submission.draw.drawn(produced)?.let { complete(submission, it) }
             } }
             tx.addTransactionCommittedListener(executor) {
                 submission.draw.committed()?.let { complete(submission, it) }
             }
-            val accepted = XposedHelpers.callMethod(root, "applyTransactionOnDraw",
+            val accepted = Reflect.callMethodTyped(root, "applyTransactionOnDraw",
                 arrayOf(SurfaceControl.Transaction::class.java), tx)
             check(accepted != false) { "ViewRoot rejected the frame transaction" }
         }.onFailure {
@@ -127,7 +127,7 @@ internal class SurfaceFrameSynchronizer(private val view: View, private val touc
         if (view.viewTreeObserver.isAlive) {
             view.viewTreeObserver.removeOnPreDrawListener(preDraw)
             insetsListener?.let {
-                runCatching { XposedHelpers.callMethod(view.viewTreeObserver, "removeOnComputeInternalInsetsListener", it) }
+                runCatching { Reflect.callMethod(view.viewTreeObserver, "removeOnComputeInternalInsetsListener", it) }
             }
         }
         insetsListener = null
@@ -139,17 +139,17 @@ internal class SurfaceFrameSynchronizer(private val view: View, private val touc
         /** LoS ViewRootImpl:2183 requires an explicit per-window hint in system_server. */
         fun configureOverlay(params: WindowManager.LayoutParams): Boolean = runCatching {
             val cls = WindowManager.LayoutParams::class.java
-            val trusted = XposedHelpers.getStaticIntField(cls, "PRIVATE_FLAG_TRUSTED_OVERLAY")
-            var privateFlags = XposedHelpers.getIntField(params, "privateFlags") or trusted
-            val force = XposedHelpers.findFieldIfExists(cls, "RENDERING_HINT_FORCE_HARDWARE_ACCELERATED")
+            val trusted = Reflect.getStaticIntField(cls, "PRIVATE_FLAG_TRUSTED_OVERLAY")
+            var privateFlags = Reflect.getIntField(params, "privateFlags") or trusted
+            val force = Reflect.findFieldIfExists(cls, "RENDERING_HINT_FORCE_HARDWARE_ACCELERATED")
             if (force != null) {
-                val hints = XposedHelpers.getIntField(params, "renderingHints")
-                XposedHelpers.setIntField(params, "renderingHints", hints or force.getInt(null))
+                val hints = Reflect.getIntField(params, "renderingHints")
+                Reflect.setIntField(params, "renderingHints", hints or force.getInt(null))
             } else {
-                privateFlags = privateFlags or XposedHelpers.getStaticIntField(cls, "PRIVATE_FLAG_FORCE_HARDWARE_ACCELERATED")
+                privateFlags = privateFlags or Reflect.getStaticIntField(cls, "PRIVATE_FLAG_FORCE_HARDWARE_ACCELERATED")
             }
-            XposedHelpers.setIntField(params, "privateFlags", privateFlags)
-            XposedHelpers.callMethod(params, "setFitInsetsTypes", 0)
+            Reflect.setIntField(params, "privateFlags", privateFlags)
+            Reflect.callMethod(params, "setFitInsetsTypes", 0)
             true
         }.onFailure { log(TAG, "trusted hardware overlay capability unavailable", it) }.getOrDefault(false)
     }

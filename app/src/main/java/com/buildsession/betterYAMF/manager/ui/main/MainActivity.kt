@@ -24,8 +24,9 @@ import com.buildsession.betterYAMF.BuildConfig
 import com.buildsession.betterYAMF.R
 import com.buildsession.betterYAMF.common.model.Config
 import com.buildsession.betterYAMF.databinding.ActivityMainBinding
-import com.buildsession.betterYAMF.manager.core.gateway.ModuleInfoGateway
 import com.buildsession.betterYAMF.manager.core.gateway.ActivationDetectionSupport
+import com.buildsession.betterYAMF.manager.core.gateway.ModuleActivation
+import com.buildsession.betterYAMF.manager.core.gateway.ModuleInfoGateway
 import com.buildsession.betterYAMF.manager.core.gateway.WindowGateway
 import com.buildsession.betterYAMF.manager.core.settings.SettingsRepository
 import com.buildsession.betterYAMF.manager.sidebar.SidebarLauncher
@@ -72,7 +73,8 @@ class MainActivity : AppCompatActivity() {
         initUi()
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
-                ModuleInfoGateway.serviceConnected.collect { onServiceConnectionChanged(it) }
+                launch { ModuleInfoGateway.serviceConnected.collect { onServiceConnectionChanged(it) } }
+                launch { ModuleInfoGateway.activation.collect { onActivationChanged(it) } }
             }
         }
 
@@ -81,10 +83,10 @@ class MainActivity : AppCompatActivity() {
     private fun initUi() {
         config = SettingsRepository.load()
         when (ModuleInfoGateway.activationDetection) {
-            ActivationDetectionSupport.UNSUPPORTED -> binding?.apply {
-                tvHookSummary.setText(R.string.module_detection_unsupported)
-                tvActive.setText(R.string.module_detection_unsupported)
-                tvVersion.setText(R.string.module_detection_deferred_message)
+            ActivationDetectionSupport.SUPPORTED -> binding?.apply {
+                tvHookSummary.setText(R.string.module_detection_connecting)
+                tvActive.setText(R.string.not_activated)
+                tvVersion.setText(R.string.module_detection_connecting_hint)
                 ivIcon.setImageResource(R.drawable.ic_warning_amber_24)
             }
         }
@@ -158,6 +160,44 @@ class MainActivity : AppCompatActivity() {
     override fun onStart() {
         super.onStart()
         ModuleInfoGateway.requestServiceConnection()
+    }
+
+    private fun onActivationChanged(status: ModuleActivation?) {
+        val view = binding ?: return
+        if (status == null) {
+            view.tvHookSummary.setText(R.string.module_detection_framework_absent)
+            view.tvActive.setText(R.string.not_activated)
+            view.tvVersion.setText(R.string.module_detection_framework_absent_hint)
+            view.ivIcon.setImageResource(R.drawable.ic_warning_amber_24)
+            return
+        }
+        view.tvHookSummary.text = getString(
+            R.string.module_detection_framework,
+            status.frameworkName, status.frameworkVersion, status.apiVersion,
+        )
+        view.tvActive.setText(if (status.injected) R.string.activated else R.string.not_activated)
+        view.tvVersion.text = buildScopeText(status)
+        view.ivIcon.setImageResource(
+            if (status.injected && status.scopeComplete) R.drawable.ic_round_check_circle_24
+            else R.drawable.ic_warning_amber_24
+        )
+    }
+
+    /** Shows every required scope with its state, so the manager can be fixed without guessing. */
+    private fun buildScopeText(status: ModuleActivation): CharSequence = buildString {
+        append(getString(R.string.module_detection_scope_heading))
+        status.requirements.forEach { requirement ->
+            append('\n')
+            append(if (requirement.satisfied) "✓ " else "✗ ")
+            append(requirement.label)
+        }
+        append('\n')
+        append(
+            getString(
+                R.string.module_detection_running_targets,
+                if (status.runningTargets.isEmpty()) "—" else status.runningTargets.joinToString(", "),
+            )
+        )
     }
 
     private fun onServiceConnectionChanged(connected: Boolean) {

@@ -19,8 +19,9 @@ dependencyResolutionManagement {
         google()
         mavenCentral()
         maven("https://jitpack.io")
-        maven("https://api.xposed.info")
         maven("https://mvnrepository.com/artifact")
+        // Vendored libxposed artifacts; see app/build.gradle.kts for why they are local.
+        flatDir { dirs("app/libs") }
     }
 }
 
