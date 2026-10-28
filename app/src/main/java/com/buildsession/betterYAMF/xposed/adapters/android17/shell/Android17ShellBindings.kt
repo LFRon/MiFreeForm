@@ -4,6 +4,7 @@ import android.app.ActivityManager.RunningTaskInfo
 import android.app.TaskInfo
 import android.os.IBinder
 import android.view.SurfaceControl
+import com.buildsession.betterYAMF.xposed.utils.logWarning
 import java.lang.reflect.Method
 
 /** PixelOS seventeen ebc25c0cf9c8. Resolve once before installing any Shell hooks. Public lifecycle
@@ -26,7 +27,12 @@ internal class Android17ShellBindings(private val loader: ClassLoader) {
         // Freeform passes this same projected info into DesktopInOrder and Fallback. Neither
         // helper needs a separate hook/signature: R8 is free to inline those single-call methods.
         optional("com.android.wm.shell.desktopmode.DesktopTasksTransitionObserver")?.let {
-            add(it.method("onTransitionReady", *readyArgs))
+            runCatching { it.method("onTransitionReady", *readyArgs) }
+                .onSuccess { method -> add(method) }
+                .onFailure { error ->
+                    logWarning(TAG,
+                        "Desktop transition observer signature unavailable; keep freeform observer only", error)
+                }
         }
     }
     val animations: List<Method> = buildList {
@@ -110,4 +116,6 @@ internal class Android17ShellBindings(private val loader: ClassLoader) {
     fun cleanup(observer: Any, task: RunningTaskInfo) {
         if (freeform.isInstance(observer)) destroyDecor.invoke(freeformDecor.get(observer), task)
     }
+
+    private companion object { const val TAG = "reYAMF_Shell" }
 }
