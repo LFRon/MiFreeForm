@@ -201,7 +201,7 @@ internal class LauncherGestureAdapter(private val native: QuickstepNativeAccess,
     }
 
     fun inputFinished(prepared: PreparedInput, handoff: RecentsDropHandoff.Handoff?, error: Throwable?) {
-        handoff?.inputFinished(error)
+        handoff?.inputFinished(error, allowLegacy = error == null && prepared.value.phase == PointerPhase.UP)
         if (prepared.gestureEpoch != epoch || prepared.lifecycle != lifecycleEpoch) return
         if (error != null || prepared.event.actionMasked == MotionEvent.ACTION_CANCEL) cancel()
         else if (prepared.value.phase == PointerPhase.DOWN && nativeDownAdmission) {

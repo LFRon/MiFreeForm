@@ -42,6 +42,7 @@ internal object RecentsDropHandoff {
     private var application: Context? = null
     private val owners = HandoffOwners<Pending>()
     private val hookedEnds = mutableSetOf<Method>()
+    private val hookedNormalEnds = mutableSetOf<Method>()
 
     private class Pending(val handoff: Handoff, val context: Context, val intent: Intent) {
         val gestureEnd = DeferredGestureEnd()
@@ -62,6 +63,15 @@ internal object RecentsDropHandoff {
         // it must not be the first occasion on which the transform methods are hooked.
         sourceSyncReady = runCatching { RecentsSourceFrame.install(native.sources.producer); true }
             .onFailure { logWarning(TAG, "native source synchronization capability unavailable", it) }.getOrDefault(false)
+        // Install the captured end hook before the first gesture. Resolving it lazily from an
+        // input callback is too late for Launcher builds whose handler is already compiled.
+        native.gestureEnds.forEach(::installEndGate)
+        log(TAG) { "end gates installed=${native.gestureEnds.size} normal=${native.normalGestureEnds.size}" }
+        if (native.normalGestureEnds.isEmpty()) {
+            logWarning(TAG, "normal gesture end capability unavailable")
+        } else {
+            native.normalGestureEnds.forEach(::installNormalGate)
+        }
         context.applicationContext.registerReceiver(object : BroadcastReceiver() {
             override fun onReceive(context: Context, intent: Intent) {
                 val sourceEpoch = intent.getLongExtra(Protocol.EXTRA_SOURCE_EPOCH, 0L)
@@ -174,11 +184,37 @@ internal object RecentsDropHandoff {
         }
 
         /** Called after original input dispatch, even when native UP takes a cancellation path. */
-        fun inputFinished(error: Throwable?) {
+        fun inputFinished(error: Throwable?, allowLegacy: Boolean = false) {
             val owner = owners.all().firstOrNull { it.value.handoff === this } ?: return
             if (error != null || !owner.value.endReceived) {
+                if (allowLegacy && error == null && !owner.value.nativeFinishRequested) {
+                    // The captured end callback can be compiled into the caller on some Launcher
+                    // builds. The declared legacyAfterNative capability still opens the exact
+                    // task after native UP; no retained source is claimed in this path.
+                    val pending = owners.take(owner) ?: return
+                    pending.timeout?.let(handler::removeCallbacks)
+                    pending.pixels?.close()
+                    pending.pixels = null
+                    pending.handoff.source.close()
+                    pending.gestureEnd.finish(resume = false)
+                    runCatching { pending.context.sendBroadcast(legacyIntent(pending)) }
+                        .onFailure { logWarning(TAG, "legacy entry dispatch failed task=$taskId", it) }
+                    logWarning(TAG, "native end callback unavailable; legacy entry queued task=$taskId")
+                    return
+                }
                 abortBeforeFinish(owner, if (error != null) "native input failed" else "native UP did not reach end")
             }
+        }
+
+        private fun legacyIntent(pending: Pending): Intent = Intent(pending.intent).apply {
+            removeExtra(Protocol.EXTRA_ENTRY_PROTOCOL)
+            removeExtra(Protocol.EXTRA_ASYNC_SNAPSHOT)
+            removeExtra(Protocol.EXTRA_LEGACY_ENTRY)
+            removeExtra(Protocol.EXTRA_SOURCE_EPOCH)
+            removeExtra(Protocol.EXTRA_DESTINATION_EPOCH)
+            removeExtra(Protocol.EXTRA_HANDOFF_ID)
+            removeExtra(Protocol.EXTRA_ENTRY_SNAPSHOT_TOKEN)
+            removeExtra(Protocol.EXTRA_RECENTS_HANDOFF_COMPLETE)
         }
 
         internal fun cleanupConsumer() {
@@ -324,51 +360,102 @@ internal object RecentsDropHandoff {
      * acknowledge input, clear velocity tracking and gestureStartNavMode (LoS TIS:476-720 /
      * OtherActivityInputConsumer:476-546). Never skip the native input event entry point.
      */
-    private fun installEndGate(swipeHandler: Any, method: Method): Boolean = runCatching {
-        check(method.declaringClass.isInstance(swipeHandler))
+    private fun installEndGate(method: Method): Boolean = runCatching {
         if (method !in hookedEnds) {
             NativeHooks.hookMethod(method, object : NativeHooks.Callback() {
                 override fun beforeHookedMethod(param: NativeHooks.Call) {
                     val owner = owners.all().firstOrNull { it.value.handoff.swipeHandler === param.thisObject } ?: return
                     val pending = owner.value
+                    log(TAG) { "end gate hit task=${pending.handoff.taskId} handoff=${pending.handoff.id} end=${pending.endReceived} nativeFinish=${pending.nativeFinishRequested} params=${param.args.size}" }
+                    if (pending.endReceived || pending.nativeFinishRequested) return
                     val originalMethod = param.method
                     val receiver = param.thisObject
                     val arguments = param.args.clone()
                     val velocity = PointF(param.args[1] as PointF)
                     arguments[1] = PointF(velocity)
-                    if (pending.nativeFinishRequested || pending.gestureEnd.defer { NativeHooks.invokeOriginalMethod(originalMethod, receiver, arguments) }) {
-                        log(TAG) { "native UP deferred task=${pending.handoff.taskId} handoff=${pending.handoff.id}" }
-                        param.result = null
-                        if (pending.endReceived) return
-                        pending.endReceived = true
-                        // LoS OtherActivityInputConsumer:497 has updated the final UP displacement.
-                        // Its px/ms velocity is copied before cleanupAfterGesture recycles the tracker.
-                        runCatching {
-                            check(pending.handoff.ownsCurrentController())
-                            pending.handoff.source.freeze { frame ->
-                                if (!owners.owns(owner)) return@freeze
-                                if (!pending.handoff.ownsCurrentController()) {
-                                    abortBeforeFinish(owner, "source controller replaced")
-                                    return@freeze
-                                }
-                                val vx = (velocity.x * 1000f).takeIf { it.isFinite() } ?: 0f
-                                val vy = (velocity.y * 1000f).takeIf { it.isFinite() } ?: 0f
-                                val snapshot = RecentsEntryCapture.capture(frame, pending.handoff.taskId, vx, vy)
-                                if (snapshot == null) abortBeforeFinish(owner, "source capture failed")
-                                else dispatchBridge(owner, snapshot)
-                            }
-                            log(TAG) { "source pose frozen task=${pending.handoff.taskId} handoff=${pending.handoff.id}; wait native transform commit" }
-                        }.onFailure {
-                            logWarning(TAG, "final source synchronization failed task=${pending.handoff.taskId}", it)
-                            abortBeforeFinish(owner, "source synchronization failed")
-                        }
-                    }
+                    if (!armCapture(pending) {
+                            NativeHooks.invokeOriginalMethod(originalMethod, receiver, arguments)
+                        }) return
+                    // Stop only this native decision until the bridge owns the destination. UP
+                    // displacement/velocity were already applied by OtherActivityInputConsumer.
+                    param.result = null
+                    log(TAG) { "native UP deferred task=${pending.handoff.taskId} handoff=${pending.handoff.id}" }
+                    freezeSource(owner, pending, velocity)
                 }
             })
             hookedEnds.add(method)
         }
         true
     }.onFailure { logWarning(TAG, "native UP capability unavailable", it) }.getOrDefault(false)
+
+    /**
+     * Pixel Launcher 907 can inline the public onGestureEnded into OtherActivityInputConsumer.
+     * Its large private decision method is still a concrete call, and is invoked after the final
+     * UP displacement. Hooking it preserves the same source handoff without depending on method
+     * entry at the inlined public method.
+     */
+    private fun installNormalGate(method: Method): Boolean = runCatching {
+        if (method !in hookedNormalEnds) {
+            NativeHooks.hookMethod(method, object : NativeHooks.Callback() {
+                override fun beforeHookedMethod(param: NativeHooks.Call) {
+                    // onGestureCancelled reaches the same private method with isCancel=true.
+                    if (param.args.size !in 5..6 || param.args[3] == true) return
+                    val owner = owners.all().firstOrNull { it.value.handoff.swipeHandler === param.thisObject } ?: return
+                    val pending = owner.value
+                    log(TAG) { "normal end gate hit task=${pending.handoff.taskId} handoff=${pending.handoff.id} end=${pending.endReceived} nativeFinish=${pending.nativeFinishRequested} params=${param.args.size}" }
+                    if (pending.endReceived || pending.nativeFinishRequested) return
+                    val originalMethod = param.method
+                    val receiver = param.thisObject
+                    val arguments = param.args.clone()
+                    val velocity = PointF(param.args[2] as PointF)
+                    arguments[2] = PointF(velocity)
+                    if (!armCapture(pending) {
+                            NativeHooks.invokeOriginalMethod(originalMethod, receiver, arguments)
+                        }) return
+                    param.result = null
+                    log(TAG) { "native normal end deferred task=${pending.handoff.taskId} handoff=${pending.handoff.id}" }
+                    freezeSource(owner, pending, velocity)
+                }
+            })
+            hookedNormalEnds.add(method)
+        }
+        true
+    }.onFailure { logWarning(TAG, "native normal end capability unavailable", it) }.getOrDefault(false)
+
+    private fun armCapture(pending: Pending, nativeDecision: () -> Unit): Boolean {
+        if (pending.endReceived || pending.nativeFinishRequested) return false
+        if (!pending.gestureEnd.defer(nativeDecision)) return false
+        pending.endReceived = true
+        return true
+    }
+
+    private fun freezeSource(
+        owner: HandoffOwners.Owner<Pending>,
+        pending: Pending,
+        velocity: PointF
+    ) {
+        // LoS OtherActivityInputConsumer:497 / Pixel 907 finishTouchTracking has updated the final
+        // UP displacement. The px/ms velocity is copied before cleanupAfterGesture recycles it.
+        runCatching {
+            check(pending.handoff.ownsCurrentController())
+            pending.handoff.source.freeze { frame ->
+                if (!owners.owns(owner)) return@freeze
+                if (!pending.handoff.ownsCurrentController()) {
+                    abortBeforeFinish(owner, "source controller replaced")
+                    return@freeze
+                }
+                val vx = (velocity.x * 1000f).takeIf { it.isFinite() } ?: 0f
+                val vy = (velocity.y * 1000f).takeIf { it.isFinite() } ?: 0f
+                val snapshot = RecentsEntryCapture.capture(frame, pending.handoff.taskId, vx, vy)
+                if (snapshot == null) abortBeforeFinish(owner, "source capture failed")
+                else dispatchBridge(owner, snapshot)
+            }
+            log(TAG) { "source pose frozen task=${pending.handoff.taskId} handoff=${pending.handoff.id}; wait native transform commit" }
+        }.onFailure {
+            logWarning(TAG, "final source synchronization failed task=${pending.handoff.taskId}", it)
+            abortBeforeFinish(owner, "source synchronization failed")
+        }
+    }
 
     fun prepare(native: QuickstepNativeAccess, owner: Any, event: MotionEvent, taskId: Int): Handoff? = runCatching {
         if (!bridgeAvailable()) return null
@@ -382,7 +469,7 @@ internal object RecentsDropHandoff {
         val controller = native.animationControllerOf(owner, displayId) ?: native.controllerOf(recentsView)
         val animation = native.captureController(controller) ?: return null
         val launcherRotation = native.homeRotation(recentsView)
-        if (!installEndGate(swipe, native.gestureEnd)) return null
+        if (!native.gestureEnds.all(::installEndGate)) return null
         val source = native.sources.source(swipe, taskId) ?: return null
         Handoff(taskId, displayId, animation, retirement, swipe, { native.cleanupConsumer(active) }, {
             native.animationControllerOf(owner, displayId) ?: native.controllerOf(recentsView)

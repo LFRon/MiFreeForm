@@ -57,14 +57,43 @@ internal class QuickstepNativeAccess(private val loader: ClassLoader, signature:
     // Pixel 907 and LoS 24.0: onGestureStarted sets this after native slop/pilfer. This does
     // not assert onRecentsAnimationStart or pixel readiness, which have separate barriers.
     private val gestureStarted = swipeHandler.getDeclaredField("mGestureStarted").accessible()
-    val gestureEnd: Method = swipeHandler
-        .getDeclaredMethod("onGestureEnded", Float::class.javaPrimitiveType,
-            PointF::class.java, Boolean::class.javaPrimitiveType).accessible()
+    /**
+     * A17 builds disagree on the public UP overload. Google's system image calls
+     * onGestureEnded(float, PointF, boolean, PointF); the reviewed PixelOS/LoS builds call
+     * onGestureEnded(float, PointF, boolean). Hook every reviewed overload: the three-argument
+     * method delegates to the four-argument one on Google's build, so a single overload is not
+     * enough.
+     */
+    val gestureEnds: List<Method> = swipeHandler.declaredMethods.filter { method ->
+        method.name == "onGestureEnded" && method.returnType == Void.TYPE &&
+            method.parameterTypes.size in 3..4 &&
+            method.parameterTypes[0] == Float::class.javaPrimitiveType &&
+            method.parameterTypes[1] == PointF::class.java &&
+            method.parameterTypes[2] == Boolean::class.javaPrimitiveType &&
+            (method.parameterTypes.size == 3 || method.parameterTypes[3] == PointF::class.java)
+    }.map { it.accessible() }
+    /**
+     * The private decision method is retained as a fallback for builds that inline the public
+     * onGestureEnded entry. Google's system image adds a final float to this method; LoS 24 does
+     * not. Source velocity is always the PointF at index 2.
+     */
+    val normalGestureEnds: List<Method> = swipeHandler.declaredMethods.filter { method ->
+        method.name == "handleNormalGestureEnd" && method.returnType == Void.TYPE &&
+            method.parameterTypes.size in 5..6 &&
+            method.parameterTypes[0] == Float::class.javaPrimitiveType &&
+            method.parameterTypes[1] == Boolean::class.javaPrimitiveType &&
+            method.parameterTypes[2] == PointF::class.java &&
+            method.parameterTypes[3] == Boolean::class.javaPrimitiveType &&
+            method.parameterTypes[4] == Boolean::class.javaPrimitiveType &&
+            (method.parameterTypes.size == 5 ||
+                method.parameterTypes[5] == Float::class.javaPrimitiveType)
+    }.map { it.accessible() }
     val sources = QuickstepSourceAccess(loader)
     val taskFilter = QuickstepTaskFilterAccess(loader)
 
     init {
-        check(onInput.returnType == Void.TYPE && gestureEnd.returnType == Void.TYPE)
+        check(onInput.returnType == Void.TYPE && gestureEnds.isNotEmpty())
+        check(normalGestureEnds.all { it.returnType == Void.TYPE })
         check(topTask.returnType == Int::class.javaPrimitiveType && home.returnType == Boolean::class.javaPrimitiveType)
         check(serviceHandler.type == handler && consumerGesture.type == gestureType)
     }
