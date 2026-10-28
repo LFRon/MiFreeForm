@@ -27,8 +27,11 @@ internal class NotificationUiBindings(loader: ClassLoader) {
     val ranking = entry.field("mRanking")
     val canBubble = android.service.notification.NotificationListenerService.Ranking::class.java.getMethod("canBubble")
     val remoteText = entry.field("remoteInputText")
-    val lastActionUp = loader.loadClass("com.android.systemui.statusbar.notification.row.ActivatableNotificationView")
-        .field("mLastActionUpTime")
+    private val lastActionUpField = loader.loadClass("com.android.systemui.statusbar.notification.row.ActivatableNotificationView")
+        .let { view ->
+            runCatching { view.field("mLastActionUpTime") }.getOrElse { view.field("mLastActionUpTimeNs") }
+        }
+    private val lastActionUpNanos = lastActionUpField.name.endsWith("Ns")
     val context = starter.field("mContext")
     val executor = starter.field("mUiBgExecutor")
     val remoteInput = starter.field("mRemoteInputManager")
@@ -58,10 +61,29 @@ internal class NotificationUiBindings(loader: ClassLoader) {
     val userIdentifier = android.os.UserHandle::class.java.method("getIdentifier")
     val isMedia = android.app.Notification::class.java.method("isMediaNotification")
     val userJobFlag = android.app.Notification::class.java.getDeclaredField("FLAG_USER_INITIATED_JOB").getInt(null)
-    val collapseShade = loader.loadClass("com.android.systemui.shade.ShadeController").getMethod("collapseOnMainThread")
-    val assist = starter.field("mAssistManagerLazy")
-    val assistUtils = loader.loadClass("com.android.systemui.assist.AssistManager").field("mAssistUtils")
-    val hideAssist = assistUtils.type.method("hideCurrentSession")
+    // Google 17 removed collapseOnMainThread; its reviewed ShadeController exposes the same
+    // main-thread collapse operation as animateCollapseShadeForcedDelayed(void).
+    val collapseShade = loader.loadClass("com.android.systemui.shade.ShadeController").let { type ->
+        runCatching { type.getMethod("collapseOnMainThread") }
+            .getOrElse { type.getMethod("animateCollapseShadeForcedDelayed") }
+    }
+    // Optional: Google's SystemUIGoogle.apk does not define com.android.systemui.assist.AssistManager
+    // (it is only referenced), so hiding an assist session there is unavailable. It is never part
+    // of the click capture itself; a missing binding only skips that cosmetic step.
+    private val assistBinding: AssistBinding? = runCatching {
+        val assist = starter.field("mAssistManagerLazy")
+        val assistUtils = loader.loadClass("com.android.systemui.assist.AssistManager").field("mAssistUtils")
+        AssistBinding(assist, assistUtils, assistUtils.type.method("hideCurrentSession"))
+    }.getOrNull()
+
+    class AssistBinding internal constructor(
+        internal val manager: Field, internal val utils: Field, internal val hide: Method
+    )
+
+    fun hideAssist(starter: Any, lazy: Method) {
+        val binding = assistBinding ?: return
+        binding.hide.invoke(binding.utils.get(lazy.invoke(binding.manager.get(starter))))
+    }
     val lazyGet = loader.loadClass("dagger.Lazy").getMethod("get")
     val visibilityRank = getVisibility.returnType.getField("rank")
     val visibilityCount = getVisibility.returnType.getField("count")
@@ -73,6 +95,18 @@ internal class NotificationUiBindings(loader: ClassLoader) {
 
     fun visibilityFor(entry: Any, starter: Any): Any = if (getVisibility.parameterCount == 2)
         getVisibility.invoke(visibility.get(starter), entry, true)!! else getVisibility.invoke(visibility.get(starter), entry)!!
+
+    /** Native stores either uptime millis (LOS) or uptime nanos (AOSP 17). */
+    fun lastActionUpMs(row: Any): Long {
+        val value = lastActionUpField.getLong(row)
+        return if (lastActionUpNanos) value / 1_000_000L else value
+    }
+
+    fun clearLastActionUp(row: Any) = lastActionUpField.setLong(row, 0L)
+
+    fun restoreLastActionUp(row: Any, eventTimeMs: Long) {
+        lastActionUpField.setLong(row, if (lastActionUpNanos) eventTimeMs * 1_000_000L else eventTimeMs)
+    }
 }
 
 @android.annotation.SuppressLint("PrivateApi") // system_server AD, not an application hidden-API bypass or a generic SDK match.

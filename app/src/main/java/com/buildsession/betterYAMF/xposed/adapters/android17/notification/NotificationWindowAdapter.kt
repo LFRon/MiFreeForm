@@ -143,7 +143,7 @@ internal object NotificationWindowAdapter {
             runCatching { previous.peer.cancel(previous.id) }
             finish(previous, -3) // A new message in the same row is a different click.
         }
-        val eventTime = native.lastActionUp.getLong(row)
+        val eventTime = native.lastActionUpMs(row)
         val options = launchOptions(eventTime)
         val controller = native.remoteController.get(native.remoteInput.get(starter))
         val spinning = controller != null && (native.spinning.get(controller) as Map<*, *>).containsKey(sbn.key)
@@ -160,7 +160,7 @@ internal object NotificationWindowAdapter {
         takeover()
         requests[entry] = click
         try {
-            native.lastActionUp.setLong(row, 0L)
+            native.clearLastActionUp(row)
             val timeout = Runnable {
                 if (!click.finished) {
                     logWarning(TAG, "notification click timed out request=${click.id}")
@@ -231,7 +231,7 @@ internal object NotificationWindowAdapter {
         // that newer HUN, or collapse a shade the user reopened while the send was in flight.
         if (isCurrent(click)) native.removeHun.invoke(click.starter, click.row)
         (native.executor.get(click.starter) as Executor).execute {
-            runCatching { native.hideAssist.invoke(native.assistUtils.get(native.lazyGet.invoke(native.assist.get(click.starter)))) }
+            runCatching { native.hideAssist(click.starter, native.lazyGet) }
                 .onFailure { logWarning(TAG, "hide assist after notification click failed", it) }
         }
     }
@@ -245,7 +245,7 @@ internal object NotificationWindowAdapter {
         if (result == -1 && unchanged) {
             // Explicit never-sent rejection may delegate once. Re-run native lock/remote-input
             // checks, since the phone/profile may have locked while staging. No capture scope.
-            if (native.lastActionUp.getLong(click.row) == 0L) native.lastActionUp.setLong(click.row, click.eventTime)
+            if (native.lastActionUpMs(click.row) == 0L) native.restoreLastActionUp(click.row, click.eventTime)
             // A local pre-send failure can reach here synchronously inside NotificationClicker.
             // Clear its scope so native fallback cannot wrap/capture itself recursively.
             val previous = rowScope.get()
