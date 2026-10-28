@@ -20,6 +20,8 @@ internal object Android17PixelLauncherAdapter : LauncherAdapter {
     override fun install(classLoader: ClassLoader) {
         QuickstepHookInstaller.install(identity, classLoader,
             retirementSignature, menu = false, taskbar = false, nativeDownAdmission = true)
+        runCatching { PixelTaskMenuHook.install(classLoader) }
+            .onFailure { logWarning("reYAMF_Adapters", "Pixel task menu unavailable", it) }
         if (!shortcutsInstalled) runCatching {
             val native = PixelNativeFreeformAccess(classLoader)
             native.enabled.hookAfter { call ->
