@@ -21,13 +21,13 @@
 | 导航起点 | 原生按旋转后的 swipe-up region 判断 DOWN；接受后创建新 `GestureState`，传给当前 `OtherActivityInputConsumer.mGestureState` | 在原生 DOWN 前保存坐标和旧对象，完成后核对 handler、新状态与 consumer 的对象身份；通过 `navigationStart` 报告事实，不再让固定底部 5% 代替 Pixel 导航区域 |
 | 当前任务与控制器 | `gestureState` / `consumer`、显示器的 `TaskAnimationManager.mController`、当前活跃 `OtherActivityInputConsumer.mInteractionHandler` | 反射成员初始化时缓存，真实对象每次手势重新读取；不跨手势缓存控制器 |
 | 原生跟踪资格 | 原生越过触摸阈值后调用 `AbsSwipeUpHandler.onGestureStarted(boolean)` 并设置 `mGestureStarted`；失效回调会清空 consumer 的 handler | MOVE 在原生识别后读取阶段，坐标在原生修改事件前采样；候选暂未就绪可重试，拥有者变化拒绝；不要求 Launcher resumed 或再上滑屏高 20% |
-| 原始 UP | `finishTouchTracking()` 先 `updateDisplacement()`，随后调用 `onGestureEnded(float, PointF, boolean)`，最后清理速度与输入跟踪 | 原始输入方法完整执行，只暂缓捕获处理器的最终决策；复制 px/ms 速度后归一为 px/s |
+| 原始 UP | `finishTouchTracking()` 先 `updateDisplacement()`，随后调用 `onGestureEnded`，最后清理速度与输入跟踪。PixelOS/LoS 为 `(float, PointF, boolean)`；Google 系统镜像额外传一个 `PointF`，即 `(float, PointF, boolean, PointF)`。私有的 `handleNormalGestureEnd` 在 Google 构建中为 6 参数，在 LoS 中为 5 参数 | `QuickstepNativeAccess` 同时解析并 Hook 两个 public 重载，以实际调用 `finishTouchTracking` 的重载为准；`handleNormalGestureEnd` 作为内联兜底也按 5/6 参数解析。原始输入方法完整执行，只暂缓捕获处理器的最终决策；复制 px/ms 速度后归一为 px/s |
 | 源画面 | `SwipeUpAnimationLogic.mRemoteTargetHandles` → 当前任务的 simulator、params、leash | `QuickstepSourceAccess` 只读取事实，不决定 mini 或动画目标 |
 | 源提交 | `TaskViewSimulator.apply()` 调用 `TransformParams.applySurfaceParams(SurfaceTransaction)`；后者可能延迟到 RT 帧提交 | `RecentsSourceFrame` 观察原生事务的 committed listener；不主动提交或释放借用的事务 |
 | 位置与像素 | `getCurrentRect()` 是显示空间矩形；`getCurrentCropRect()` 是缓冲区裁剪；`getScaledCornerRadius()` 为视觉圆角 | 提交确认后捕获任务内容，交给现有 v2 / 单向 Binder 像素传输 |
 | 原生结束 | `finishController(toLauncher, callback, sendUserLeaveHint, reason)`，强制结束另有 boolean 参数 | 捕获当前控制器的 normal / force API；使用 `true / false`，等待原生 result receiver 回调，超时仅作故障收敛 |
 | 源 UI 退场 | 只有 `createAnimationToNewWorkspace(BaseState, long, int)`；默认 flags 为 0；`dispatchOnStart()` 返回 void | 本目录显式选择三参数 ABI，保留正 duration 归一、原生开始监听和 `reapplyState(true)` 的最终清理 |
-| 受管任务过滤 | `onVisibleTasksChanged()` 在本 APK 中为空；`getCachedTopTask(boolean,int)` 构造真实候选缓存；`GestureState.getRunningTaskIds(true)` 直接读取前两个缓存任务 | `QuickstepTaskFilterAccess` 过滤缓存中所有受管任务，保留 context、display、desk 和原始 TaskInfo；不能只过滤空回调或栈顶 |
+| 受管任务过滤 | `onVisibleTasksChanged()` 在本 APK 中为空；`getCachedTopTask(boolean,int)` 构造真实候选缓存；`GestureState.getRunningTaskIds(true)` 直接读取前两个缓存任务；`TopTaskTracker.handleTaskMovedToFront` 的谓词是 `getWindowingMode() != 5` | `QuickstepTaskFilterAccess` 过滤缓存中所有受管任务，保留 context、display、desk 和原始 TaskInfo；不能只过滤空回调或栈顶。剔除条件还要求任务仍为 freeform/multi-window：广播集合是异步的，下拉全屏的释放要几帧才生效，仅凭集合会在交接瞬间把真正的前台任务剔掉，只剩 home 候选，动画以 HOME 结束（表现为上滑无反应）。过滤结果为空时保留原生候选，受管集合变化时清空 `mOrderedTaskList` |
 
 源变换提交、目标桥接帧提交、原生完成回调、源 UI 退场、真实任务准备仍使用已有的独立确认条件。平台适配没有增加自有弹簧、位移轨迹、mini 判定或固定交接延时。
 

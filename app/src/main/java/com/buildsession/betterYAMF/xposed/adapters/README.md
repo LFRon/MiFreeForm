@@ -56,12 +56,26 @@ Android 17 的启动前解析覆盖输入、源事务、任务过滤缓存和控
 | 组合 | 状态 | 允许的行为 |
 |---|---|---|
 | Android 17 + Launcher3 | 迁移既有 LineageOS 24.0 真机基线 | 结构检查通过后安装手势、菜单和任务栏实现；本次重构仍需驻留代码生效后复验 |
-| Android 17 + Pixel Launcher | 源码/DEX 核对候选，未完成 PixelOS 真机验证 | 仅 APK 版本号 907；手势接入公共端口，后端可用时过滤原生 desktop/freeform 菜单；米窗菜单与任务栏入口尚不安装 |
+| Android 17 + Pixel Launcher | 源码/DEX 核对候选，未完成 PixelOS 真机验证 | 仅 APK 版本号 907；手势接入公共端口，后端可用时过滤原生 desktop/freeform 菜单并追加 BetterFreeForm 任务菜单入口；任务栏入口尚不安装 |
+| Android 17 + Pixel Launcher（Google 原生镜像） | AVD 验证通过，真机待复验 | Pixel Launcher 17/907；系统后端按同一 A17 实现适配 Google 的 AOSP 差异；需开启 freeform；任务菜单入口采用 Pixel 的 SystemShortcut 字段构造 |
 | Android 16 + Launcher3 / Pixel Launcher | 待适配 | 不安装原生 Hook，不借用 Android 17 后端 |
 | Android 15 + Launcher3 | 待适配 | 不安装原生 Hook，不借用 Android 17 后端 |
 | 其他 SDK / Launcher 组合 | 未登记 | 不安装原生 Hook；无 `SDK >=` 或包名包含 launcher 的默认匹配 |
 
 APK 的最低 SDK 33 是应用安装下限，不是小窗支持声明。旧表面参数定义也不证明旧版任务后端已经成立。此次明确收紧以前未经验证的通用入口，Android 15/16 的完整适配属于后续工作。
+
+### Android 17 AOSP / Google 镜像补充
+
+Google 原生 Android 17 与 LineageOS 24.0 共用同一个 `android17/system` 入口，但原生结构存在差异，适配器按实际签名逐项核对后再安装：
+
+- `TaskCreationParams.Builder` 可能没有公开的 `setLaunchCookie(IBinder)`；适配器回退写入其 `mLaunchCookie` 字段，失败仍显式报初始化错误。
+- `WindowContainerTransaction` 可能没有 `setReparentLeafTaskIfRelaunchFromHome`；保留通用的 `setReparentLeafTaskIfRelaunch`，缺失的 FromHome 提示明确记录 Warning。
+- Google 原生镜像默认可能关闭 freeform；必须启用 `enable_freeform_support` / `force_resizable_activities` 并重启，否则 `createTask(freeform 根)` 会被系统以 `unsupported windowingMode=5` 拒绝。这是平台开关，不是 CORE 模式或尺寸策略。
+- Google 17 的 `DesktopTasksTransitionObserver` 可能只是数据持有类，不提供 `onTransitionReady`；此时只保留 `FreeformTaskTransitionObserver`，并记录 Warning。存在该方法的 LOS/PixelOS 仍安装完整 Hook。
+- 受管任务过滤必须以任务自身窗口模式为准：广播集合是异步的，下拉全屏的释放 WCT 要几帧才生效，用户常在这段时间内就上滑。`QuickstepTaskFilterAccess` 只在任务仍为 freeform/multi-window 时剔除，`YAMFManager` 在交接开始时先发布"该任务正在离开"的集合，且过滤结果为空时保留原生候选——否则 Launcher 的候选只剩 home，动画以 HOME 结束，表现为上滑无反应。受管集合变化时清空 `TopTaskTracker.mOrderedTaskList`。
+- Google 的 SystemUIGoogle.apk 不含 `com.android.systemui.assist.AssistManager`（只在引用中出现），通知点击后的 assist 收起在这一组合下不可用；它不参与点击捕获，缺失时跳过并保留其余钩子。
+- Vector 可能在 SystemUI 自己的 dex 路径就绪前投递 `com.android.systemui`：此时传入的 class loader `DexPathList` 为空。`HookShell` 因此在主线程用 `ActivityThread.currentApplication()` 的 loader 重试（有界），而不是把那一次 `ClassNotFoundException` 当成能力缺失。
+- 当前证据为 SDK 37 / x86_64 Google 镜像 + Pixel Launcher 17/907 的 AVD 验证：最近任务投放走 source bridge，`source pose frozen` → `bridge requested` → `visual=source` → `visual=live`；启动日志显示 `Shell native hooks installed`、`Shell ownership marker received`、`notification body-click capability installed`、`task menu entry installed`、`end gates installed=2 normal=1`、`entry backend ready`。真机尚未完成重复进入、旋转、全屏、打断和清理验收。LINEAGE/PixelOS 基线不受此条影响。
 
 AVIUM、Project Infinity X 等已经集成魔改小窗的 ROM 不在适配范围。系统与 Launcher 入口均会检查公开 `Build.PRODUCT` / `FINGERPRINT` / `DISPLAY` 中的对应品牌标识，识别到时跳过安装。该检查是尽力排除，不声称可以识别隐去品牌或伪装构建信息的 ROM，也不接管这些 ROM 的小窗。
 
@@ -70,6 +84,7 @@ AVIUM、Project Infinity X 等已经集成魔改小窗的 ROM 不在适配范围
 ## 完成与失败约束
 
 - 原始 UP 完整执行；仅暂缓已捕获处理器的最终去向决策，保持最后位移和输入清理。
+- Pixel Launcher 17/907 的 `OtherActivityInputConsumer.finishTouchTracking()` 实际调用四参数 `onGestureEnded(float, PointF, boolean, PointF)`，而 PixelOS/LoS 评审源调用三参数重载；`QuickstepNativeAccess` 同时解析两个 public 重载，并以 `handleNormalGestureEnd` 5/6 参数方法作为内联兜底。只有两个结束决策都不可用时，已声明的 `legacyAfterNative` 才在原始 UP 后按任务 id 排队，不声称保留源画面，也不伪造源释放。
 - 源变换提交、目标桥接帧提交、原生控制器结束、源 UI 退场、目标准备分别确认；保留既有 v2 广播与单向 Binder 像素协议。
 - `bridgeAvailable()` 同时要求跨进程协商和本地源事务同步机制成立。方法存在只是结构条件，不能替代真机时序验证。
 - 同一进程只安装一组 Launcher 入口。安装中途失败会撤回已注册的该组 Hook；不在进行中的手势里切换实现。

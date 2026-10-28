@@ -17,6 +17,8 @@
 
 安装需要支持本工程 Xposed 接口的框架，例如 LSPosed。当前 Android 17 实现需要同时启用 **`android`、`com.android.systemui` 和实际承担最近任务手势的 Launcher**。SystemUI 承载 Shell，小窗后端会等待同一构建的 Shell 隔离确认；缺少其作用域或仍驻留旧代码时，后端不宣告入口可用。侧边栏等应用侧浮层按界面提示授予悬浮窗权限。
 
+Google 原生 Android 17 默认可能未开启 freeform。使用该镜像时，请在开发者选项中启用 freeform（或写入 `enable_freeform_support=1`、`force_resizable_activities=1`）并重启，否则系统会拒绝创建 freeform 悬浮根；这不是模块的窗口策略。AVD 基线使用 Pixel Launcher 17/907，真机仍需按同一组合复验。
+
 安装或更新 APK 后，应在 Hook 框架中检查模块及所需作用域。APK 更新成功不等于 Launcher / `system_server` 已加载新代码；驻留版本的生效方式由所用框架决定。
 
 顶栏及状态卡片目前显示“暂不支持检测”，模块激活及作用域完整性检测将在迁移至 **libxposed 102** 后补充。这一提示不代表模块未激活，也不根据服务连接或后端就绪状态推断作用域是否完整。
