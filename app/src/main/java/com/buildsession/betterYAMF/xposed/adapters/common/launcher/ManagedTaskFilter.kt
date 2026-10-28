@@ -6,6 +6,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import com.buildsession.betterYAMF.BuildConfig
 import com.buildsession.betterYAMF.common.ipc.Protocol
 import com.buildsession.betterYAMF.xposed.utils.log
 import com.buildsession.betterYAMF.xposed.utils.TRUSTED_SENDER_PERMISSION
@@ -37,12 +38,24 @@ internal object ManagedTaskFilter {
 
     @Volatile
     private var receiverRegistered = false
+    @Volatile
+    private var filterAccess: QuickstepTaskFilterAccess? = null
+    @Volatile
+    private var tracker: Any? = null
 
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             val ids = intent.getIntArrayExtra(Protocol.EXTRA_MANAGED_TASK_IDS) ?: return
             managedTaskIds.clear()
             ids.forEach { managedTaskIds.add(it) }
+            // Pixel Launcher 17/907 does not update TopTaskTracker from onVisibleTasksChanged.
+            // When a task leaves managed ownership for fullscreen, the legacy ordered-task cache
+            // can still contain its previous home entry; without this invalidation the next
+            // swipe-up reads that stale task and never leaves the fullscreen app.
+            filterAccess?.let { access -> tracker?.let { target ->
+                runCatching { access.invalidateTopTaskCache(target) }
+                    .onFailure { log(TAG, "invalidate top task cache failed", it) }
+            } }
             log(TAG) { "managed tasks updated: [${ids.joinToString()}]" }
         }
     }
@@ -72,13 +85,21 @@ internal object ManagedTaskFilter {
 
     /** 安装 TopTaskTracker 双路径过滤（Launcher 进程 handleLoadPackage 时调用）。 */
     fun installTopTaskFilters(access: QuickstepTaskFilterAccess): List<NativeHooks.Registration> {
+        filterAccess = access
+        // Without the per-task windowing mode only the broadcast set can be trusted, and a
+        // fullscreen release that has not been delivered yet still hides the real target.
+        if (!access.windowingModeAvailable) {
+            log(TAG) { "task windowing mode unavailable; release/gesture race cannot be excluded" }
+        }
         val hooks = mutableListOf<NativeHooks.Registration>()
         try {
             hooks += access.visible.hookBefore { param ->
+                tracker = param.thisObject
                 runCatching { filterVisibleGroups(param, access) }
                     .onFailure { log(TAG, "filter visible groups failed", it) }
             }
             hooks += access.cached.hookAfter { param ->
+                tracker = param.thisObject
                 runCatching { rebuildCachedTopTask(param, access) }
                     .onFailure { log(TAG, "filter cached top task failed", it) }
             }
@@ -98,9 +119,9 @@ internal object ManagedTaskFilter {
         val groups = param.args.getOrNull(0) as? Array<*> ?: return
         val kept = groups.filter { group ->
             if (group == null) return@filter true
-            val ids = runCatching { access.groupIds(group) }.getOrNull()
-            // 解析失败（desk 等特殊组）或组内混有非受管任务 → 保留
-            ids == null || ids.isEmpty() || ids.any { !isManaged(it) }
+            val ids = runCatching { access.groupHosted(group) }.getOrNull()
+            // 解析失败（desk 等特殊组）、组内混有非受管任务、或任务已回到全屏 → 保留
+            ids == null || ids.isEmpty() || ids.any { (id, hosted) -> !isManaged(id) || !hosted }
         }
         if (kept.size == groups.size) return
         val component = groups.javaClass.componentType
@@ -114,6 +135,11 @@ internal object ManagedTaskFilter {
     private fun rebuildCachedTopTask(param: NativeHooks.Call, access: QuickstepTaskFilterAccess) {
         if (managedTaskIds.isEmpty()) return
         val result = param.result ?: return
-        access.withoutManagedTasks(result, ::isManaged)?.let { param.result = it }
+        val filtered = access.withoutManagedTasks(result, ::isManaged) ?: return
+        param.result = filtered
+        if (BuildConfig.DEBUG) {
+            log(TAG) { "gesture task filtered managed=[${managedTaskIds.joinToString()}] " +
+                "before=${access.cachedFacts(result)} after=${access.cachedFacts(filtered)}" }
+        }
     }
 }

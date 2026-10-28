@@ -101,7 +101,7 @@ class AppWindow(val context: Context, private val onWindowInit: (WindowHost, Int
             }
             override fun handoffFullscreen(commandId: Long, released: () -> Unit,
                 result: (FullscreenHandoffResult) -> Unit): WindowOperation =
-                YAMFManager.windowBackend.handoffFullscreen(currentTaskId, released) { value ->
+                YAMFManager.handoffWindowToFullscreen(currentTaskId, released) { value ->
                     if (value.status != CommandStatus.DONE)
                         logWarning(TAG, "fullscreen handoff result=$value window=$windowId task=$currentTaskId command=$commandId")
                     result(value)

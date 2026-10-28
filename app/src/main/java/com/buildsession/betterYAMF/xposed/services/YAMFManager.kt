@@ -27,6 +27,8 @@ import com.buildsession.betterYAMF.xposed.adapters.common.system.EntrySnapshotTr
 import com.buildsession.betterYAMF.xposed.adapters.common.system.PendingEntryRequests
 import com.buildsession.betterYAMF.xposed.adapters.common.system.UserScopedBroadcasts
 import com.buildsession.betterYAMF.window.api.CommandStatus
+import com.buildsession.betterYAMF.window.api.FullscreenHandoffResult
+import com.buildsession.betterYAMF.window.api.WindowOperation
 import com.buildsession.betterYAMF.window.backend.WindowBackend
 import com.buildsession.betterYAMF.window.backend.WindowBackendCallbacks
 import com.buildsession.betterYAMF.window.backend.WindowBackends
@@ -596,9 +598,13 @@ object YAMFManager : IYAMFManager.Stub() {
      * 对齐系统对 pinned 任务的处理：上滑/快速切换等手势永远不会选中浮窗，
      * 浮窗只受自身触摸与模块命令驱动。
      */
-    fun broadcastManagedTaskIds() {
+    fun broadcastManagedTaskIds(leaving: Int = -1) {
         runCatching {
-            val ids = windowBackend.managedTaskIds()
+            // [leaving] is a task that is abandoning floating ownership right now. The release
+            // applies a few frames later, so a user swipe that starts during the fullscreen
+            // reveal would otherwise still be excluded from Launcher gesture targets and the
+            // recents animation would end on the home task instead of opening Overview.
+            val ids = windowBackend.managedTaskIds().filter { it != leaving }.toIntArray()
             EntryProtocolIdentity.peers.recipients().forEach { target ->
                 UserScopedBroadcasts.send(systemContext, Intent(Protocol.ACTION_MANAGED_TASKS).setPackage(target.packageName)
                     .putExtra(Protocol.EXTRA_MANAGED_TASK_IDS, ids), target.userId)
@@ -640,6 +646,18 @@ object YAMFManager : IYAMFManager.Stub() {
      * [toFront]：true=置顶回前（下拉全屏路径）；false=沉到原父级栈底（关闭小窗：
      * 任务转后台、留在最近任务，不抢当前前台）。
      */
+    /**
+     * 下拉全屏交接：先让 Launcher 停止把该任务当作浮窗入口目标，再释放几何。
+     * 释放的 WCT 要几个帧才生效，而用户常在 REVEALING 期间就已上滑；若仍按旧的受管集合
+     * 过滤，Launcher 的唯一候选只剩 home，动画会以 HOME 结束（表现为"上滑没反应"）。
+     */
+    fun handoffWindowToFullscreen(
+        taskId: Int, onReleased: () -> Unit, onComplete: (FullscreenHandoffResult) -> Unit
+    ): WindowOperation {
+        broadcastManagedTaskIds(leaving = taskId)
+        return windowBackend.handoffFullscreen(taskId, onReleased, onComplete)
+    }
+
     fun switchTaskToFullscreen(taskId: Int, toFront: Boolean = true): Boolean {
         WindowSessions.hostedTasks.remove(taskId)
         WindowSessions.taskActivities.remove(taskId)
