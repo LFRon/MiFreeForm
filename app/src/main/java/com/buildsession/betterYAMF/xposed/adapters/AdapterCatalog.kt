@@ -1,12 +1,19 @@
 package com.buildsession.betterYAMF.xposed.adapters
 
-import com.buildsession.betterYAMF.xposed.adapters.android15.launcher3.Android15Launcher3Adapter
-import com.buildsession.betterYAMF.xposed.adapters.android16.launcher3.Android16Launcher3Adapter
-import com.buildsession.betterYAMF.xposed.adapters.android16.pixelLauncher.Android16PixelLauncherAdapter
-import com.buildsession.betterYAMF.xposed.adapters.android17.launcher3.Android17Launcher3Adapter
-import com.buildsession.betterYAMF.xposed.adapters.android17.pixelLauncher.Android17PixelLauncherAdapter
+import com.buildsession.betterYAMF.xposed.adapters.launcher.launcher3.Android15Launcher3Adapter
+import com.buildsession.betterYAMF.xposed.adapters.launcher.launcher3.Android16Launcher3Adapter
+import com.buildsession.betterYAMF.xposed.adapters.launcher.pixel.Android16PixelLauncherAdapter
+import com.buildsession.betterYAMF.xposed.adapters.launcher.launcher3.Android17Launcher3Adapter
+import com.buildsession.betterYAMF.xposed.adapters.launcher.pixel.Android17PixelLauncherAdapter
 
-/** Exact keys: no package substring matching, SDK >= fallback, or mixing individual probes. */
+/**
+ * Axis 2 of three: the Launcher implementation. Exact keys, no package substring matching, no
+ * SDK >= fallback, and no borrowing one Launcher's mechanism for another.
+ *
+ * Launcher identity is deliberately independent of the distribution name. LineageOS can host the
+ * Pixel Launcher and PixelOS ships both AOSP Launcher3 and the Pixel Launcher prebuilt, so the
+ * installed Home/Recents host decides this axis while [RomProfile] only describes the framework.
+ */
 internal object AdapterCatalog {
     val launchers: List<LauncherAdapter> = listOf(Android15Launcher3Adapter,
         Android16Launcher3Adapter, Android16PixelLauncherAdapter,

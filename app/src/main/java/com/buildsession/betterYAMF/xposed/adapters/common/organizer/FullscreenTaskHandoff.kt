@@ -312,15 +312,17 @@ internal object FullscreenTaskHandoff {
         }
 
         private fun selectClientSurface(): (Any) -> SurfaceControl? {
-            // LoS 24 owns client surfaces in WindowStateAnimator.mSurfaceControl. Older Android
-            // generations keep their buffer layer in WindowSurfaceController instead.
+            // AOSP 24.0 owns client surfaces in WindowStateAnimator.mSurfaceControl; the Google
+            // branch exposes getClientViewRootSurface(); older generations keep the buffer layer in
+            // WindowSurfaceController. Earlier forms stay first and each later one is a fallback.
             val getter = runCatching { method(windowClass, "getClientViewRootSurface") }.getOrNull()
             if (getter != null) return { getter.invoke(it) as? SurfaceControl }
             val animatorField = field(windowClass, "mWinAnimator")
             val animatorClass = animatorField.type
             val direct = runCatching { field(animatorClass, "mSurfaceControl") }.getOrNull()
             if (direct != null) return { direct.get(animatorField.get(it)) as? SurfaceControl }
-            val controllerField = field(animatorClass, "mSurfaceController")
+            val controllerField = runCatching { field(animatorClass, "mSurfaceController") }.getOrNull()
+                ?: return { null } // Shape without any owned client surface: handoff stays native.
             val layer = field(controllerField.type, "mSurfaceControl")
             return { window -> controllerField.get(animatorField.get(window))?.let { layer.get(it) as? SurfaceControl } }
         }

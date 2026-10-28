@@ -1,4 +1,4 @@
-package com.buildsession.betterYAMF.xposed.adapters.android17.pixelLauncher
+package com.buildsession.betterYAMF.xposed.adapters.launcher.pixel
 
 import com.buildsession.betterYAMF.xposed.adapters.*
 import com.buildsession.betterYAMF.xposed.adapters.common.launcher.QuickstepHookInstaller
@@ -12,7 +12,7 @@ import com.buildsession.betterYAMF.xposed.utils.logWarning
  * are instead filtered at the final list, only when the MiWindow backend is actually usable.
  */
 internal object Android17PixelLauncherAdapter : LauncherAdapter {
-    override val identity = AdapterIdentity("android17/pixelLauncher", 37,
+    override val identity = AdapterIdentity("pixel/17", 37,
         "com.google.android.apps.nexuslauncher", AdapterEvidence.SOURCE_REVIEWED, "PixelOS 17", launcherVersionCode = 907L)
     internal val retirementSignature = LauncherSourceRetirement.Signature.THREE_ARGUMENTS
     private var shortcutsInstalled = false

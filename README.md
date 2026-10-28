@@ -13,7 +13,7 @@
 
 ## 运行与安装
 
-工程声明的最低版本是 Android 13（API 33），当前原生交接与绘制同步的验证基线是 **LineageOS 24.0 的 Quickstep / Launcher3 与系统窗口后端**。最低 API、作用域中的包名或可找到的类名，都不能单独证明设备兼容。当前 Android 17 / Pixel Launcher 17、907 仅为源码核对候选，尚未完成 PixelOS 真机验证；Android 15/16 的组合保留待适配入口。
+工程声明的最低版本是 Android 13（API 33），当前原生交接与绘制同步的验证基线是 **LineageOS 24.0 的 Quickstep / Launcher3 与系统窗口后端**。最低 API、作用域中的包名或可找到的类名，都不能单独证明设备兼容。系统侧与 Launcher 侧的反射成员已按 `lineage-24.0` 分支源码逐个核验；三处构建差异（`Task#getLeash`、`InsetsState#calculateInsets` 重载、`DisplayPolicy` 的系统栏窗口取用）改为能力探测回退，细节见 [`adapters/README.md`](app/src/main/java/com/buildsession/betterYAMF/xposed/adapters/README.md)。当前 Android 17 / Pixel Launcher 17、907 仅为源码核对候选，尚未完成 PixelOS 真机验证；Android 15/16 的组合保留待适配入口。
 
 安装需要支持 **libxposed API 102** 的框架（本工程在 Vector 上验证）。模块以 `META-INF/xposed/module.prop` 声明 `targetApiVersion=102`，框架因此只走现代入口，不再经过 legacy `de.robv` 兼容层；作用域清单是 **`system`（system_server 的虚拟包名，不是 `android`）、`com.android.systemui` 和实际承担最近任务手势的 Launcher**。SystemUI 承载 Shell，小窗后端会等待同一构建的 Shell 隔离确认；缺少其作用域或仍驻留旧代码时，后端不宣告入口可用。侧边栏等应用侧浮层按界面提示授予悬浮窗权限。
 
@@ -155,7 +155,7 @@ CORE 输出的可交互帧提交后才回报激活成功，随后在 NMS 执行�
 
 ## 适配新的 Launcher 或 Android 版本
 
-具体实现以 **Android 大版本 + Launcher** 为独立目录和验收单位，共享机制集中在 `xposed/adapters/common`。每个组合提供普通 Kotlin Hook 安装入口，按精确 SDK / 包名 / 主进程选择；系统侧通过对应 Android 实现提供任务后端。ROM 名称不决定 Launcher 类型：LineageOS 24.0 加装已核对的 Pixel Launcher，且默认 Home / 最近任务宿主均为 Pixel 时，使用 Pixel 适配器。Home 与最近任务分属不同包的组合须单独适配，不能自动套用集成路径。未来 Android 版本和未登记 Launcher 也不自动套用现有实现。
+具体实现按三条正交的轴组织：**框架基线（AOSP / Google）× Launcher 实现 × 发行版审阅记录**，共享机制集中在 `xposed/adapters/common`，轴定义与目录见 [`adapters/README.md`](app/src/main/java/com/buildsession/betterYAMF/xposed/adapters/README.md)。发行版只用于记录前两轴解释不了的厂商补丁，未收录的 ROM 直接使用成员探测结果。每个组合提供普通 Kotlin Hook 安装入口，按精确 SDK / 包名 / 主进程选择；系统侧通过对应 Android 实现提供任务后端。ROM 名称不决定 Launcher 类型：LineageOS 24.0 加装已核对的 Pixel Launcher，且默认 Home / 最近任务宿主均为 Pixel 时，使用 Pixel 适配器。Home 与最近任务分属不同包的组合须单独适配，不能自动套用集成路径。未来 Android 版本和未登记 Launcher 也不自动套用现有实现。
 
 完整目录、当前支持表、源码证据及新增步骤见 **[平台适配接入说明](app/src/main/java/com/buildsession/betterYAMF/xposed/adapters/README.md)**。AVIUM、Project Infinity X 等自带魔改小窗的 ROM 不在适配范围；公开构建信息中识别到相应标识时跳过 Hook。构建信息和方法签名都不能代替目标 ROM 的行为验收。
 

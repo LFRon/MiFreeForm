@@ -1,6 +1,8 @@
-# PixelOS 17 / Pixel Launcher 接入核对
+# Pixel Launcher 接入核对（轴 2）
 
-此目录负责 Android 17（SDK 37）与 `com.google.android.apps.nexuslauncher` 的具体适配。主进程、SDK、APK 版本先匹配；安装前解析整组原生成员。公共入口判定、窗口几何、弹簧和交接策略继续由现有 API / CORE / runtime 承担。
+此目录是三条适配轴中的 **Launcher 实现**轴：`com.google.android.apps.nexuslauncher` 的 Quickstep 机制，当前入口是 `pixel/17`（待适配：`pixel/16`）。主进程、SDK、APK 版本先匹配；安装前解析整组原生成员。公共入口判定、窗口几何、弹簧和交接策略继续由现有 API / CORE / runtime 承担。
+
+这一轴与发行版名字无关：Pixel Launcher 可以出现在 LineageOS 上，PixelOS 的 manifest 也同时构建 AOSP `platform/packages/apps/Launcher3` 并携带 `vendor/pixel/launcher` 预置。实际使用哪一份由运行时默认 Home 与最近任务宿主决定；框架侧形状见 `adapters/baseline`，发行版审阅记录见 `adapters/rom/pixelos`。
 
 ## 证据范围
 

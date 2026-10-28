@@ -2,6 +2,7 @@ package com.buildsession.betterYAMF.xposed.adapters.common.system
 
 import android.graphics.Rect
 import android.view.Display
+import com.buildsession.betterYAMF.xposed.adapters.AndroidEnvironment
 import com.buildsession.betterYAMF.xposed.utils.Instances
 import com.buildsession.betterYAMF.xposed.utils.Reflect
 
@@ -35,8 +36,17 @@ object SystemBarMetrics {
                 val dc = Reflect.callMethod(Reflect.getObjectField(wms, "mRoot"), "getDisplayContent", 0)
                 val controller = Reflect.callMethod(dc, "getInsetsStateController")
                 val state = Reflect.callMethod(controller, "getRawInsetsState")
-                Reflect.callMethod(state, "calculateInsets", Rect(0, 0, dm.widthPixels, dm.heightPixels),
-                    android.view.WindowInsets.Type.systemBars() or android.view.WindowInsets.Type.displayCutout(), true) as android.graphics.Insets
+                val frame = Rect(0, 0, dm.widthPixels, dm.heightPixels)
+                val types = android.view.WindowInsets.Type.systemBars() or android.view.WindowInsets.Type.displayCutout()
+                // The Google branch declares (frame, types, ignoreVisibility); the AOSP branch only
+                // declares the four-argument form, where hostBounds is nullable.
+                if (shape.insetsIgnoreVisibility)
+                    Reflect.callMethod(state, "calculateInsets", frame, types, true) as android.graphics.Insets
+                else
+                    Reflect.callMethodTyped(state, "calculateInsets",
+                        arrayOf(Rect::class.java, Rect::class.java, Int::class.javaPrimitiveType,
+                            Boolean::class.javaPrimitiveType),
+                        frame, null, types, true) as android.graphics.Insets
             }
         }.getOrNull()
         return com.buildsession.betterYAMF.window.api.SceneMetrics(dm.widthPixels, dm.heightPixels,
@@ -55,10 +65,22 @@ object SystemBarMetrics {
     /** 取 DisplayPolicy 并读系统栏窗口（getStatusBar / getNavigationBar）的 frame 高度。 */
     private fun windowHeight(accessor: String): Int? = runCatching {
         val policy = displayPolicy() ?: return null
-        val window = Reflect.callMethod(policy, accessor) ?: return null
+        val window = barWindow(policy, accessor) ?: return null
         val frame = Reflect.callMethod(window, "getFrame") as? Rect ?: return null
         frame.height().takeIf { it > 0 }
     }.getOrNull()
+
+    /** Member availability is per accessor: AOSP 24.0 exposes `getNavigationBar()` but keeps the
+     * status bar in `mStatusBar` only, so the probed order is a hint with the other form behind it.
+     */
+    private fun barWindow(policy: Any, accessor: String): Any? {
+        val field = "m" + accessor.removePrefix("get")
+        val getter = { runCatching { Reflect.callMethod(policy, accessor) }.getOrNull() }
+        val direct = { runCatching { Reflect.getObjectField(policy, field) }.getOrNull() }
+        return if (shape.displayPolicyBarGetters) getter() ?: direct() else direct() ?: getter()
+    }
+
+    private val shape by lazy { AndroidEnvironment.shape(Instances.systemContext.classLoader) }
 
     private fun displayPolicy(): Any? = runCatching {
         val wms = Reflect.getObjectField(Instances.activityTaskManager, "mWindowManager")

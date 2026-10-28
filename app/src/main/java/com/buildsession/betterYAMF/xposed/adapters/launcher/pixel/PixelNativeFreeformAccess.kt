@@ -1,4 +1,4 @@
-package com.buildsession.betterYAMF.xposed.adapters.android17.pixelLauncher
+package com.buildsession.betterYAMF.xposed.adapters.launcher.pixel
 
 /** Pixel 17/907 final shortcut list. Match actual native types, never localized labels. */
 internal class PixelNativeFreeformAccess(loader: ClassLoader) {

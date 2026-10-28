@@ -17,7 +17,7 @@ class AdapterCatalogTest {
 
     @Test fun knownCurrentCombinationHasOneExplicitEntry() {
         val selected = select(37) as LauncherSelection.Selected
-        assertEquals("android17/launcher3", selected.adapter.identity.id)
+        assertEquals("launcher3/17", selected.adapter.identity.id)
         assertEquals("LineageOS 24.0", selected.adapter.identity.referenceRom)
         assertEquals(AdapterEvidence.DEVICE_BASELINE, selected.adapter.identity.evidence)
         assertNotNull(SystemAdapters.select(37, lineage))
@@ -25,14 +25,14 @@ class AdapterCatalogTest {
 
     @Test fun pixelSourceAuditIsNotLabelledAsDeviceValidation() {
         val selected = select(37, pixel) as LauncherSelection.Selected
-        assertEquals("android17/pixelLauncher", selected.adapter.identity.id)
+        assertEquals("pixel/17", selected.adapter.identity.id)
         assertEquals("PixelOS 17", selected.adapter.identity.referenceRom)
         assertEquals(AdapterEvidence.SOURCE_REVIEWED, selected.adapter.identity.evidence)
     }
 
     @Test fun lineageWithPixelHomeAndQuickstepSelectsPixelInsteadOfTheRomBaseline() {
         val selected = active(pkg = pixel) as LauncherSelection.Selected
-        assertEquals("android17/pixelLauncher", selected.adapter.identity.id)
+        assertEquals("pixel/17", selected.adapter.identity.id)
         // The combination remains source-reviewed; a different ROM does not upgrade its evidence.
         assertEquals(AdapterEvidence.SOURCE_REVIEWED, selected.adapter.identity.evidence)
     }
@@ -40,7 +40,7 @@ class AdapterCatalogTest {
     @Test fun pixelRomWithLauncher3HomeAndQuickstepSelectsLauncher3() {
         val selected = active(platform = PlatformIdentity(product = "PixelOS_sagit-userdebug"))
             as LauncherSelection.Selected
-        assertEquals("android17/launcher3", selected.adapter.identity.id)
+        assertEquals("launcher3/17", selected.adapter.identity.id)
     }
 
     @Test fun installedButNonDefaultLauncherCannotEnableAnEntry() {
@@ -77,7 +77,7 @@ class AdapterCatalogTest {
         assertTrue(active(pkg = pixel) is LauncherSelection.Selected)
         assertTrue(active(pkg = pixel, home = launcher3) is LauncherSelection.Unavailable)
         val restored = active(pkg = pixel) as LauncherSelection.Selected
-        assertEquals("android17/pixelLauncher", restored.adapter.identity.id)
+        assertEquals("pixel/17", restored.adapter.identity.id)
     }
 
     @Test fun unauditedPixelApkDoesNotInstallEvenIfThePackageAndSdkMatch() {

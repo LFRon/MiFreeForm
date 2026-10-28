@@ -5,6 +5,7 @@ import android.app.PendingIntent
 import android.content.Intent
 import android.os.Bundle
 import android.os.IBinder
+import com.buildsession.betterYAMF.xposed.adapters.AndroidEnvironment
 import java.lang.reflect.Field
 import java.lang.reflect.Method
 
@@ -61,11 +62,13 @@ internal class NotificationUiBindings(loader: ClassLoader) {
     val userIdentifier = android.os.UserHandle::class.java.method("getIdentifier")
     val isMedia = android.app.Notification::class.java.method("isMediaNotification")
     val userJobFlag = android.app.Notification::class.java.getDeclaredField("FLAG_USER_INITIATED_JOB").getInt(null)
-    // Google 17 removed collapseOnMainThread; its reviewed ShadeController exposes the same
-    // main-thread collapse operation as animateCollapseShadeForcedDelayed(void).
+    // The Google branch removed collapseOnMainThread; the AOSP branch (LineageOS 24.0, PixelOS 17)
+    // keeps it and also exposes animateCollapseShadeForcedDelayed(void) as the same operation.
     val collapseShade = loader.loadClass("com.android.systemui.shade.ShadeController").let { type ->
-        runCatching { type.getMethod("collapseOnMainThread") }
-            .getOrElse { type.getMethod("animateCollapseShadeForcedDelayed") }
+        val order = if (AndroidEnvironment.shape(loader).shadeCollapseOnMainThread)
+            listOf("collapseOnMainThread", "animateCollapseShadeForcedDelayed")
+        else listOf("animateCollapseShadeForcedDelayed", "collapseOnMainThread")
+        order.firstNotNullOf { name -> runCatching { type.getMethod(name) }.getOrNull() }
     }
     // Optional: Google's SystemUIGoogle.apk does not define com.android.systemui.assist.AssistManager
     // (it is only referenced), so hiding an assist session there is unavailable. It is never part

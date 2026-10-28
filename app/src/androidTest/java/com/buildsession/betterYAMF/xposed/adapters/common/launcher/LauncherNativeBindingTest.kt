@@ -6,9 +6,9 @@ import android.content.Intent
 import com.buildsession.betterYAMF.xposed.adapters.AdapterCatalog
 import com.buildsession.betterYAMF.xposed.adapters.AndroidEnvironment
 import com.buildsession.betterYAMF.xposed.adapters.LauncherSelection
-import com.buildsession.betterYAMF.xposed.adapters.android17.launcher3.Android17Launcher3Adapter
-import com.buildsession.betterYAMF.xposed.adapters.android17.pixelLauncher.Android17PixelLauncherAdapter
-import com.buildsession.betterYAMF.xposed.adapters.android17.pixelLauncher.PixelNativeFreeformAccess
+import com.buildsession.betterYAMF.xposed.adapters.launcher.launcher3.Android17Launcher3Adapter
+import com.buildsession.betterYAMF.xposed.adapters.launcher.pixel.Android17PixelLauncherAdapter
+import com.buildsession.betterYAMF.xposed.adapters.launcher.pixel.PixelNativeFreeformAccess
 import android.os.Build
 import androidx.test.platform.app.InstrumentationRegistry
 import dalvik.system.PathClassLoader
@@ -95,9 +95,9 @@ class LauncherNativeBindingTest {
         signature: LauncherSourceRetirement.Signature, context: Context) {
         val native = QuickstepNativeAccess(loader, signature)
         assertEquals("onInputEvent", native.onInput.name)
-        assertEquals("onGestureEnded", native.gestureEnd.name)
         assertEquals(Void.TYPE, native.onInput.returnType)
-        assertEquals(Void.TYPE, native.gestureEnd.returnType)
+        assertTrue(native.gestureEnds.isNotEmpty())
+        assertTrue(native.gestureEnds.all { it.name == "onGestureEnded" && it.returnType == Void.TYPE })
         // Executing this simple native value constructor does not initialize Launcher services.
         // Pixel 17/907's onVisibleTasksChanged is empty; getCachedTopTask must be filtered itself.
         val type = native.taskFilter.cached.returnType

@@ -36,7 +36,10 @@ internal interface LauncherAdapter {
  */
 internal data class PlatformIdentity(val product: String = "", val fingerprint: String = "",
     val display: String = "") {
-    val excluded: Boolean get() = listOf(product, fingerprint, display).any(EXCLUDED_ROM::containsMatchIn)
+    /** Space-joined public labels; distribution profiles match against this and nothing else. */
+    val labels: String get() = "$product $fingerprint $display"
+
+    val excluded: Boolean get() = EXCLUDED_ROM.containsMatchIn(labels)
 
     private companion object {
         val EXCLUDED_ROM = Regex("(?i)(?:^|[^a-z0-9])(?:avium(?:ui)?|(?:project[ _-]*)?infinity(?:[ _-]*x)?)(?:$|[^a-z0-9])")

@@ -17,6 +17,7 @@ internal object Android17SystemAdapter : AndroidSystemAdapter {
 
     override fun install(classLoader: ClassLoader) {
         if (installed) return
+        com.buildsession.betterYAMF.xposed.adapters.AndroidEnvironment.reportBaseline(classLoader)
         val organizer = classLoader.loadClass("android.window.ITaskOrganizer")
         val tx = classLoader.loadClass("android.view.SurfaceControl\$Transaction")
         val task = classLoader.loadClass("com.android.server.wm.Task")

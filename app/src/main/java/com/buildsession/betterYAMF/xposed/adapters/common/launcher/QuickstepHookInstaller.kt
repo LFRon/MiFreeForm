@@ -28,6 +28,7 @@ internal object QuickstepHookInstaller {
         nativeDownAdmission: Boolean = false) {
         if (owner === loader && identity == id) return
         check(owner == null) { "An active Launcher binding cannot be replaced in-flight" }
+        com.buildsession.betterYAMF.xposed.adapters.AndroidEnvironment.reportBaseline(loader)
         val native = QuickstepNativeAccess(loader, signature)
         val optional = QuickstepOptionalHooks(loader, menu, taskbar) { isCurrentLauncher }
         var gesture: LauncherGestureAdapter? = null

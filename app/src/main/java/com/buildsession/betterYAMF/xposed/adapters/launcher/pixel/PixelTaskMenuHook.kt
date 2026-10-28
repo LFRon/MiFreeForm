@@ -1,4 +1,4 @@
-package com.buildsession.betterYAMF.xposed.adapters.android17.pixelLauncher
+package com.buildsession.betterYAMF.xposed.adapters.launcher.pixel
 
 import android.app.PendingIntent
 import android.app.RemoteAction

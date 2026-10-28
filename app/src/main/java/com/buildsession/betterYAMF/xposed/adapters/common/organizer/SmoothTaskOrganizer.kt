@@ -9,6 +9,8 @@ import android.view.Display
 import android.view.SurfaceControl
 import android.window.ITaskOrganizer
 import com.buildsession.betterYAMF.window.api.WindowRect
+import com.buildsession.betterYAMF.xposed.adapters.AndroidEnvironment
+import com.buildsession.betterYAMF.xposed.adapters.baseline.FrameworkShape
 import com.buildsession.betterYAMF.xposed.adapters.common.freeform.FreeformBackend
 import com.buildsession.betterYAMF.xposed.adapters.common.system.ShellOwnershipServer
 import com.buildsession.betterYAMF.xposed.adapters.common.system.EntryProtocolIdentity
@@ -268,9 +270,11 @@ object SmoothTaskOrganizer {
         val info = Reflect.callMethod(appeared, "getTaskInfo") as ActivityManager.RunningTaskInfo
         val stage = NotificationTaskStage(info.taskId, Reflect.requireObjectField(info, "token"), previous)
         notificationStages[info.taskId] = stage // Record before fallible setup, for complete cleanup.
-        var raw: SurfaceControl? = null
+        val nativeLeash = taskLeash(appeared)
         try {
-            raw = Reflect.callMethod(appeared, "getLeash") as SurfaceControl
+            val raw = nativeLeash ?: checkNotNull(taskSurface(appeared)) {
+                "notification stage surface unavailable"
+            }
             val leash = checkNotNull(ownLeash(raw))
             try { SurfaceControl.Transaction().use { tx -> tx.setAlpha(leash, 0f); Reflect.callMethod(tx, "hide", leash); tx.apply() } }
             finally { releaseQuietly(leash) }
@@ -285,7 +289,7 @@ object SmoothTaskOrganizer {
             applyWct(wct)
             return stage
         } catch (error: Throwable) { disposeNotificationStage(stage); throw error }
-        finally { releaseQuietly(raw) }
+        finally { releaseQuietly(nativeLeash) }
     }
 
     /** No WM lock crosses host/IPC work. The scoped native identity is checked a second time
@@ -408,6 +412,19 @@ object SmoothTaskOrganizer {
         if (sc == null) return
         runCatching { sc.release() }
     }
+
+    /** Probe the loader that actually owns the Task class, so no context initialization is needed. */
+    private fun shapeOf(task: Any): FrameworkShape = AndroidEnvironment.shape(task.javaClass.classLoader)
+
+    /** Only the Google branch exposes `Task#getLeash`, and only that handle may be released. */
+    private fun taskLeash(task: Any): SurfaceControl? =
+        if (!shapeOf(task).taskLeash) null
+        else runCatching { Reflect.callMethod(task, "getLeash") as? SurfaceControl }.getOrNull()
+
+    /** Container surface every branch exposes; borrowed from WindowManager, never released. */
+    private fun taskSurface(task: Any): SurfaceControl? =
+        taskLeash(task)
+            ?: runCatching { Reflect.callMethod(task, "getSurfaceControl") as? SurfaceControl }.getOrNull()
 
     /** 用任务的 WindowContainerToken 解析 Task 对象（同一进程内直取）。 */
     private fun resolveTaskByToken(token: Any?): Any? {
@@ -848,20 +865,25 @@ object SmoothTaskOrganizer {
                 "createTask returned null (display/freeform/organizer prerequisites)"
             }
             val taskInfo = Reflect.callMethod(appearedInfo, "getTaskInfo") as ActivityManager.RunningTaskInfo
-            val rawLeash = Reflect.callMethod(appearedInfo, "getLeash") as SurfaceControl
+            // Google 17 exposes the animation leash; LoS 24 keeps only the container surface. Only
+            // the leash is a handle we may release, the container surface belongs to WindowManager.
+            val nativeLeash = taskLeash(appearedInfo)
+            val rootSurface = nativeLeash ?: checkNotNull(taskSurface(appearedInfo)) {
+                "floating root surface unavailable (display/freeform/organizer prerequisites)"
+            }
             // Record the native identity before any fallible local setup.
             floatingRootTaskId = taskInfo.taskId
             floatingRootToken = Reflect.getObjectField(taskInfo, "token")
             rootInitializationStep = "retain-and-hide-root-leash"
             try {
-                val owned = checkNotNull(ownLeash(rawLeash))
+                val owned = checkNotNull(ownLeash(rootSurface))
                 // Hide the empty container before fallible organizer/AOT setup. A failed setup
                 // must not leave a top-level black container covering the current application.
                 try { SurfaceControl.Transaction().use { tx -> Reflect.callMethod(tx, "hide", owned); tx.apply() } }
                 catch (error: Throwable) { releaseQuietly(owned); throw error }
                 bindRootLeash(owned)
             }
-            finally { releaseQuietly(rawLeash) }
+            finally { releaseQuietly(nativeLeash) }
             log(TAG) { "floating root created task=$floatingRootTaskId" }
         }
         rootInitializationStep = "validate-root-organizer"

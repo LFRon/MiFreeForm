@@ -31,6 +31,7 @@ internal object Android17ShellAdapter {
 
     fun install(loader: ClassLoader) {
         if (installed) return
+        com.buildsession.betterYAMF.xposed.adapters.AndroidEnvironment.reportBaseline(loader)
         val native = Android17ShellBindings(loader)
         val hooks = mutableListOf<NativeHooks.Registration>()
         try {
